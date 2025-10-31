@@ -25,7 +25,7 @@ You can use the `setup.py` script to automatically download and install the requ
 1.  **Clone the repository:**
     ```sh
     git clone https://github.com/5ymph0en1x/SyLC.git
-    cd SyLC_3D_Player
+    cd SyLC
     ```
 
 2.  **Create and activate a virtual environment:**
