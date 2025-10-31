@@ -1,0 +1,4 @@
+PySide6
+python-mpv
+requests
+py7zr
