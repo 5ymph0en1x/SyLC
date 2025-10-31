@@ -882,6 +882,7 @@ class ControlsOverlay(QWidget):
     stereo_mode_changed = Signal(str)
     mode_3d_toggled = Signal(bool)
     audio_track_changed = Signal(int)  # Signal for audio track change
+    subtitle_track_changed = Signal(int)  # Signal for subtitle track change
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -955,15 +956,25 @@ class ControlsOverlay(QWidget):
             "Top-Bottom",
             "2D (Mono)"
         ])
-        self.stereo_mode_combo.setMinimumWidth(160)
+        self.stereo_mode_combo.setMinimumWidth(130)
+        self.stereo_mode_combo.setMaximumWidth(160)
         self.stereo_mode_combo.setToolTip("Stereoscopic format")
 
         # Audio track combobox
         self.audio_track_combo = QComboBox()
         self.audio_track_combo.addItem("Audio: No track")
-        self.audio_track_combo.setMinimumWidth(200)
+        self.audio_track_combo.setMinimumWidth(140)
+        self.audio_track_combo.setMaximumWidth(180)
         self.audio_track_combo.setToolTip("Select audio track")
         self.audio_track_combo.setEnabled(False)  # Disabled by default
+
+        # Subtitle track combobox
+        self.subtitle_track_combo = QComboBox()
+        self.subtitle_track_combo.addItem("Subtitles: None")
+        self.subtitle_track_combo.setMinimumWidth(140)
+        self.subtitle_track_combo.setMaximumWidth(180)
+        self.subtitle_track_combo.setToolTip("Select subtitle track")
+        self.subtitle_track_combo.setEnabled(False)  # Disabled by default
 
         # Flat style 3D info label
         self.info_3d_label = QLabel("")
@@ -995,13 +1006,14 @@ class ControlsOverlay(QWidget):
         controls_layout = QHBoxLayout()
         controls_layout.setSpacing(8)
 
-        # Left group - file and 3D + info label + audio
+        # Left group - file and 3D + info label + audio + subtitles
         left_group = QHBoxLayout()
         left_group.setSpacing(8)
         left_group.addWidget(self.open_file_button)
         left_group.addWidget(self.mode_3d_button)
         left_group.addWidget(self.stereo_mode_combo)
         left_group.addWidget(self.audio_track_combo)
+        left_group.addWidget(self.subtitle_track_combo)
         left_group.addWidget(self.info_3d_label)
 
         # Center - playback
@@ -1032,6 +1044,7 @@ class ControlsOverlay(QWidget):
         self.mode_3d_button.toggled.connect(self.mode_3d_toggled)
         self.stereo_mode_combo.currentTextChanged.connect(self._on_stereo_mode_changed)
         self.audio_track_combo.currentIndexChanged.connect(self._on_audio_track_changed)
+        self.subtitle_track_combo.currentIndexChanged.connect(self._on_subtitle_track_changed)
 
     def show_animated(self):
         """Shows the widget without animation to avoid flickering."""
@@ -1136,6 +1149,52 @@ class ControlsOverlay(QWidget):
 
         # Unblock signals
         self.audio_track_combo.blockSignals(False)
+
+    def _on_subtitle_track_changed(self, index):
+        """Emits the signal with the ID of the selected subtitle track."""
+        if index == 0:  # Index 0 is "None" (disable subtitles)
+            self.subtitle_track_changed.emit(0)
+        elif index > 0:
+            # Retrieve the track ID stored in the user data
+            track_id = self.subtitle_track_combo.itemData(index)
+            if track_id is not None:
+                self.subtitle_track_changed.emit(track_id)
+
+    def update_subtitle_tracks(self, tracks):
+        """
+        Updates the list of available subtitle tracks.
+
+        Args:
+            tracks: List of tuples (id, title, language)
+        """
+        # Block signals during update
+        self.subtitle_track_combo.blockSignals(True)
+
+        # Clear the combobox
+        self.subtitle_track_combo.clear()
+
+        # Always add "None" option to disable subtitles
+        self.subtitle_track_combo.addItem("Subtitles: None", 0)
+
+        if not tracks or len(tracks) == 0:
+            # No subtitle tracks
+            self.subtitle_track_combo.setEnabled(True)  # Still enabled to allow "None" selection
+        else:
+            # Add the tracks
+            for track_id, title, lang in tracks:
+                # Format the track name
+                track_name = f"Subtitles: {title}"
+                if lang:
+                    track_name += f" ({lang})"
+
+                self.subtitle_track_combo.addItem(track_name, track_id)
+
+            self.subtitle_track_combo.setEnabled(True)
+            # Select "None" by default (index 0)
+            self.subtitle_track_combo.setCurrentIndex(0)
+
+        # Unblock signals
+        self.subtitle_track_combo.blockSignals(False)
 
     def paintEvent(self, event):
         """Draw the rounded background with true transparent corners."""
@@ -1248,7 +1307,7 @@ class InfoOverlay(QWidget):
         painter.drawText(int(center_x - text_width/2), int(text_y), self.text)
 
         # Subtitle
-        subtitle = "MP4, MKV, AVI, ISO (3D & HDR)"
+        subtitle = "MP4, MKV, AVI (3D & HDR)"
         subtitle_font = QFont('Segoe UI', 10, QFont.Weight.Normal)
         painter.setFont(subtitle_font)
         fm2 = QFontMetrics(subtitle_font)
@@ -1411,9 +1470,12 @@ class PlayerWindow(QMainWindow):
             'input-default-bindings': True,
             # --- Cache optimizations to reduce lag (modern mpv options) ---
             'cache': 'yes',
-            'demuxer-readahead-secs': 5, # Read 5 seconds ahead (for lag)
-            'demuxer-max-bytes': '500M', # 500MB max for the demuxer
-            'demuxer-max-back-bytes': '250M', # 250MB max for the demuxer backbuffer
+            'demuxer-readahead-secs': 20,
+            'demuxer-max-bytes': '2000M',
+            'demuxer-max-back-bytes': '1000M',
+            'stream-buffer-size': '512k',
+            'index': 'recreate',
+            'hr-seek': 'yes',
             'osc': False,
             'volume': 100,
             'mute': 'no',
@@ -1469,6 +1531,7 @@ class PlayerWindow(QMainWindow):
         self.controls_overlay.mode_3d_toggled.connect(self.toggle_3d_mode)
         self.controls_overlay.stereo_mode_changed.connect(self.change_stereo_mode)
         self.controls_overlay.audio_track_changed.connect(self.change_audio_track)
+        self.controls_overlay.subtitle_track_changed.connect(self.change_subtitle_track)
         # Connect the click on the info overlay
         self.info_overlay.file_clicked.connect(self.open_file_dialog)
 
@@ -1608,6 +1671,7 @@ class PlayerWindow(QMainWindow):
 
         self.current_file_path = file_path
         self.has_media = True
+
         self.player.play(file_path)
         self.player.pause = False
         self.update_ui_state()
@@ -1616,7 +1680,10 @@ class PlayerWindow(QMainWindow):
         QTimer.singleShot(500, lambda: self._init_thumbnail_cache(file_path))
 
         # Load available audio tracks
-        self.load_audio_tracks()
+        QTimer.singleShot(500, self.load_audio_tracks)
+
+        # Load available subtitle tracks
+        QTimer.singleShot(500, self.load_subtitle_tracks)
 
         # Apply 3D configuration if enabled
         if self.is_3d_enabled:
@@ -1743,12 +1810,60 @@ class PlayerWindow(QMainWindow):
         except Exception as e:
             print(f"Error fetching audio tracks: {e}")
 
+    def change_subtitle_track(self, track_id):
+        """Changes the active subtitle track or disables subtitles."""
+        if self.has_media:
+            try:
+                if track_id == 0:
+                    # Disable subtitles
+                    self.player.sid = 'no'
+                    print("Subtitles disabled")
+                else:
+                    # Enable specific subtitle track
+                    self.player.sid = track_id
+                    print(f"Subtitle track changed: ID {track_id}")
+            except Exception as e:
+                print(f"Error changing subtitle track: {e}")
+
+    def load_subtitle_tracks(self):
+        """Loads the list of subtitle tracks from MPV."""
+        if not self.has_media:
+            return
+
+        try:
+            # Wait a bit for MPV to load the metadata
+            QTimer.singleShot(500, self._fetch_subtitle_tracks)
+        except Exception as e:
+            print(f"Error loading subtitle tracks: {e}")
+
+    def _fetch_subtitle_tracks(self):
+        """Fetches the subtitle tracks from MPV."""
+        try:
+            track_list = self.player.track_list
+            subtitle_tracks = []
+
+            for track in track_list:
+                if track.get('type') == 'sub':
+                    track_id = track.get('id')
+                    title = track.get('title', f"Track {track_id}")
+                    lang = track.get('lang', '')
+
+                    subtitle_tracks.append((track_id, title, lang))
+
+            print(f"Subtitle tracks found: {len(subtitle_tracks)}")
+
+            # Update the UI
+            self.controls_overlay.update_subtitle_tracks(subtitle_tracks)
+
+        except Exception as e:
+            print(f"Error fetching subtitle tracks: {e}")
+
     def open_file_dialog(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Open a video",
             "",
-            "Video Files (*.mkv *.mp4 *.avi *.iso);;All files (*.*)"
+            "Video Files (*.mkv *.mp4 *.avi);;All files (*.*)"
         )
         if file_path:
             self.play_file(file_path)
