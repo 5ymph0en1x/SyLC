@@ -71,6 +71,11 @@ graph TD
     style R fill:#00C8FF,stroke:#fff,color:#fff
 ```
 
+<div align="center">
+  <img src="FP.jpg" alt="Framepack"/>
+</div>
+
+
 SyLC generates this complex surface in real-time via custom OpenGL shaders, allowing your TV or projector to instantly recognize a native 3D signal.
 
 ---
@@ -83,7 +88,9 @@ SyLC generates this complex surface in real-time via custom OpenGL shaders, allo
 *   **Windows Optimized:** Standalone, portable executable requiring no installation of shady external codecs.
 *   **Bitstream Audio:** Support for multi-channel audio tracks.
 
-<img src="interface.jpg" alt="SyLC 3D Player"/>
+<div align="center">
+  <img src="interface.jpg" alt="SyLC 3D Player"/>
+</div>
 
 ## 🚀 Installation and Usage
 
