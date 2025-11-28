@@ -83,6 +83,8 @@ SyLC generates this complex surface in real-time via custom OpenGL shaders, allo
 *   **Windows Optimized:** Standalone, portable executable requiring no installation of shady external codecs.
 *   **Bitstream Audio:** Support for multi-channel audio tracks.
 
+<img src="interface.jpg" alt="SyLC 3D Player"/>
+
 ## 🚀 Installation and Usage
 
 1.  Download the latest **Release** (`.exe` file).
