@@ -120,7 +120,7 @@ The decoder's SIMD hot loop is compiled for each architecture's vector unit (AVX
 
 ## Get started
 
-1. Download the asset for your platform from **Releases** (including the dlls).
+1. Download the asset for your platform from **Releases** (including the dlls if you plan to use the sources).
 2. **x64:** run `SyLC_3D_Player_v3.0_win-x64.exe`. **ARM64:** unzip and run `SyLC_3D_Player.exe`.
 3. Open a 3D MKV (drag-and-drop or the folder button). Send the frame-packed window to your 3D display and enjoy.
 
