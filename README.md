@@ -1,119 +1,195 @@
 <div align="center">
-  <img src="splash.png" alt="SyLC 3D Player Logo" width="250" />
-  <h1>SyLC 3D Ultra-Player</h1>
-  <h3>The Ultimate PC 3D Experience: MVC, Frame Packing & High Fidelity.</h3>
-  
-  <a href="#download"><strong>Download Beta</strong></a> · <a href="#why-sylc"><strong>Why this Player?</strong></a> · <a href="#under-the-hood"><strong>Technology</strong></a>
-  
-  <br/>
-  
-  ![Platform](https://img.shields.io/badge/platform-Windows-blue)
-  ![Status](https://img.shields.io/badge/status-Release%20Candidate-green)
-  ![3D](https://img.shields.io/badge/3D-Frame%20Packing-ff0044)
+
+# SyLC 3D Player
+
+<img src="splash.png" alt="SyLC 3D Player Logo" width="250" />
+
+### A free, open-source player for the 3D format the industry left behind.
+
+*Stereoscopic 3D Blu-ray (MVC) playback, decoded from scratch, rendered in native HDR — given to the community, no strings attached.*
+
+![Version](https://img.shields.io/badge/version-3.0.0-1f6feb?style=for-the-badge)
+![Platform](https://img.shields.io/badge/Windows-x64%20%7C%20ARM64-0078D6?style=for-the-badge&logo=windows&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.13-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![License](https://img.shields.io/badge/license-free%20%26%20open--source-2ea44f?style=for-the-badge)
+
+![3D](https://img.shields.io/badge/3D-MVC%20stereoscopic-e10098?style=for-the-badge)
+![HDR](https://img.shields.io/badge/HDR-Direct3D%2011-5c2d91?style=for-the-badge)
+![Decoder](https://img.shields.io/badge/decoder-edge264%20BSD-fe7a16?style=for-the-badge)
+![Audio](https://img.shields.io/badge/audio-libmpv-eb5d2a?style=for-the-badge)
+
 </div>
 
 ---
 
-## 🌌 Introduction
+## Why this exists
 
-**SyLC 3D Ultra-Player** is not just another video player. It is the answer to a technological void that has frustrated 3D home cinema enthusiasts on PC for years.
+In 2017 the industry quietly killed 3D. Blu-ray players stopped shipping it, TVs dropped it, and the software that could play **3D Blu-rays** — encoded in a format called **MVC** — was discontinued one app at a time. The discs didn't disappear. The collections didn't disappear. The *players* did.
 
-While most modern players have abandoned true 3D in favor of compressed formats (SBS/TAB) or require complex, obsolete setups, SyLC was built with a single goal: **To restore the glory of Blu-ray 3D (MVC) on Windows.**
+And here's the cruel part: **MVC can't be played by the tools everyone already has.** When you rip a 3D Blu-ray to an MKV, you get an H.264 stream carrying **two interleaved camera views** — left and right eye, the second view encoded as differences against the first. FFmpeg — the engine inside VLC, MPC-HC, and nearly every "it plays everything" player — **decodes only the base view and silently throws the 3D away.** You get a flat 2D picture and no warning. The depth is *in the file*. Nothing on your machine will show it to you.
 
-It natively reads **H.264 MVC** streams, decodes them in real-time, and sends them to your 3D projector or TV using the **Frame Packing** method, guaranteeing Full HD (1080p) quality for *each* eye.
+**SyLC 3D Player is the answer to that problem.** It is a complete, from-scratch stereoscopic pipeline — its own MVC decoder, its own demuxer, its own HDR renderer — built over months specifically so that your 3D library plays again, in full quality, on modern hardware. It is **free, open-source, and unencumbered**. No license, no activation, no trial, no telemetry.
 
-## 🏆 Why SyLC is Unique
-
-The problem with standard players (VLC, MPC-HC, etc.) is that they only see part of the video stream. A 3D MKV file contains two streams:
-1.  **The Base View (AVC):** The left eye, readable by everyone.
-2.  **The Dependent View (MVC):** The right eye, encoded as a "difference" relative to the left.
-
-Most players simply ignore the second stream. **SyLC captures it, decodes it, and synchronizes it.**
-
-### The 3 Supported Playback Modes
-
-SyLC handles all formats, from the most basic to the most advanced:
-
-| Mode | Description | Resolution per Eye | Verdict |
-| :--- | :--- | :--- | :--- |
-| **1. Side-by-Side (SBS)** | Images placed next to each other. | 960 x 1080 | *50% loss of horizontal definition.* |
-| **2. Top-and-Bottom (TAB)** | Images stacked vertically. | 1920 x 540 | *50% loss of vertical definition.* |
-| **3. FRAME PACKING** 🌟 | **The Holy Grail.** | **1920 x 1080** | **Pristine Blu-ray 3D Quality.** |
+As far as we know, it is **the only actively-developed, open-source player that truly decodes MVC** — both eyes — and renders it in real HDR.
 
 ---
 
-## ⚙️ Under the Hood: A Technical Feat
+## What makes it unique
 
-Developing SyLC required overcoming major obstacles where standard libraries failed.
+- 🧬 **It doesn't lean on FFmpeg for the hard part.** The 3D is decoded by a custom in-house H.264/**MVC** decoder that reconstructs *both* views — the thing mainstream players can't do.
+- 🌈 **True HDR, not a tone-mapped fake.** Frames land in a 16-bit-float **scRGB** Direct3D 11 swapchain; a GPU shader does YUV→RGB and the stereo frame-packing in one pass. HDR10/PQ is preserved end to end.
+- 🥽 **Real 3D output.** Frame-packed stereo to a detached window for 3D TVs, projectors and HMDs — plus an embedded 2D preview.
+- 🎯 **Pixel-exact.** The decoder's luma output has been verified byte-for-byte against FFmpeg's base view. It's not "close enough" — it's correct.
+- 🪶 **Self-contained.** One executable (x64) or one portable folder (ARM64). Nothing to install, no codec packs, no system pollution.
 
-### The MVC Decoding Challenge
-To achieve Frame Packing, we couldn't rely on off-the-shelf decoders. We had to **rewrite and adapt a custom H.264 decoding core (based on `edge264`)**.
+---
 
-*   **Dual-Stream Extraction:** Our engine simultaneously separates and processes the base view and the dependent view (MVC).
-*   **Atomic Synchronization:** Both views are reassembled with microsecond precision to avoid any "desync" effect or eye strain.
-*   **Unified Buffer (Zero-Copy):** To ensure fluidity (24fps / 60fps), images flow between the C++ decoder and the rendering interface without unnecessary memory copying.
+## Under the hood
 
-### The Frame Packing Architecture
-This is where the magic happens. Frame Packing involves sending a "giant" image to the graphics card, containing both views separated by a silent band (active blanking).
+For the curious, here is what is actually happening between the file and your eyes — and why each step was hard enough to be interesting.
 
-```mermaid
-graph TD
-    subgraph "GPU Buffer (1920 x 2205 pixels)"
-        L["Left View (1920x1080)"]
-        G["Active Gap / Blanking (45px)"]
-        R["Right View (1920x1080)"]
-    end
-    L --> Display
-    G --> Display
-    R --> Display
-    style L fill:#007ACC,stroke:#fff,color:#fff
-    style G fill:#000,stroke:#333,color:#fff
-    style R fill:#00C8FF,stroke:#fff,color:#fff
+### 1. The decoder — `edge264`, taught to see in stereo
+The heart of the player is **[edge264](https://github.com/tvlabs/edge264)**, a remarkable single-translation-unit H.264 decoder with hand-written SIMD kernels — **SSE2→AVX2** on x86, **NEON** on ARM. It is fast, lean, and BSD-licensed. But like everything else, it spoke only 2D.
+
+This project extends it into a real **MVC (Annex H)** decoder: a second *dependent* view that predicts itself from the *base* view across the inter-view boundary, a per-view **decoded-picture-buffer** that has to honour `max_dec_frame_buffering` *separately* for each eye, SPS↔Subset-SPS fallback, PPS inheritance, frame-pairing, and graceful buffer-overflow handling so the two eyes never drift apart. Getting two interdependent H.264 bitstreams to march in lockstep, frame for frame, is most of the engineering.
+
+### 2. The demuxer — pulling two eyes out of one container
+A dedicated **C++ demuxer** (pybind11, on top of **libmatroska/libebml**) opens the MKV, finds the MVC track, and de-interleaves the base and dependent NAL units into the exact order the decoder expects — feeding a zero-copy ring buffer so decode never waits on I/O.
+
+### 3. The renderer — HDR all the way to the panel
+Decoded YUV planes are uploaded straight to the GPU. A Qt **RHI / Direct3D 11** shader converts colour and assembles the stereo frame inside an **RGBA16F (scRGB)** HDR surface — the format Windows uses for native HDR — so there is no SDR round-trip and no OpenGL→DXGI copy tax.
+
+### 4. The real-time problem — and the Python GIL
+Audio rides on **libmpv**; video is slaved to mpv's clock so the two stay locked. But MVC decode is **single-threaded** (the multiview decoder isn't thread-safe), which makes timing brutal: decoding a single key frame can take ~100 ms, and on a naïve loop that froze the picture once per GOP — a visible hitch every second. The fix was to **decouple presentation from decoding** (a dedicated presenter thread with back-pressure so the buffer absorbs the spikes) and then to wrestle the **CPython GIL** itself — `sys.setswitchinterval(0.0005)` was the decisive change that stopped the decode thread from starving the presenter. Result on a dense scene: **16 fps with 33 % dropped frames → a steady 24 fps with zero drops.**
+
+---
+
+## War stories
+
+Months of work hide inside a few one-line fixes. A taste:
+
+- **The "Frankenstein" banding.** *Gravity* and other demanding discs came out sliced with horizontal bands of wrong colour. The cause was buried deep in dequantization: when a picture declared a scaling matrix but supplied no lists and the sequence had none either, the decoder fell back to a **flat-16** matrix instead of the **H.264 default** matrices the spec mandates. One wrong fallback, an entire film corrupted. Fixed in the PPS parser.
+- **The decoder that worked everywhere but Windows.** Every slice failed with `EBADMSG`. The culprit: Windows' `<windows.h>` defines `min`/`max` as **macros**, which silently replaced edge264's own inline `min`/`max` and made the **CABAC** arithmetic diverge bit-for-bit. The fix is three characters — `NOMINMAX` — and finding it took considerably longer than typing it.
+- **The deadlock between two eyes.** Under load the per-view buffers could wedge against each other; it took an entry-guard bypass, a graceful frame-bump path, and a force-complete with chroma concealment to guarantee the stereo pair always advances.
+
+This is the kind of work that doesn't show up in a feature list — but it's the difference between "plays MVC" and *plays MVC correctly, every frame, on every disc.*
+
+---
+
+## Features
+
+- **3D MVC playback** — H.264 Stereo High (profile 128), both views decoded in-house.
+- **Direct3D 11 / Qt RHI rendering** with **HDR (PQ)** preservation and high-quality scaling.
+- **Frame-packed 3D output** (detached window) + embedded 2D view.
+- **Matroska (MKV)** input with an MVC track, via the native demuxer.
+- **PGS (Blu-ray) subtitles**, streamed in real time.
+- **Live A/V sync trim** to cancel your system's audio-output latency — nudge it by ear with `[` and `]`.
+- **Instant, smooth seeking** — no post-seek lag.
+- **Completely free** — every feature unlocked, forever.
+
+### Keyboard shortcuts
+| Key | Action |
+|---|---|
+| `Space` | Play / Pause |
+| `Esc` | Exit fullscreen |
+| `]` / `[` | Delay / advance the video for A/V sync (±50 ms) |
+
+---
+
+## Two native builds — no emulation
+
+| Platform | Asset | Notes |
+|---|---|---|
+| **Windows x64** | `SyLC_3D_Player_v3.0_win-x64.exe` | Single self-contained file. Built for the **x86-64-v3 (AVX2)** baseline — runs natively on any AVX2 CPU (Haswell 2013+ / Zen 1+). |
+| **Windows on ARM** | `SyLC_3D_Player_v3.0_win-arm64.zip` | Portable folder, **100 % native ARM64** (Snapdragon / Adreno) — every binary cross-compiled to aarch64, zero x64 emulation. |
+
+The decoder's SIMD hot loop is compiled for each architecture's vector unit (AVX2 / NEON), so you get the real silicon, not a translation layer.
+
+---
+
+## System requirements
+
+- **Windows 10/11 (x64)** or **Windows 11 on ARM (ARM64)**.
+- A **Direct3D 11**-capable GPU (an HDR display to enjoy HDR).
+- x64: a CPU with **AVX2** (standard since ~2013).
+- Input: an **MKV** containing an **MVC** track. Rip a 3D Blu-ray with **MakeMKV**. (Plain 2D files play through libmpv.)
+
+> Raw `.ssif` / `.m2ts` Blu-ray structures aren't supported yet — remux to MKV first.
+
+---
+
+## Get started
+
+1. Download the asset for your platform from **Releases**.
+2. **x64:** run `SyLC_3D_Player_v3.0_win-x64.exe`. **ARM64:** unzip and run `SyLC_3D_Player.exe`.
+3. Open a 3D MKV (drag-and-drop or the folder button). Send the frame-packed window to your 3D display and enjoy.
+
+Nothing to install. Everything — decoder, demuxer, audio, codecs, Python runtime — is bundled.
+
+---
+
+## Build from source
+
+Everything needed lives in this repository: the Python application, the **decoder sources** (`edge264/`), the **demuxer sources** (`mvc_realtime_demuxer/`), the binaries, and the build scripts. Full details in **[`BUILD.md`](BUILD.md)** (x64) and **`BUILD_ARM.md`** (ARM64).
+
+The short version (x64):
+
+```bat
+:: edge264 decoder (MSYS2 / UCRT64) — portable AVX2 build
+gcc -shared -o edge264.dll -O3 -march=x86-64-v3 -flax-vector-conversions edge264/src/edge264.c -lpthread
+
+:: one-file no-console executable (Nuitka + MSVC 2022)
+build_exe_onefile.bat
 ```
 
-<div align="center">
-  <img src="FP.jpg" alt="Framepack"/>
-</div>
-
-
-SyLC generates this complex surface in real-time via custom OpenGL shaders, allowing your TV or projector to instantly recognize a native 3D signal.
+Prerequisites: **Python 3.13**, `pip install -r requirements.txt` + `nuitka` + `pybind11`, **MSVC 2022**, and **MSYS2/GCC** for edge264. Swap `-march=x86-64-v3` for `-march=znver3` (or `native`) if you're building only for your own machine and want every last drop of Zen 3.
 
 ---
 
-## ✨ Key Features
+## Architecture at a glance
 
-*   **Auto-Detection:** Intelligent analysis of metadata (MKV, MP4, M2TS) to activate the correct 3D mode.
-*   **"Glassmorphism" UI:** A modern interface that automatically fades away for total immersion.
-*   **Smooth Timeline:** Stabilized "seek" system with thumbnail previews (even in 3D mode!).
-*   **Windows Optimized:** Standalone, portable executable requiring no installation of shady external codecs.
-*   **Bitstream Audio:** Support for multi-channel audio tracks.
-
-<div align="center">
-  <img src="interface.jpg" alt="SyLC 3D Player"/>
-</div>
-
-## 🚀 Installation and Usage
-
-1.  Download the latest **Release** (`.exe` file).
-2.  Run `SyLC_Player.exe`.
-3.  Drag and drop your 3D video file.
-
-### 🌟 Frame Packing Special Instructions
-To achieve the ultimate 3D quality (Frame Packing), follow these specific steps:
-
-1.  **Configure Output:** Ensure your Projector/TV output resolution is set to **1920x2205** @ 24Hz (you may need to create a *Custom Resolution* in your NVIDIA/AMD control panel).
-2.  **Move Window:** When the video starts, a "Tall" window will appear. **Drag this window onto your projector/secondary screen.**
-3.  **Go Fullscreen:** Press **'F'** (or double-click). The window will cover the entire 1920x2205 area, triggering the hardware 3D mode on your device.
-4.  **Put on your glasses!** 👓
-
-*Note: For standard SBS or TAB modes, simply toggle fullscreen on any standard 1080p display.*
-
-## 🛠️ Credits
-
-Developed with passion by **Symphoenix**.
-*   UI Engine: PySide6 (Qt)
-*   Video Engine: Custom C++ implementation & MPV
-*   Logo: Symphoenix Arts
+```
+   MKV (MVC)
+      │
+      ▼
+ ┌──────────────┐   base + dependent NAL units (zero-copy ring buffer)
+ │  C++ demuxer │ ───────────────────────────────────────────────►
+ │ libmatroska  │
+ └──────────────┘
+      │
+      ▼
+ ┌──────────────┐   two interdependent H.264 views, decoded in lockstep
+ │   edge264    │   (AVX2 on x64 · NEON on ARM64 · GIL released)
+ │  MVC decoder │ ───────────────────────────────────────────────►
+ └──────────────┘
+      │ YUV planes
+      ▼
+ ┌──────────────┐   YUV→RGB + stereo frame-packing in one GPU pass
+ │  D3D11 / RHI │   RGBA16F (scRGB) HDR swapchain
+ │  HDR shader  │ ──────────────►  3D display / projector / HMD
+ └──────────────┘
+                    audio ── libmpv ──► clock that video is slaved to
+```
 
 ---
-*This software is the result of months of research and reverse engineering to bring true 3D back to our screens. Enjoy!*
+
+## License & credits
+
+**Free & open-source.** The **edge264** decoder is **BSD**-licensed (see `edge264/LICENSE_BSD.txt`). SyLC also stands on the shoulders of great GPL/LGPL projects — please honour their licenses when redistributing.
+
+- **[edge264](https://github.com/tvlabs/edge264)** — the fast H.264/AVC decoder this project extends to MVC
+- **[libmpv / mpv](https://mpv.io/)** — audio engine
+- **[libmatroska / libebml](https://www.matroska.org/)** — Matroska demuxing
+- **[FFmpeg](https://ffmpeg.org/)** — `ffprobe` for stream & subtitle analysis
+- **[Qt / PySide6](https://www.qt.io/)** — UI and Direct3D 11 rendering
+- **[Nuitka](https://nuitka.net/)** — standalone compilation
+
+---
+
+<div align="center">
+
+**Built over months, for the love of the format — and given freely to everyone who refused to let 3D die.**
+
+*If SyLC brought one of your discs back to life, that's the whole reward. Long live open source. 🥂*
+
+</div>
