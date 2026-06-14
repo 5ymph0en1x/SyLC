@@ -1,0 +1,28 @@
+# SyLC 3D Player - Requirements
+# Python 3.12+ recommended (tested with 3.12, 3.13, 3.14)
+
+# Core UI Framework
+PySide6>=6.6.0
+
+# Video playback backend
+python-mpv>=1.0.0
+
+# Numerical computing (YUV processing)
+numpy>=1.24.0
+
+# Image processing (optional, for some features)
+opencv-python>=4.8.0
+
+# C++ bindings (for mvc_demuxer_cpp compilation)
+pybind11>=2.11.0
+
+
+
+# Note: The following are built-in Python modules (no pip install needed):
+# - ctypes, sys, os, time, logging, threading, gc
+# - collections, enum, dataclasses, typing, functools
+# - concurrent.futures, subprocess, json, tempfile, shutil, glob
+# - io, locale, multiprocessing, traceback
+
+# Note: edge264.dll must be compiled separately using MSYS2/MinGW-w64
+# See edge264/build_v42.bat for compilation instructions
