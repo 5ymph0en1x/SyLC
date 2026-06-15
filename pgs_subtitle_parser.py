@@ -800,21 +800,50 @@ class PGSSubtitleParser:
         Returns:
             PGSDisplaySet or None if no subtitle should be shown
         """
-        result = None
+        # Bridge brief clears between two shows. Blu-ray PGS often re-transmits a subtitle as
+        # several short epochs (show ~0.7s / clear ~0.3s / show ...), which renders as flicker.
+        # (MakeMKV strips these, so the MKV path never saw them.) If a "clear" is shorter than
+        # BRIDGE_GAP and sits between two shows, keep showing the previous one — real clears
+        # (gaps to the next subtitle) are seconds long and are honored normally.
+        BRIDGE_GAP = 0.7
 
-        for ds in self.display_sets:
+        def _is_show(ds):
+            return len(ds.compositions) > 0 and ds.rendered_image is not None
+
+        # Find the active display set (last one whose pts <= time).
+        active_idx = -1
+        for idx, ds in enumerate(self.display_sets):
             if ds.pts <= time_seconds:
-                # Check if subtitle has expired (past its end time)
-                if ds.end_pts > 0 and time_seconds >= ds.end_pts:
-                    result = None  # Subtitle has ended
-                elif len(ds.compositions) == 0 or ds.rendered_image is None:
-                    result = None  # "Clear" display set
-                else:
-                    result = ds  # Active subtitle
+                active_idx = idx
             else:
-                break  # Past current time, stop iterating
+                break
+        if active_idx < 0:
+            return None
 
-        return result
+        ds = self.display_sets[active_idx]
+        if _is_show(ds):
+            if ds.end_pts > 0 and time_seconds >= ds.end_pts:
+                return None  # expired (only with an explicit short END)
+            return ds
+
+        # Active set is a "clear" — decide whether to bridge it.
+        prev_show = None
+        if active_idx > 0:
+            d = self.display_sets[active_idx - 1]
+            if _is_show(d):
+                prev_show = d
+        next_show = None
+        if active_idx + 1 < len(self.display_sets):
+            d = self.display_sets[active_idx + 1]
+            if _is_show(d):
+                next_show = d
+
+        if prev_show is not None:
+            if next_show is not None and (next_show.pts - ds.pts) < BRIDGE_GAP:
+                return prev_show  # brief clear between two shows -> bridge it
+            if next_show is None and (time_seconds - ds.pts) < 0.3:
+                return prev_show  # next show not parsed yet (read-ahead) -> short grace hold
+        return None
 
     # =========================================================================
     # STREAMING MODE API - For real-time parsing from M2TS demuxer

@@ -453,6 +453,17 @@ class PremiumIconButton(QPushButton):
             painter.drawText(QRectF(0, 0, self.width(), self.height()),
                              Qt.AlignmentFlag.AlignCenter, '3D')
 
+        elif self.icon_type == 'disc':
+            # Optical disc: outer ring + center hub (open a Blu-ray)
+            painter.setPen(QPen(color, 1.8, Qt.PenStyle.SolidLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            r = s * 0.5
+            painter.drawEllipse(QPointF(cx, cy), r, r)
+            painter.drawEllipse(QPointF(cx, cy), r * 0.35, r * 0.35)
+            painter.setBrush(QBrush(color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QPointF(cx, cy), r * 0.12, r * 0.12)
+
 
 # =============================================================================
 # PREMIUM STATUS BADGE
@@ -1168,6 +1179,7 @@ class PremiumControlsOverlay(QWidget):
     seeked = Signal(float)
     volume_changed = Signal(int)
     file_opened = Signal()
+    disc_opened = Signal()  # open a Blu-ray 3D disc/folder (auto-detect the feature)
     stereo_mode_changed = Signal(str)
     mode_3d_toggled = Signal(bool)
     audio_track_changed = Signal(int)
@@ -1223,7 +1235,9 @@ class PremiumControlsOverlay(QWidget):
         left_group.setSpacing(10)
 
         self.open_file_button = PremiumIconButton('folder', 'medium')
-        # self.open_file_button.setToolTip("Ouvrir un fichier")
+        self.open_file_button.setToolTip("Open file")
+        self.open_disc_button = PremiumIconButton('disc', 'medium')
+        self.open_disc_button.setToolTip("Open Blu-ray 3D (drive or BDMV folder)")
 
         # Audio track
         self.audio_track_combo = QComboBox()
@@ -1240,6 +1254,7 @@ class PremiumControlsOverlay(QWidget):
         self._style_combo(self.subtitle_track_combo)
 
         left_group.addWidget(self.open_file_button)
+        left_group.addWidget(self.open_disc_button)
         left_group.addWidget(self.audio_track_combo, 1)  # stretch factor 1
         left_group.addWidget(self.subtitle_track_combo, 1)  # stretch factor 1 (same width)
 
@@ -1249,16 +1264,16 @@ class PremiumControlsOverlay(QWidget):
         center_group.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.skip_back_button = PremiumIconButton('skip_back', 'small')
-        # self.skip_back_button.setToolTip("-10 secondes")
+        self.skip_back_button.setToolTip("Skip back 10s")
 
         self.stop_button = PremiumIconButton('stop', 'medium')
-        # self.stop_button.setToolTip("Stop (S)")
+        self.stop_button.setToolTip("Stop")
 
         self.play_pause_button = PremiumIconButton('play', 'primary')
-        # self.play_pause_button.setToolTip("Lecture / Pause (Espace)")
+        self.play_pause_button.setToolTip("Play / Pause")
 
         self.skip_forward_button = PremiumIconButton('skip_forward', 'small')
-        # self.skip_forward_button.setToolTip("+10 secondes")
+        self.skip_forward_button.setToolTip("Skip forward 10s")
 
         center_group.addWidget(self.skip_back_button)
         center_group.addWidget(self.stop_button)
@@ -1282,7 +1297,7 @@ class PremiumControlsOverlay(QWidget):
         # 3D Mode button
         self.mode_3d_button = PremiumIconButton('3d', 'medium')
         self.mode_3d_button.setCheckable(True)
-        # self.mode_3d_button.setToolTip("Activer le mode 3D")
+        self.mode_3d_button.setToolTip("Toggle 3D mode")
 
         # Stereo mode combo
         self.stereo_mode_combo = QComboBox()
@@ -1299,7 +1314,7 @@ class PremiumControlsOverlay(QWidget):
 
         # Fullscreen
         self.fullscreen_button = PremiumIconButton('fullscreen', 'medium')
-        # self.fullscreen_button.setToolTip("Plein Ecran (F)")
+        self.fullscreen_button.setToolTip("Fullscreen (F)")
 
         # Layout
         right_group.addStretch()
@@ -1373,6 +1388,7 @@ class PremiumControlsOverlay(QWidget):
         self.stop_button.clicked.connect(self.stop_clicked)
         self.fullscreen_button.clicked.connect(self.fullscreen_toggled)
         self.open_file_button.clicked.connect(self.file_opened)
+        self.open_disc_button.clicked.connect(self.disc_opened)
         self.volume_slider.volume_changed.connect(self.volume_changed)
         self.time_slider.sliderMoved.connect(lambda pos: self._on_slider_scrub(pos))
         # ANTI-SPAM: Utiliser scrub_finished (debounced) au lieu de sliderReleased
@@ -1388,6 +1404,7 @@ class PremiumControlsOverlay(QWidget):
         """Stop all button animations - call before destruction or MVC mode."""
         buttons = [
             self.open_file_button,
+            self.open_disc_button,
             self.skip_back_button,
             self.stop_button,
             self.play_pause_button,
@@ -1403,6 +1420,7 @@ class PremiumControlsOverlay(QWidget):
         """Re-enable button animations after MVC mode ends."""
         buttons = [
             self.open_file_button,
+            self.open_disc_button,
             self.skip_back_button,
             self.stop_button,
             self.play_pause_button,
@@ -1524,8 +1542,8 @@ class PremiumControlsOverlay(QWidget):
             # Convert streaming format to tuple format and add to combo
             for i, track in enumerate(tracks):
                 track_number = track.get('trackNumber', i + 1)
-                name = track.get('name', f"Track {track_number}")
-                language = track.get('language', '')
+                name = (track.get('name') or '').strip()
+                language = (track.get('language') or '').strip()
                 is_pgs = track.get('isPGS', False)
                 codec = track.get('codecId', '')
 
@@ -1535,12 +1553,22 @@ class PremiumControlsOverlay(QWidget):
                 elif 'UTF8' in codec:
                     codec_label = "SRT"
                 else:
-                    codec_label = codec.split('/')[-1] if '/' in codec else codec
+                    codec_label = (codec.split('/')[-1] if '/' in codec else codec) or ''
 
+                # Drop meaningless placeholder names (e.g. "TRACK_1"); build a
+                # readable label from language + codec instead.
+                low = name.lower()
+                is_placeholder = (not name) or (
+                    low.startswith('track') and low[5:].strip(' _0123456789') == ''
+                )
+                parts = []
+                if name and not is_placeholder:
+                    parts.append(name)
                 if language:
-                    label = f"{name} [{language.upper()}] ({codec_label})"
-                else:
-                    label = f"{name} ({codec_label})"
+                    parts.append(f"[{language.upper()}]")
+                if codec_label:
+                    parts.append(f"({codec_label})")
+                label = " ".join(parts) if parts else f"Subtitle {i + 1}"
 
                 # Use 1-based index for UI (matches track selection logic in GUI)
                 ui_index = i + 1

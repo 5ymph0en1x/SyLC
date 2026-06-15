@@ -87,7 +87,7 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
         .def_property_readonly("dropped", &FrameRingBuffer::dropped)
         .def_property_readonly("max_frame_bytes", &FrameRingBuffer::maxFrameBytes)
         .def("pop",
-             [](std::shared_ptr<FrameRingBuffer> self) {
+             [](std::shared_ptr<FrameRingBuffer> self) -> py::tuple {  // explicit return type: clang needs it (MSVC tolerant)
                  FrameBufferView view;
                  size_t slotIndex = 0;
                  if (!self->pop(view, slotIndex)) {
@@ -605,7 +605,10 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
              "Demux next SSIF frame pair into a native ring buffer (zero-copy)")
         .def("seek", &MVCSSIFDemuxer::seek,
              "Seek to timestamp in milliseconds",
-             py::arg("timestamp_ms"));
+             py::arg("timestamp_ms"))
+        .def("set_external_duration_ms", &MVCSSIFDemuxer::setExternalDurationMs,
+             "Provide media duration (ms) so seek() can map timestamp -> byte offset",
+             py::arg("duration_ms"));
 
     // === MVC DECODER (edge264 integration) ===
 

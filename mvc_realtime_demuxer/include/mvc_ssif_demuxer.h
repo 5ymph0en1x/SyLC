@@ -77,9 +77,15 @@ public:
     bool hasCodecPrivate() const { return hasCodecPrivate_; }
 
     /**
-     * Seek to timestamp (not yet implemented)
+     * Seek to timestamp (milliseconds). In streaming mode this does a proportional
+     * byte seek into the interleaved SSIF; the decoder then re-finds the next IDR.
      */
     bool seek(int64_t timestampMs);
+
+    /**
+     * Provide the media duration (ms) so seek() can map timestamp -> byte offset.
+     */
+    void setExternalDurationMs(int64_t ms) { externalDurationMs_ = ms; }
 
 private:
     struct PESState {
@@ -179,6 +185,8 @@ private:
     // to normalize timestamps to start from 0
     int64_t basePtsOffset_;
     bool basePtsInitialized_;
+
+    int64_t externalDurationMs_ = 0;  // media duration for timestamp->byte seek mapping
 
     bool isOpen_;
 };

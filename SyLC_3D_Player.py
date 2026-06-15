@@ -31,6 +31,8 @@ if sys.stderr:
         pass # sys.stderr might be None or a custom object in GUI mode
 
 import os
+import re
+import struct
 
 # CRITICAL HDR FIX: Disable Windows Fullscreen Optimizations
 # This prevents Windows from detecting borderless fullscreen and switching HDR off
@@ -214,6 +216,162 @@ print("[STARTUP] Imports de base reussis")
 os.environ["PATH"] = os.path.dirname(__file__) + os.pathsep + os.environ["PATH"]
 from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QRectF, QPointF, Slot, QEvent, QObject
 from PySide6.QtGui import QPainter, QColor, QFont, QFontMetrics, QPen, QBrush, QPainterPath, QBitmap, QImage, QPixmap, QIcon, QCursor
+
+
+# --- Human-readable track labels (audio / subtitle) -------------------------------
+# mpv/MakeMKV tracks often carry placeholder titles like "TRACK_1" that mean nothing.
+# Build a meaningful label from language + codec (+ channel layout for audio) instead.
+_TRACK_LANG_NAMES = {
+    'eng': 'English', 'en': 'English', 'fre': 'French', 'fra': 'French', 'fr': 'French',
+    'spa': 'Spanish', 'es': 'Spanish', 'ger': 'German', 'deu': 'German', 'de': 'German',
+    'ita': 'Italian', 'it': 'Italian', 'jpn': 'Japanese', 'ja': 'Japanese',
+    'chi': 'Chinese', 'zho': 'Chinese', 'zh': 'Chinese', 'rus': 'Russian', 'ru': 'Russian',
+    'por': 'Portuguese', 'pt': 'Portuguese', 'dut': 'Dutch', 'nld': 'Dutch', 'nl': 'Dutch',
+    'kor': 'Korean', 'ko': 'Korean', 'ara': 'Arabic', 'ar': 'Arabic', 'pol': 'Polish', 'pl': 'Polish',
+    'swe': 'Swedish', 'dan': 'Danish', 'nor': 'Norwegian', 'fin': 'Finnish', 'cze': 'Czech', 'ces': 'Czech',
+    'hun': 'Hungarian', 'tur': 'Turkish', 'tha': 'Thai', 'hin': 'Hindi', 'heb': 'Hebrew',
+    'ell': 'Greek', 'gre': 'Greek', 'ukr': 'Ukrainian', 'vie': 'Vietnamese', 'ind': 'Indonesian',
+}
+_TRACK_CODEC_NAMES = {
+    'eac3': 'Dolby Digital+', 'ac3': 'Dolby Digital', 'ac-3': 'Dolby Digital',
+    'truehd': 'Dolby TrueHD', 'mlp': 'Dolby TrueHD',
+    'dts': 'DTS', 'dca': 'DTS', 'dts-hd': 'DTS-HD', 'aac': 'AAC', 'flac': 'FLAC',
+    'mp3': 'MP3', 'mp2': 'MP2', 'opus': 'Opus', 'vorbis': 'Vorbis',
+    'pcm_bluray': 'LPCM', 'pcm_dvd': 'LPCM', 'pcm_s16le': 'PCM', 'pcm_s24le': 'PCM', 'pcm': 'PCM',
+    # subtitles
+    'hdmv_pgs_subtitle': 'PGS', 'pgssub': 'PGS', 'pgs': 'PGS',
+    'subrip': 'SRT', 'srt': 'SRT', 'ass': 'ASS', 'ssa': 'SSA',
+    'dvd_subtitle': 'VobSub', 'dvdsub': 'VobSub', 'mov_text': 'TX3G',
+}
+_TRACK_CHANNELS = {1: 'Mono', 2: 'Stereo', 3: '2.1', 6: '5.1', 7: '6.1', 8: '7.1'}
+
+
+def _humanize_lang(code):
+    if not code:
+        return ''
+    return _TRACK_LANG_NAMES.get(str(code).strip().lower(), str(code).upper())
+
+
+def _humanize_codec(codec, profile=''):
+    base = _TRACK_CODEC_NAMES.get(str(codec).strip().lower(), str(codec).strip().upper()) if codec else ''
+    p = str(profile or '').strip()
+    if not p or p.lower() in ('unknown', 'none'):
+        return base
+    # DTS family: ffmpeg/mpv profile strings are already canonical ("DTS-HD MA", "DTS-HD HRA", "DTS-ES")
+    label = p if p.lower().startswith('dts') else base
+    if 'atmos' in p.lower() and 'atmos' not in label.lower():
+        label += ' Atmos'
+    return label
+
+
+def _track_int(track, *keys):
+    for k in keys:
+        v = track.get(k)
+        if v:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                pass
+    return 0
+
+
+def _friendly_track_label(track, kind='audio', lang_map=None):
+    """Build a human-readable label for an mpv track-list entry (audio/sub).
+
+    lang_map: optional {PID: 'iso639'} from a Blu-ray .clpi, used when the
+    container itself carries no language tag (raw M2TS/SSIF case).
+    """
+    tid = track.get('id', '?')
+    parts = []
+    # language: prefer the container tag; fall back to the Blu-ray .clpi by PID (src-id)
+    lang_code = (track.get('lang') or '').strip()
+    if not lang_code and lang_map:
+        lang_code = lang_map.get(track.get('src-id'), '') or ''
+    lang = _humanize_lang(lang_code)
+    if lang:
+        parts.append(lang)
+    codec = _humanize_codec(track.get('codec', ''), track.get('codec-profile', ''))
+    if codec:
+        parts.append(codec)
+    if kind == 'audio':
+        ch = _track_int(track, 'demux-channel-count', 'demux_channel_count',
+                        'audio-channels', 'audio_channels')
+        if ch:
+            parts.append(_TRACK_CHANNELS.get(ch, f'{ch}.0'))
+    # keep a real, non-placeholder title (skip MakeMKV "TRACK_1" style)
+    title = (track.get('title') or '').strip()
+    if title and not re.match(r'(?i)^track[\s_]*\d+$', title):
+        parts.append(f'“{title}”')
+    if not parts:
+        parts.append(f'{"Audio" if kind == "audio" else "Subtitle"} {tid}')
+    if track.get('forced'):
+        parts.append('(forced)')
+    elif track.get('default'):
+        parts.append('(default)')
+    return ' · '.join(parts)
+
+
+# --- Blu-ray .clpi language map (raw M2TS/SSIF carries no language tag) ------------
+# Blu-ray stream_coding_type groups (per the BD spec / libbluray):
+_BD_AUDIO_CT = {0x03, 0x04, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0xA1, 0xA2}
+_BD_PGIG_CT = {0x90, 0x91}   # Presentation Graphics / Interactive Graphics (PGS)
+_BD_TEXT_CT = {0x92}         # Text subtitle
+
+
+def _parse_clpi_languages(path):
+    """Parse a Blu-ray .clpi ProgramInfo and return {PID: 'iso639'} (lowercase)."""
+    out = {}
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+        if data[0:4] != b'HDMV':
+            return out
+        proginfo_addr = struct.unpack('>I', data[12:16])[0]
+        q = proginfo_addr + 4   # skip ProgramInfo length
+        q += 1                  # reserved (8 bits)
+        num_prog = data[q]; q += 1
+        for _ in range(num_prog):
+            q += 6              # spn_program_sequence_start(4) + program_map_pid(2)
+            num_streams = data[q]; q += 1
+            q += 1              # num_groups
+            for _ in range(num_streams):
+                pid = struct.unpack('>H', data[q:q+2])[0]; q += 2
+                sci_len = data[q]; q += 1
+                sci = data[q:q+sci_len]; q += sci_len
+                if not sci:
+                    continue
+                ct = sci[0]
+                lang = ''
+                if ct in _BD_AUDIO_CT and len(sci) >= 5:
+                    lang = sci[2:5].decode('ascii', 'replace')   # after coding_type + format byte
+                elif ct in _BD_PGIG_CT and len(sci) >= 4:
+                    lang = sci[1:4].decode('ascii', 'replace')   # right after coding_type
+                elif ct in _BD_TEXT_CT and len(sci) >= 5:
+                    lang = sci[2:5].decode('ascii', 'replace')
+                lang = lang.strip('\x00').strip()
+                if lang:
+                    out[pid] = lang.lower()
+    except Exception:
+        pass
+    return out
+
+
+def _find_clpi_for_media(media_path):
+    """Locate the matching CLIPINF/<stem>.clpi for a BDMV STREAM file, or None."""
+    try:
+        stem = os.path.splitext(os.path.basename(media_path))[0]
+        d = os.path.dirname(os.path.abspath(media_path))
+        for _ in range(4):   # .../STREAM/SSIF -> STREAM -> BDMV (CLIPINF sits beside STREAM)
+            cand = os.path.join(d, 'CLIPINF', stem + '.clpi')
+            if os.path.isfile(cand):
+                return cand
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+    except Exception:
+        pass
+    return None
 
 
 def _find_asset(name):
@@ -622,6 +780,16 @@ APP_STYLE = """
     QMainWindow, QWidget {
         background-color: #1e1e1e;
         color: #F0F0F0;
+        font-family: 'Segoe UI', sans-serif;
+    }
+
+    QToolTip {
+        color: #F5F5F5;
+        background-color: #2A2A2A;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 4px;
+        padding: 4px 8px;
+        font-size: 12px;
         font-family: 'Segoe UI', sans-serif;
     }
 
@@ -2162,6 +2330,7 @@ class PlayerWindow(QMainWindow):
             self._seek_queue.seek_completed.connect(self._on_seek_completed_logic)
 
         self.controls_overlay.file_opened.connect(self.open_file_dialog)
+        self.controls_overlay.disc_opened.connect(self.open_disc_dialog)
         self.controls_overlay.mode_3d_toggled.connect(self.toggle_3d_mode)
         self.controls_overlay.stereo_mode_changed.connect(self.change_stereo_mode)
         self.controls_overlay.audio_track_changed.connect(self.change_audio_track)
@@ -2465,6 +2634,17 @@ class PlayerWindow(QMainWindow):
 
         if self.mvc_decoder_thread and self.mvc_decoder_thread.isRunning():
             print(f"[SEEK-QUEUE] Requesting decoder seek to {target_time:.3f}s")
+            # CRITICAL (SSIF/M2TS): the demuxer's proportional byte seek needs the media
+            # duration. mpv has it by now (the slider works) even if the async observer
+            # never propagated it, so push it right before seeking (the guaranteed point).
+            # Without it the C++ seek divides into 0ms and lands at byte 0 = restart.
+            try:
+                _dur = (self.player.duration if self.player else None) or \
+                       (self.video_3d_info.get('duration') if self.video_3d_info else None)
+                if _dur and _dur > 0:
+                    self.mvc_decoder_thread.set_media_duration(float(_dur))
+            except Exception:
+                pass
             # V7b FIX: Prime audio clock to target to prevent false drift calc
             self.mvc_decoder_thread.update_audio_clock(target_time)
             self.mvc_decoder_thread.seek(target_time)
@@ -2633,6 +2813,14 @@ class PlayerWindow(QMainWindow):
         self.controls_overlay.set_duration(value)
         if self.current_file_path:
             self.controls_overlay.time_slider.set_video_file(self.current_file_path, value or 0)
+        # CRITICAL (SSIF/M2TS seek): mpv reports duration asynchronously, usually AFTER
+        # the MVC decoder + its demuxer were created, so the demuxer's proportional seek
+        # never got a duration and landed at byte 0 (restart). Push it now so seeks work.
+        if value and getattr(self, 'mvc_decoder_thread', None):
+            try:
+                self.mvc_decoder_thread.set_media_duration(float(value))
+            except Exception as e:
+                logger.warning(f"[MVC] set_media_duration propagation failed: {e}")
 
     def on_time_update(self, _, value):
         """MPV time position changed - called from MPV event thread!"""
@@ -3360,17 +3548,36 @@ class PlayerWindow(QMainWindow):
         if not self.has_media: return
         QTimer.singleShot(500, self._fetch_audio_tracks)
 
+    def _get_clpi_lang_map(self):
+        """Return {PID: 'iso639'} from the Blu-ray .clpi for the current file (cached).
+
+        Raw M2TS/SSIF streams carry no language tag; the per-PID language lives in
+        the disc's CLIPINF/<clip>.clpi. Returns {} for non-BDMV files (e.g. MKV,
+        which carry their own language tags that mpv exposes directly).
+        """
+        path = getattr(self, 'current_file_path', None)
+        if not path:
+            return {}
+        if getattr(self, '_clpi_lang_map_path', None) == path:
+            return self._clpi_lang_map
+        clpi = _find_clpi_for_media(path)
+        self._clpi_lang_map = _parse_clpi_languages(clpi) if clpi else {}
+        self._clpi_lang_map_path = path
+        if self._clpi_lang_map:
+            logger.info(f"[CLPI] Loaded {len(self._clpi_lang_map)} stream languages from {os.path.basename(clpi)}")
+        return self._clpi_lang_map
+
     def _fetch_audio_tracks(self):
         try:
             if not self.player: return
             track_list = self.player.track_list
+            lang_map = self._get_clpi_lang_map()
             audio_tracks = []
             for track in track_list:
                 if track.get('type') == 'audio':
                     track_id = track.get('id')
-                    title = track.get('title', f"Track {track_id}")
-                    lang = track.get('lang', '')
-                    audio_tracks.append((track_id, title, lang))
+                    label = _friendly_track_label(track, 'audio', lang_map)
+                    audio_tracks.append((track_id, label, ''))  # label is already complete
             print(f"Audio tracks found: {len(audio_tracks)}")
             self.controls_overlay.update_audio_tracks(audio_tracks)
         except Exception as e:
@@ -3679,15 +3886,15 @@ class PlayerWindow(QMainWindow):
                 return
             track_list = self.player.track_list
             logger.info(f"[SUBTITLE] track_list has {len(track_list)} tracks")
+            lang_map = self._get_clpi_lang_map()
             subtitle_tracks = []
             for track in track_list:
                 logger.debug(f"[SUBTITLE] track type={track.get('type')}")
                 if track.get('type') == 'sub':
                     track_id = track.get('id')
-                    title = track.get('title', f"Track {track_id}")
-                    lang = track.get('lang', '')
-                    subtitle_tracks.append((track_id, title, lang))
-                    logger.info(f"[SUBTITLE]   Found subtitle: id={track_id}, title={title}, lang={lang}")
+                    label = _friendly_track_label(track, 'sub', lang_map)
+                    subtitle_tracks.append((track_id, label, ''))  # label is already complete
+                    logger.info(f"[SUBTITLE]   Found subtitle: id={track_id}, label={label}")
             logger.info(f"[SUBTITLE] Subtitle tracks found: {len(subtitle_tracks)}")
             self.controls_overlay.update_subtitle_tracks(subtitle_tracks)
 
@@ -3738,12 +3945,45 @@ class PlayerWindow(QMainWindow):
     # ================================================
 
     def open_file_dialog(self):
-        # V1.0: Initial release supports MKV only (BD3D/SSIF/M2TS coming in future version)
+        # MKV (MVC) + Blu-ray 3D raw streams (SSIF/M2TS) via the native demuxer.
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Open a video", "", "Video Files (*.mkv *.mk3d *.mp4 *.avi);;All files (*.*)"
+            self, "Open a video or Blu-ray ISO",
+            "",
+            "Video / Blu-ray (*.mkv *.mk3d *.ssif *.m2ts *.ts *.mp4 *.avi *.iso);;"
+            "Blu-ray disc image (*.iso);;"
+            "Blu-ray streams (*.ssif *.m2ts *.ts);;All files (*.*)"
         )
         if file_path:
             self.play_file(file_path)
+
+    def open_disc_dialog(self):
+        """Open a Blu-ray 3D disc/folder: pick a drive letter (e.g. J:\\) or a BDMV folder.
+        The feature film's SSIF is auto-detected (duration-based main-title detection)."""
+        folder = QFileDialog.getExistingDirectory(
+            self, "Open a Blu-ray 3D — pick the drive (e.g. J:\\) or the BDMV folder", ""
+        )
+        if folder:
+            self.play_file(folder)  # play_file auto-detects the feature SSIF on a disc/folder
+
+    def dragEnterEvent(self, event):
+        """Accept drag of files/folders (including a Blu-ray drive or BDMV folder)."""
+        try:
+            if event.mimeData().hasUrls():
+                event.acceptProposedAction()
+        except Exception:
+            pass
+
+    def dropEvent(self, event):
+        """Play a dropped file, or auto-detect the 3D feature from a dropped folder/disc."""
+        try:
+            urls = event.mimeData().urls()
+            if urls:
+                path = urls[0].toLocalFile()
+                if path:
+                    event.acceptProposedAction()
+                    self.play_file(path)  # smart: file, folder, drive root, or BDMV
+        except Exception as e:
+            logger.warning(f"[DROP] {e}")
 
     def resizeEvent(self, event):
         """Repositions overlays on window resize."""
@@ -3875,7 +4115,7 @@ class PlayerWindow(QMainWindow):
             if self.mvc_decoder_thread and self.mvc_mode_active and hasattr(self.mvc_decoder_thread, 'adjust_av_offset'):
                 delta = 0.05 if key == Qt.Key.Key_BracketRight else -0.05
                 off = self.mvc_decoder_thread.adjust_av_offset(delta)
-                self.show_3d_notification(f"Sync A/V — video retardee de {off*1000:.0f} ms", success=True)
+                self.show_3d_notification(f"A/V sync — video delayed by {off*1000:.0f} ms", success=True)
             event.accept()
             return
 
@@ -3883,6 +4123,17 @@ class PlayerWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._stop_mvc_decoder()
+        # Release any Blu-ray ISO we mounted, so no phantom drive is left behind.
+        try:
+            import bluray_disc
+            for m in (getattr(self, '_active_iso_mount', None),
+                      getattr(self, '_pending_iso_mount', None)):
+                if m:
+                    bluray_disc.dismount_iso(m[0])
+            self._active_iso_mount = None
+            self._pending_iso_mount = None
+        except Exception:
+            pass
         self.controls_overlay.close()
         self.info_overlay.close()
         self.loading_overlay.close()
@@ -3942,25 +4193,103 @@ class PlayerWindow(QMainWindow):
 
         self.monitoring_overlay.move(global_pos)
 
+    def _dismount_pending_iso(self):
+        """Dismount an ISO we just mounted but couldn't use (best-effort)."""
+        try:
+            import bluray_disc
+            pending = getattr(self, '_pending_iso_mount', None)
+            if pending:
+                logger.info(f"[DISC] Dismounting unused ISO: {pending[0]}")
+                bluray_disc.dismount_iso(pending[0])
+                self._pending_iso_mount = None
+        except Exception as e:
+            logger.warning(f"[DISC] Dismount (pending) failed: {e}")
+
+    def _promote_iso_mount(self):
+        """After the previous file's handles are released: dismount the previously
+        active ISO (when switching away from it) and promote the just-mounted one to
+        active. Best-effort — a stuck mount must never block playback."""
+        try:
+            import bluray_disc
+            pending = getattr(self, '_pending_iso_mount', None)
+            active = getattr(self, '_active_iso_mount', None)
+            if active and (not pending or active[0] != pending[0]):
+                logger.info(f"[DISC] Dismounting previous ISO: {active[0]}")
+                bluray_disc.dismount_iso(active[0])
+                active = None
+            self._active_iso_mount = pending or active
+            self._pending_iso_mount = None
+        except Exception as e:
+            logger.warning(f"[DISC] ISO promote failed: {e}")
+
     def play_file(self, file_path):
-        """Loads and starts playing a video file - V7a Enhanced with cleanup delay."""
+        """Loads and starts playing a video file - V7a Enhanced with cleanup delay.
+
+        Also accepts a Blu-ray 3D disc/folder: a drive letter (J:\\), a BDMV folder,
+        an index.bdmv, or any folder containing a BDMV. In that case the feature film
+        ("main title") SSIF is auto-detected (duration-based, robust to decoy playlists).
+        """
+        try:
+            import bluray_disc
+            from PySide6.QtWidgets import QApplication
+            self._pending_iso_mount = None
+            # Blu-ray ISO: mount it (no admin needed) and treat the mount as the disc.
+            if bluray_disc.is_iso(file_path):
+                try:
+                    self.show_3d_notification("Mounting Blu-ray ISO…", success=True)
+                    QApplication.processEvents()
+                except Exception:
+                    pass
+                drive = bluray_disc.mount_iso(file_path)
+                if drive and bluray_disc.is_bluray_path(drive):
+                    self._pending_iso_mount = (file_path, drive)
+                    logger.info(f"[DISC] Mounted ISO {file_path} -> {drive}")
+                    file_path = drive  # detect the feature on the mounted drive
+                elif drive:
+                    bluray_disc.dismount_iso(file_path)
+                    self.show_3d_notification("ISO has no Blu-ray (BDMV) structure", success=False)
+                    return
+                else:
+                    self.show_3d_notification("Could not mount the ISO", success=False)
+                    return
+            if os.path.isdir(file_path) or bluray_disc.is_bluray_path(file_path):
+                try:
+                    self.show_3d_notification("Detecting the feature on disc…", success=True)
+                    QApplication.processEvents()
+                except Exception:
+                    pass
+                feat, info = bluray_disc.find_feature(file_path)
+                if feat:
+                    kind = info.get('kind')
+                    mins = (info.get('duration_s') or 0) / 60.0
+                    logger.info(f"[DISC] Feature ({kind}): {feat} | method={info.get('method')} "
+                                f"dur={info.get('duration_s', 0):.0f}s playlist={info.get('playlist')} "
+                                f"clip={info.get('clip')}")
+                    label = "3D feature" if kind == 'ssif' else "2D feature"
+                    self.show_3d_notification(f"{label}: {os.path.basename(feat)} ({mins:.0f} min)", success=True)
+                    file_path = feat
+                else:
+                    logger.info(f"[DISC] No feature found under: {file_path}")
+                    self.show_3d_notification("No playable feature found on this disc/folder", success=False)
+                    self._dismount_pending_iso()
+                    return
+        except Exception as e:
+            logger.warning(f"[DISC] BDMV detection failed: {e}")
+
+        # If detection threw/failed and left a directory or drive root, abort cleanly
+        # instead of trying to "play" a folder.
+        if os.path.isdir(file_path):
+            logger.warning(f"[DISC] No playable feature resolved from: {file_path}")
+            self._dismount_pending_iso()
+            self.show_3d_notification("No playable feature found on this disc/folder", success=False)
+            return
+
         if not os.path.exists(file_path):
             print(f"File not found: {file_path}")
             return
 
-        # V1.0: Initial release - SSIF/M2TS support coming in future version
+        # SSIF/M2TS (Blu-ray 3D raw streams) are now supported via the native demuxer.
         file_ext = os.path.splitext(file_path)[1].lower()
-        if file_ext in ('.ssif', '.m2ts'):
-            QMessageBox.information(
-                self,
-                "Format Not Yet Supported",
-                f"Blu-ray 3D files ({file_ext.upper()}) will be supported in a future version.\n\n"
-                "Currently supported formats:\n"
-                "• MKV (Matroska) - Full MVC 3D support\n"
-                "• MP4, AVI - Standard 2D playback\n\n"
-                "To play Blu-ray 3D content, please use MakeMKV to convert to MKV format."
-            )
-            return
 
         if not self.player:
             print("Player not ready, retrying...")
@@ -4007,6 +4336,10 @@ class PlayerWindow(QMainWindow):
 
         # Stop decoder and wait for cleanup to complete
         self._stop_mvc_decoder()
+
+        # The previous file's handles are now released — dismount the previously
+        # active ISO (if we're switching away) and promote the just-mounted one.
+        self._promote_iso_mount()
 
         # CRITICAL FIX: Add delay after cleanup to ensure all threads are stopped
         # and resources are released before starting new file
@@ -4181,6 +4514,14 @@ class PlayerWindow(QMainWindow):
                         self.controls_overlay.set_duration(mpv_duration)
                         self.controls_overlay.time_slider.set_video_file(self.current_file_path, mpv_duration)
                         logger.info(f"[TIMELINE] Updated range from MPV: {mpv_duration}s")
+
+                        # SSIF/M2TS seek needs this duration inside the demuxer (proportional
+                        # byte seek). This is where mpv's duration reliably lands at startup.
+                        if getattr(self, 'mvc_decoder_thread', None):
+                            try:
+                                self.mvc_decoder_thread.set_media_duration(float(mpv_duration))
+                            except Exception:
+                                pass
 
                         # NOW start playback with correct timeline scale
                         # Explicitly force UI to playing state (Pause Icon) immediately
@@ -5174,10 +5515,10 @@ class PlayerWindow(QMainWindow):
         # Cleanup complet du decodeur MVC (mais watchdog dejÃ  arrÃªte)
         self._stop_mvc_decoder()
 
-        # Informer l'utilisateur - TOUTE erreur fatale du decodeur
+        # Inform the user - ANY fatal decoder error
         self.show_3d_notification(
-            "Erreur fatale du decodeur MVC - Lecture audio uniquement.\n"
-            "BUG dans EDGE264 detecte.",
+            "Fatal MVC decoder error — audio-only playback.\n"
+            "edge264 bug detected.",
             success=False
         )
         logger.info("[MVC ERROR] Fallback to audio-only playback")
@@ -5240,8 +5581,17 @@ class PlayerWindow(QMainWindow):
                 return
 
             # === SMART AUDIO SYNC ALGORITHM ===
+            # Velvet #9: make this corrector aware of the V58 video-delay offset so it targets the
+            # SAME delayed position the decoder's V12 sync does, instead of fighting it. When it was
+            # V58-unaware it read raw_timestamp-audio_pos as a ~610ms "lag" and railed the decoder
+            # PI to -250ms -> video paced ~25% fast -> a constant brake/race judder. Targeting the
+            # offset lets both correctors cooperate -> stable, smooth playback.
+            av_offset = 0.0
+            if self.mvc_decoder_thread is not None:
+                av_offset = getattr(self.mvc_decoder_thread, '_av_sync_offset_s', 0.0) or 0.0
+
             # 1. Low-pass bias filter: Cancel constant offsets without abrupt skips
-            raw_error_ms = (raw_timestamp - audio_pos) * 1000.0  # Convert to ms
+            raw_error_ms = (raw_timestamp - audio_pos + av_offset) * 1000.0  # Convert to ms
 
             if abs(raw_error_ms) < self.SYNC_BIAS_WINDOW_MS:
                 # Learn bias from small errors (adaptive low-pass filter)
@@ -5253,7 +5603,7 @@ class PlayerWindow(QMainWindow):
             self._last_mvc_timestamp = absolute_timestamp
 
             # 3. Calculate residual error after bias correction
-            sync_error_ms = (absolute_timestamp - audio_pos) * 1000.0  # ms for comparison
+            sync_error_ms = (absolute_timestamp - audio_pos + av_offset) * 1000.0  # ms for comparison
             now = time.monotonic()
 
             # 4. Progressive drift correction (3-tier strategy)

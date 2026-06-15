@@ -99,6 +99,7 @@ class SubtitleManager(QObject):
         if not enabled:
             self._current_display_set = None
             self._last_update_pts = -1.0
+            self._last_img_key = None
             self.subtitle_cleared.emit()
             logger.debug("[SubtitleManager] Subtitles disabled")
         else:
@@ -120,6 +121,7 @@ class SubtitleManager(QObject):
         self._parser = None
         self._current_display_set = None
         self._last_update_pts = -1.0
+        self._last_img_key = None
         self.subtitle_cleared.emit()
 
     @Slot(float)
@@ -132,6 +134,15 @@ class SubtitleManager(QObject):
         Args:
             time_seconds: Current playback position in seconds
         """
+        # Anti-jitter / multi-source guard: update_time() is driven by several clock sources
+        # (clamped UI time, raw MPV time-pos, the periodic position poller) that disagree by
+        # tens of ms and can step BACKWARDS. A backward blip at a subtitle transition snaps the
+        # lookup to the previous display set -> "cross-display" flicker (next shows, previous
+        # flashes, then next). Hold the subtitle clock monotonic for small backward steps; a
+        # real seek (large jump, or on_seek()) resets it.
+        if (time_seconds < self._last_time_seconds
+                and (self._last_time_seconds - time_seconds) < 1.0):
+            time_seconds = self._last_time_seconds
         self._last_time_seconds = time_seconds
 
         if not self._enabled or self._parser is None:
@@ -153,6 +164,7 @@ class SubtitleManager(QObject):
             if self._current_display_set is not None:
                 self._current_display_set = None
                 self._last_update_pts = -1.0
+                self._last_img_key = None
                 self.subtitle_cleared.emit()
         else:
             # Check if it's a different display set (by PTS)
@@ -162,13 +174,31 @@ class SubtitleManager(QObject):
 
                 # Render and emit
                 if display_set.rendered_image is not None:
+                    img = display_set.rendered_image
+                    # Suppress re-render when the image is IDENTICAL to what's already on
+                    # screen. Blu-ray PGS re-transmits the same subtitle as periodic epochs
+                    # (different PTS, same pixels); re-emitting would re-upload the texture and
+                    # flash near the end of the display. Compare a cheap content key.
+                    img_key = (img.shape, hash(img.tobytes()))
+                    if img_key == getattr(self, '_last_img_key', None):
+                        return  # same subtitle re-sent -> already displayed, no re-render
+                    self._last_img_key = img_key
                     x = display_set.render_x
                     y = display_set.render_y
-                    h, w = display_set.rendered_image.shape[:2]
+                    h, w = img.shape[:2]
+                    # Normalize against the PGS COMPOSITION resolution (the PCS
+                    # video_descriptor the coordinates were authored against — almost
+                    # always 1920x1080 for Blu-ray), NOT the decoded video size.
+                    # They diverge for cropped content (e.g. a 2.39:1 film stored as
+                    # 1920x816): a y=982 coordinate over a 816-tall reference normalizes
+                    # to >1.0 and the subtitle lands off-screen. The decoded size is only
+                    # a fallback when the parser didn't report a composition size.
+                    ref_w = getattr(display_set, 'width', 0) or self._video_width
+                    ref_h = getattr(display_set, 'height', 0) or self._video_height
                     self.subtitle_changed.emit(
-                        display_set.rendered_image,
+                        img,
                         x, y, w, h,
-                        self._video_width, self._video_height
+                        ref_w, ref_h
                     )
 
     @Slot()
@@ -179,6 +209,8 @@ class SubtitleManager(QObject):
         """
         self._current_display_set = None
         self._last_update_pts = -1.0
+        self._last_img_key = None
+        self._last_time_seconds = -1.0  # reset monotonic clock so the post-seek time is honored
 
         # Clear streaming buffer if in streaming mode
         if self._streaming_mode and self._parser:
@@ -213,6 +245,7 @@ class SubtitleManager(QObject):
         self._streaming_mode = True
         self._current_display_set = None
         self._last_update_pts = -1.0
+        self._last_img_key = None
 
     @Slot(bytes, float)
     def on_pgs_data(self, pgs_data: bytes, pts: float):

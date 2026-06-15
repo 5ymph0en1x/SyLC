@@ -12,6 +12,7 @@ Version: 5.7 - CRITICAL FIX for 64GB memory leak in minutes
 import ctypes
 import sys
 import os
+import struct
 import time
 import logging
 import threading
@@ -19,6 +20,111 @@ import gc
 import numpy as np
 from collections import deque
 from PySide6.QtCore import QThread, Signal, QMutex, QWaitCondition
+
+
+# -----------------------------------------------------------------------------
+# Blu-ray .clpi EP_map (PTS -> byte seek index for the base view)
+# Lets the SSIF/M2TS dual-file demuxer land exactly on an IDR for frame-accurate
+# seeking (instead of a slow byte binary-search). Validated against real discs.
+# -----------------------------------------------------------------------------
+class _ClpiBits:
+    __slots__ = ('d', 'pos')
+
+    def __init__(self, data, byte_pos=0):
+        self.d = data
+        self.pos = byte_pos * 8
+
+    def u(self, n):
+        v = 0
+        d = self.d
+        p = self.pos
+        for _ in range(n):
+            v = (v << 1) | ((d[p >> 3] >> (7 - (p & 7))) & 1)
+            p += 1
+        self.pos = p
+        return v
+
+    def skip(self, n):
+        self.pos += n
+
+    def bytepos(self):
+        return self.pos >> 3
+
+
+def _parse_clpi_epmap(path):
+    """Parse a Blu-ray .clpi CPI/EP_map. Returns (pts_ms_list, byte_list) for the first
+    stream PID (the base view), RAW timestamps (90kHz/90), bytes = SPN*192. ([],[]) on failure."""
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+        if data[0:4] != b'HDMV':
+            return [], []
+        cpi_start = struct.unpack('>I', data[16:20])[0]
+        bs = _ClpiBits(data, cpi_start)
+        cpi_len = bs.u(32)
+        if cpi_len == 0:
+            return [], []
+        bs.skip(12)            # reserved
+        bs.u(4)                # CPI_type
+        ep_map_start = bs.bytepos()
+        bs.skip(8)             # reserved_for_future_use
+        num_pid = bs.u(8)
+        entries = []
+        for _ in range(num_pid):
+            pid = bs.u(16)
+            bs.skip(10)
+            bs.u(4)                       # EP_stream_type
+            num_coarse = bs.u(16)
+            num_fine = bs.u(18)
+            start_addr = bs.u(32)
+            entries.append((pid, num_coarse, num_fine, start_addr))
+        if not entries:
+            return [], []
+        pid, num_coarse, num_fine, start_addr = entries[0]
+        base = ep_map_start + start_addr
+        b = _ClpiBits(data, base)
+        ep_fine_table_start = b.u(32)
+        coarse = []
+        for _ in range(num_coarse):
+            ref_fine = b.u(18); pts_c = b.u(14); spn_c = b.u(32)
+            coarse.append((ref_fine, pts_c, spn_c))
+        bf = _ClpiBits(data, base + ep_fine_table_start)
+        fine = []
+        for _ in range(num_fine):
+            bf.u(1); bf.u(3)             # is_angle_change_point, I_end_position_offset
+            pts_f = bf.u(11); spn_f = bf.u(17)
+            fine.append((pts_f, spn_f))
+        pts_ms, byte_off = [], []
+        for ci, (ref_fine, pts_c, spn_c) in enumerate(coarse):
+            nxt = coarse[ci + 1][0] if ci + 1 < len(coarse) else len(fine)
+            for fi in range(ref_fine, min(nxt, len(fine))):
+                pf, sf = fine[fi]
+                pts90k = (((pts_c & ~0x01) << 18) + (pf << 8)) * 2   # 45kHz -> 90kHz
+                spn = (spn_c & ~0x1FFFF) + sf
+                pts_ms.append(pts90k // 90)
+                byte_off.append(spn * 192)
+        return pts_ms, byte_off
+    except Exception:
+        return [], []
+
+
+def _find_clpi_for_media(media_path):
+    """Locate CLIPINF/<stem>.clpi for a BDMV STREAM file (.ssif/.m2ts), or None."""
+    try:
+        stem = os.path.splitext(os.path.basename(media_path))[0]
+        d = os.path.dirname(os.path.abspath(media_path))
+        for _ in range(4):   # .../STREAM/SSIF -> STREAM -> BDMV (CLIPINF beside STREAM)
+            cand = os.path.join(d, 'CLIPINF', stem + '.clpi')
+            if os.path.isfile(cand):
+                return cand
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+    except Exception:
+        pass
+    return None
+
 
 # -----------------------------------------------------------------------------
 # Nuitka Onefile Support - MUST be before importing .pyd modules
@@ -509,6 +615,22 @@ class MVCDecoderThread(QThread):
                 self._native_decoder = None
                 self._use_native_pipeline = False
 
+    def set_media_duration(self, seconds):
+        """Update the media duration (seconds) so proportional SSIF/M2TS seek works.
+
+        mpv reports duration asynchronously, often AFTER this thread and its demuxer
+        were created, so the startup set_external_duration_ms() can be skipped (the
+        proportional C++ seek then divides into a zero duration and lands at byte 0 =
+        restart). The GUI calls this when mpv's duration arrives; the value is also
+        re-applied to the demuxer right before each seek, on this thread.
+        """
+        try:
+            if not seconds or float(seconds) <= 0:
+                return
+            self._media_duration = float(seconds)
+        except (TypeError, ValueError):
+            pass
+
     def seek(self, time_pos):
         """Request a seek to the specified time (seconds)."""
         self.mutex.lock()
@@ -788,6 +910,20 @@ class MVCDecoderThread(QThread):
                     logger.info(f"[MVC-THREAD] External duration hint set: {self._media_duration:.3f}s")
             except Exception as e:
                 logger.warning(f"[MVC-THREAD] Could not set external duration hint: {e}")
+
+            # Frame-accurate SSIF/M2TS seeking: feed the base-view EP_map (PTS->byte) from the
+            # Blu-ray .clpi so the demuxer lands exactly on an IDR instead of binary-searching.
+            # Best-effort — the dual-file PTS binary-search seek works fine without it.
+            try:
+                if hasattr(self.demuxer, "set_base_seek_table"):
+                    clpi = _find_clpi_for_media(self.filepath)
+                    if clpi:
+                        pts_ms, byte_off = _parse_clpi_epmap(clpi)
+                        if pts_ms:
+                            self.demuxer.set_base_seek_table(pts_ms, byte_off)
+                            logger.info(f"[MVC-THREAD] EP_map seek table: {len(pts_ms)} entries from {os.path.basename(clpi)}")
+            except Exception as e:
+                logger.warning(f"[MVC-THREAD] EP_map load skipped: {e}")
 
             logger.info("[MVC-THREAD] Demuxer opened successfully")
 
@@ -1575,6 +1711,15 @@ class MVCDecoderThread(QThread):
                     success = False
                     try:
                         if hasattr(self.demuxer, 'seek'):
+                            # SSIF/M2TS proportional seek needs the duration; mpv may have
+                            # reported it only AFTER demuxer init, so re-apply it here (on
+                            # this thread) right before seeking. Without it the C++ seek
+                            # divides into a zero duration and lands at byte 0 (restart).
+                            if hasattr(self.demuxer, 'set_external_duration_ms') and self._media_duration:
+                                try:
+                                    self.demuxer.set_external_duration_ms(int(float(self._media_duration) * 1000))
+                                except Exception:
+                                    pass
                             success = self.demuxer.seek(int(optimized_target * 1000))
                             # Récupérer le timestamp Cues réel si disponible
                             if hasattr(self.demuxer, 'getLastCueTimestamp'):
@@ -4216,7 +4361,13 @@ class MVCDecoderThread(QThread):
 
                 try:
                     self._emit_single_frame(frame)
-                    self._last_display_time = current_time
+                    # Velvet #9: phase-accurate schedule — advance by the target, not to
+                    # current_time, so per-frame overhead (~2ms) doesn't accumulate into a slow
+                    # drift (which made the video fall behind -> bulk-drops). Resync on a real
+                    # stall (>1 frame behind) to avoid a catch-up burst.
+                    self._last_display_time += adjusted_frame_time
+                    if current_time - self._last_display_time > adjusted_frame_time:
+                        self._last_display_time = current_time
                     # V43: Track frames emitted for startup grace period
                     self._v12_frames_emitted = getattr(self, '_v12_frames_emitted', 0) + 1
                 except Exception as e:

@@ -346,69 +346,61 @@ bool MVCSSIFDemuxer::readNextFramePairStreaming(FramePair& framePair) {
             return false;
         }
 
-        // Wait for at least 3 base frames before emitting (to handle out-of-order arrival)
-        // This ensures we can properly order frames by PTS
-        // Exception: if we have many frames buffered, start emitting to avoid memory issues
-        if (baseFrameBuffer_.size() < 3 && baseFrameBuffer_.size() < MAX_FRAME_BUFFER_SIZE / 2) {
-            return false;  // Wait for more base frames
-        }
+        // CRITICAL (corruption fix): emit base frames in DECODE order — the FIFO order they
+        // arrive in the stream (= DTS order) — NOT sorted by PTS. H.264 Blu-ray uses B-frames,
+        // so presentation (PTS) order != decode order; feeding the decoder in PTS order makes it
+        // decode B/P frames before their reference frames -> green frames + macroblock garbage.
+        // The base PID arrives in decode order, so the FRONT of baseFrameBuffer_ is the next frame
+        // to decode. Pair it with its dependent view by PTS (same temporal instant). edge264 then
+        // performs presentation reordering itself (DPB), exactly as on the working MKV path.
+        BufferedFrame& front = baseFrameBuffer_.front();
+        int64_t basePts = front.pts;
 
-        // Find the LOWEST PTS match (to emit frames in correct temporal order)
-        // This is critical for decoder reference frame management
-        int64_t bestPts = INT64_MAX;
-        size_t bestBi = 0, bestDi = 0;
-        bool foundMatch = false;
-
-        for (size_t bi = 0; bi < baseFrameBuffer_.size(); bi++) {
-            int64_t basePts = baseFrameBuffer_[bi].pts;
-
-            for (size_t di = 0; di < dependentFrameBuffer_.size(); di++) {
-                int64_t depPts = dependentFrameBuffer_[di].pts;
-                int64_t ptsDiff = std::abs(basePts - depPts);
-
-                if (ptsDiff <= PTS_MATCH_TOLERANCE && basePts < bestPts) {
-                    bestPts = basePts;
-                    bestBi = bi;
-                    bestDi = di;
-                    foundMatch = true;
-                }
+        int bestDi = -1;
+        int64_t bestDiff = PTS_MATCH_TOLERANCE + 1;
+        for (size_t di = 0; di < dependentFrameBuffer_.size(); di++) {
+            int64_t diff = std::abs(basePts - dependentFrameBuffer_[di].pts);
+            if (diff <= PTS_MATCH_TOLERANCE && diff < bestDiff) {
+                bestDiff = diff;
+                bestDi = static_cast<int>(di);
             }
         }
 
-        if (foundMatch) {
-            int64_t basePts = baseFrameBuffer_[bestBi].pts;
-
-            // PTS NORMALIZATION: Capture first valid PTS as offset
-            // Blu-ray streams often start at non-zero PTS (e.g., ~11s = 1048560 ticks)
-            // We subtract this offset to get timestamps starting from 0
-            if (!basePtsInitialized_) {
-                basePtsOffset_ = basePts;
-                basePtsInitialized_ = true;
-                fprintf(stderr, "[SSIF] PTS normalization: first PTS=%lld (%.3fs), using as offset\n",
-                        (long long)basePtsOffset_, basePtsOffset_ / 90000.0);
+        if (bestDi < 0) {
+            // Dependent view for this base frame not arrived yet -> wait for more packets.
+            // Deadlock guard: if the dependent buffer is full and still no match, this base's
+            // dependent is genuinely missing -> drop this base frame to resync.
+            if (dependentFrameBuffer_.size() >= MAX_FRAME_BUFFER_SIZE) {
+                baseFrameBuffer_.erase(baseFrameBuffer_.begin());
             }
-
-            framePair.baseData = std::move(baseFrameBuffer_[bestBi].data);
-            framePair.dependentData = std::move(dependentFrameBuffer_[bestDi].data);
-            // Use normalized timestamp (PTS - offset) / 90
-            int64_t normalizedPts = basePts - basePtsOffset_;
-            framePair.timestamp = normalizedPts / 90;  // 90kHz to ms
-            framePair.isKeyframe = baseFrameBuffer_[bestBi].isKeyframe;
-
-            // Remove matched frames from buffers
-            baseFrameBuffer_.erase(baseFrameBuffer_.begin() + bestBi);
-            dependentFrameBuffer_.erase(dependentFrameBuffer_.begin() + bestDi);
-
-            totalFramePairs++;
-            if (totalFramePairs == 1 || totalFramePairs % 500 == 0) {
-                fprintf(stderr, "[SSIF] Frame #%d: ts=%lld ms, base=%zu, dep=%zu%s\n",
-                        totalFramePairs, (long long)framePair.timestamp,
-                        framePair.baseData.size(), framePair.dependentData.size(),
-                        framePair.isKeyframe ? " [IDR]" : "");
-            }
-            return true;
+            return false;
         }
-        return false;
+
+        // PTS NORMALIZATION: Blu-ray streams often start at non-zero PTS; capture the first PTS
+        // as offset so display timestamps start from 0. (PTS, not decode order, drives display.)
+        if (!basePtsInitialized_) {
+            basePtsOffset_ = basePts;
+            basePtsInitialized_ = true;
+            fprintf(stderr, "[SSIF] PTS normalization: first PTS=%lld (%.3fs), using as offset\n",
+                    (long long)basePtsOffset_, basePtsOffset_ / 90000.0);
+        }
+
+        framePair.baseData = std::move(front.data);
+        framePair.dependentData = std::move(dependentFrameBuffer_[bestDi].data);
+        framePair.timestamp = (basePts - basePtsOffset_) / 90;  // 90kHz -> ms (presentation ts)
+        framePair.isKeyframe = front.isKeyframe;
+
+        baseFrameBuffer_.erase(baseFrameBuffer_.begin());
+        dependentFrameBuffer_.erase(dependentFrameBuffer_.begin() + bestDi);
+
+        totalFramePairs++;
+        if (totalFramePairs == 1 || totalFramePairs % 500 == 0) {
+            fprintf(stderr, "[SSIF] Frame #%d: ts=%lld ms, base=%zu, dep=%zu%s\n",
+                    totalFramePairs, (long long)framePair.timestamp,
+                    framePair.baseData.size(), framePair.dependentData.size(),
+                    framePair.isKeyframe ? " [IDR]" : "");
+        }
+        return true;
     };
 
     // Try matching existing buffered frames first
@@ -899,32 +891,60 @@ bool MVCSSIFDemuxer::synchronizeFrames(FramePair& framePair) {
 }
 
 bool MVCSSIFDemuxer::seek(int64_t timestampMs) {
-    // SOL 5B: Synchronize seek on both base AND dependent streams
     if (!isOpen_) {
         return false;
     }
+    if (timestampMs < 0) timestampMs = 0;
 
-    // Seek base stream
-    if (!baseReader_->seek(timestampMs)) {
-        std::cerr << "[SSIF] Base stream seek failed at " << timestampMs << "ms" << std::endl;
-        return false;
+    // Clear all reassembly/pairing state so we resync cleanly from the new position.
+    // Keep basePtsOffset_/basePtsInitialized_ so the normalized timeline stays consistent.
+    auto clearState = [&]() {
+        streamingPesState_.clear();
+        basePesStates_.clear();
+        dependentPesStates_.clear();
+        baseFrameBuffer_.clear();
+        dependentFrameBuffer_.clear();
+        frameQueue_.clear();
+        pendingBase_.hasData = false;       pendingBase_.baseView.clear();
+        pendingDependent_.hasData = false;  pendingDependent_.baseView.clear();
+    };
+
+    // Map a timestamp to a packet-aligned byte offset within a reader (proportional).
+    auto byteForTimestamp = [&](M2TSReader* r) -> uint64_t {
+        if (!r) return 0;
+        uint64_t fileSize = r->getFileSize();
+        if (externalDurationMs_ <= 0 || fileSize == 0) return 0;
+        double frac = static_cast<double>(timestampMs) / static_cast<double>(externalDurationMs_);
+        if (frac < 0.0) frac = 0.0;
+        if (frac > 1.0) frac = 1.0;
+        return static_cast<uint64_t>(frac * static_cast<double>(fileSize));
+    };
+
+    if (isStreamingMode_) {
+        // STREAMING MODE (the real BD3D path): proportional byte seek into the interleaved
+        // SSIF file. The decoder then re-finds the next IDR and the GUI aligns MPV audio to it
+        // (seekIDRFound / V10-V11 SSIF sync), so an approximate landing is fine.
+        uint64_t targetByte = byteForTimestamp(ssifReader_.get());
+        if (!ssifReader_ || !ssifReader_->seek(targetByte)) {
+            std::cerr << "[SSIF] Streaming seek to byte " << targetByte << " failed" << std::endl;
+            return false;
+        }
+        clearState();
+        std::cout << "[SSIF] Streaming seek -> byte " << targetByte
+                  << " (" << timestampMs << "ms of " << externalDurationMs_ << "ms)" << std::endl;
+        return true;
     }
-    base_stream_pos_ = timestampMs;
-    std::cout << "[SSIF] Base stream seeked to " << timestampMs << "ms" << std::endl;
 
-    // CRITICAL: Seek dependent stream to THE SAME position for sync
-    if (dependentReader_ && !dependentReader_->seek(timestampMs)) {
-        std::cerr << "[SSIF] Dependent stream seek failed, may desync" << std::endl;
-        // Continue anyway, better than full failure
-    } else {
+    // DUAL-FILE MODE (legacy, rarely used): proportional byte seek on both M2TS readers.
+    if (baseReader_) {
+        baseReader_->seek(byteForTimestamp(baseReader_.get()));
+        base_stream_pos_ = timestampMs;
+    }
+    if (dependentReader_) {
+        dependentReader_->seek(byteForTimestamp(dependentReader_.get()));
         dependent_stream_pos_ = timestampMs;
-        std::cout << "[SSIF] Dependent stream seeked to " << timestampMs << "ms" << std::endl;
     }
-
-    // Clear pending frames to avoid stale data
-    pendingBase_.hasData = false;
-    pendingDependent_.hasData = false;
-
+    clearState();
     return true;
 }
 

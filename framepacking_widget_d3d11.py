@@ -200,6 +200,10 @@ class FramepackingDisplayWidgetD3D11(QRhiWidget if HAS_RHI_WIDGET else QWidget):
         # + 1 subtitle texture
         self._textures = [None] * 7
         self._texture_size = (1920, 1080)
+        # Actual per-eye SOURCE frame size of the YUV textures. Starts at 1080p (Blu-ray 3D)
+        # but is re-sized to the real decoded frame on the fly so edge264 can display 2D
+        # (or any-resolution) content without green padding / right-edge ghosting.
+        self._yuv_src_size = (1920, 1080)
 
         # Stereo mode
         self._stereo_mode = 1  # 0=2D, 1=FramePack, 2=SBS, 3=TAB
@@ -502,11 +506,14 @@ class FramepackingDisplayWidgetD3D11(QRhiWidget if HAS_RHI_WIDGET else QWidget):
             return False
 
     def _create_yuv_textures(self) -> bool:
-        """Create YUV textures for left and right eyes."""
-        # Source video is always 1080p per eye.
-        # DO NOT use self._texture_size, as it represents the output render target
-        # which is 1920x2205 in framepacking mode.
-        w, h = 1920, 1080
+        """Create YUV textures for left and right eyes, sized to the current SOURCE frame.
+
+        Blu-ray 3D is always 1080p/eye, but 2D-via-edge264 (and any non-1080p stream) needs
+        textures matching the real frame; _resize_yuv_textures() updates self._yuv_src_size and
+        re-runs this. NOTE: this is the SOURCE size, not self._texture_size (the 1920x2205
+        framepack render target).
+        """
+        w, h = self._yuv_src_size
 
         # Pre-initialize buffer for first-frame clear (kept ready so the very first
         # render doesn't show uninitialized GPU memory as magenta noise).
@@ -539,6 +546,38 @@ class FramepackingDisplayWidgetD3D11(QRhiWidget if HAS_RHI_WIDGET else QWidget):
 
         logger.info(f"[D3D11-HDR] Created YUV textures: {w}x{h}")
         return True
+
+    def _resize_yuv_textures(self, w, h) -> bool:
+        """Recreate the YUV (+subtitle) textures at a new SOURCE size, then rebind.
+
+        Called from the render thread (inside _upload_frame_textures, before beginPass — so
+        outside any render pass, which is safe for QRhi resource (de)allocation) when the
+        decoded frame size differs from the current textures (e.g. a non-1080p 2D H.264 stream).
+        Without this the frame is padded into 1080p textures -> green band + right-edge ghost.
+        """
+        w = max(2, int(w))
+        h = max(2, int(h))
+        if (w, h) == self._yuv_src_size and all(t is not None for t in self._textures):
+            return True
+        try:
+            for i in range(len(self._textures)):
+                t = self._textures[i]
+                if t is not None:
+                    try:
+                        t.destroy()
+                    except Exception:
+                        pass
+                    self._textures[i] = None
+            self._yuv_src_size = (w, h)
+            if not self._create_yuv_textures():
+                return False
+            if not self._create_shader_bindings():
+                return False
+            logger.info(f"[D3D11-HDR] YUV textures resized to source {w}x{h}")
+            return True
+        except Exception as e:
+            logger.error(f"[D3D11-HDR] YUV resize to {w}x{h} failed: {e}")
+            return False
 
     def _create_shader_bindings(self) -> bool:
         """Create shader resource bindings."""
@@ -758,6 +797,11 @@ class FramepackingDisplayWidgetD3D11(QRhiWidget if HAS_RHI_WIDGET else QWidget):
             oh = output_size.height()
             if self._stereo_mode == 1:
                 target_aspect = 1920.0 / 2205.0
+            elif self._stereo_mode == 0:
+                # 2D: use the ACTUAL source frame aspect (any resolution), so non-16:9 2D
+                # content (e.g. 2.39:1) is letterboxed correctly instead of stretched.
+                sw, sh = self._yuv_src_size
+                target_aspect = (sw / sh) if sh else (1920.0 / 1080.0)
             else:
                 target_aspect = 1920.0 / 1080.0
             if oh > 0 and ow > 0:
@@ -810,6 +854,16 @@ class FramepackingDisplayWidgetD3D11(QRhiWidget if HAS_RHI_WIDGET else QWidget):
         planes = [y_l, u_l, v_l, y_r, u_r, v_r]
 
         import numpy as _np
+
+        # Dimension-aware: match the YUV textures to the ACTUAL decoded frame size, so any
+        # resolution (e.g. a non-1080p 2D H.264 stream via edge264) displays without green
+        # padding or right-edge ghosting. The Y plane is delivered at the true frame size
+        # (the decoder crops the stride), so its shape is the source size. Safe here: we are
+        # on the render thread, before beginPass.
+        if y_l is not None and getattr(y_l, 'ndim', 0) >= 2:
+            src_h, src_w = int(y_l.shape[0]), int(y_l.shape[1])
+            if (src_w, src_h) != self._yuv_src_size:
+                self._resize_yuv_textures(src_w, src_h)
 
         # D3D11 typical row pitch alignment. R8 textures of narrow width need
         # explicit padding to this multiple. Wider textures (>= ALIGN) already

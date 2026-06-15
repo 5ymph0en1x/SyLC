@@ -80,7 +80,10 @@ bool SSIFParser::parse(const std::string& ssifPath) {
 
     // STREAMING FIX: For large SSIF files (>100MB), use streaming mode
     // instead of reading entire file into memory
-    constexpr size_t STREAMING_THRESHOLD = 100 * 1024 * 1024;  // 100 MB
+    // Real Blu-ray 3D SSIF files have NO embedded extent table (the interleaving map lives in
+    // the .clpi, not the SSIF), so the small-file extent parser below is bogus for them. Use a
+    // tiny threshold so any genuine SSIF (always >1MB) takes the correct streaming path.
+    constexpr size_t STREAMING_THRESHOLD = 1 * 1024 * 1024;  // 1 MB
     constexpr size_t HEADER_PROBE_SIZE = 64 * 1024;  // 64 KB for header
 
     std::vector<uint8_t> data;
