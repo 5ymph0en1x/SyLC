@@ -8,7 +8,7 @@
 
 *Stereoscopic 3D Blu-ray (MVC) playback, decoded from scratch, rendered in native HDR — given to the community, no strings attached.*
 
-![Version](https://img.shields.io/badge/version-3.0.0-1f6feb?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-3.1.0-1f6feb?style=for-the-badge)
 ![Platform](https://img.shields.io/badge/Windows-x64%20%7C%20ARM64-0078D6?style=for-the-badge&logo=windows&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/license-free%20%26%20open--source-2ea44f?style=for-the-badge)
@@ -82,6 +82,9 @@ This is the kind of work that doesn't show up in a feature list — but it's the
 - **Direct3D 11 / Qt RHI rendering** with **HDR (PQ)** preservation and high-quality scaling.
 - **Frame-packed 3D output** (detached window) + embedded 2D view.
 - **Matroska (MKV)** input with an MVC track, via the native demuxer.
+- **Raw Blu-ray streams** — plays **SSIF** (3D) and **M2TS** (2D) directly, *no remux*, with frame-accurate seeking.
+- **Open a whole Blu-ray** — point SyLC at a **disc/drive, a BDMV folder, or an `.iso`**; the feature film is auto-detected by **duration-based main-title detection** (3D SSIF preferred, 2D otherwise). ISO images are **auto-mounted without admin rights** and released on exit.
+- **Broad 2D compatibility** — any 2D video plays through libmpv (H.264 / VC-1 / MPEG-2…), including **2D Blu-rays**, at the correct aspect.
 - **PGS (Blu-ray) subtitles**, streamed in real time.
 - **Live A/V sync trim** to cancel your system's audio-output latency — nudge it by ear with `[` and `]`.
 - **Instant, smooth seeking** — no post-seek lag.
@@ -100,8 +103,8 @@ This is the kind of work that doesn't show up in a feature list — but it's the
 
 | Platform | Asset | Notes |
 |---|---|---|
-| **Windows x64** | `SyLC_3D_Player_v3.0_win-x64.exe` | Single self-contained file. Built for the **x86-64-v3 (AVX2)** baseline — runs natively on any AVX2 CPU (Haswell 2013+ / Zen 1+). |
-| **Windows on ARM** | `SyLC_3D_Player_v3.0_win-arm64.zip` | Portable folder, **100 % native ARM64** (Snapdragon / Adreno) — every binary cross-compiled to aarch64, zero x64 emulation. |
+| **Windows x64** | `SyLC_3D_Player_v3.1.0_win-x64.exe` | Single self-contained file. Built for the **x86-64-v3 (AVX2)** baseline — runs natively on any AVX2 CPU (Haswell 2013+ / Zen 1+). |
+| **Windows on ARM** | `SyLC_3D_Player_v3.1.0_win-arm64.zip` | Portable folder, **100 % native ARM64** (Snapdragon / Adreno) — every binary cross-compiled to aarch64, zero x64 emulation. |
 
 The decoder's SIMD hot loop is compiled for each architecture's vector unit (AVX2 / NEON), so you get the real silicon, not a translation layer.
 
@@ -112,17 +115,17 @@ The decoder's SIMD hot loop is compiled for each architecture's vector unit (AVX
 - **Windows 10/11 (x64)** or **Windows 11 on ARM (ARM64)**.
 - A **Direct3D 11**-capable GPU (an HDR display to enjoy HDR).
 - x64: a CPU with **AVX2** (standard since ~2013).
-- Input: an **MKV** containing an **MVC** track. Rip a 3D Blu-ray with **MakeMKV**. (Plain 2D files play through libmpv.)
+- Input: a **3D MKV** (MVC track), a **raw Blu-ray stream** (`.ssif` / `.m2ts`), a **BDMV disc/folder**, or a **Blu-ray `.iso`**. Rip with **MakeMKV**, or just point SyLC at the disc. (2D files of any codec play through libmpv.)
 
-> Raw `.ssif` / `.m2ts` Blu-ray structures aren't supported yet — remux to MKV first.
+> **No remux required for Blu-rays.** Open the **disc/drive**, the **BDMV folder**, or the **`.iso` directly** — SyLC mounts the image (no admin), finds the 3D feature by duration, and streams the **SSIF** straight off it. `.iso` opens via *Open file* or drag-and-drop; a disc/folder via the **disc** button or drag-and-drop.
 
 ---
 
 ## Get started
 
-1. Download the asset for your platform from **Releases** (including the dlls if you plan to use the sources).
-2. **x64:** run `SyLC_3D_Player_v3.0_win-x64.exe`. **ARM64:** unzip and run `SyLC_3D_Player.exe`.
-3. Open a 3D MKV (drag-and-drop or the folder button). Send the frame-packed window to your 3D display and enjoy.
+1. Download the asset for your platform from **Releases**.
+2. **x64:** run `SyLC_3D_Player_v3.1.0_win-x64.exe`. **ARM64:** unzip and run `SyLC_3D_Player.exe`.
+3. Open your 3D content — a **MKV**, a raw **`.ssif` / `.m2ts`**, a **BDMV folder**, or a Blu-ray **`.iso`** (drag-and-drop, the **Open file** button, or the **disc** button). Send the frame-packed window to your 3D display and enjoy.
 
 Nothing to install. Everything — decoder, demuxer, audio, codecs, Python runtime — is bundled.
 
@@ -193,3 +196,5 @@ Prerequisites: **Python 3.13**, `pip install -r requirements.txt` + `nuitka` + `
 *If SyLC brought one of your discs back to life, that's the whole reward. Long live open source. 🥂*
 
 </div>
+
+
