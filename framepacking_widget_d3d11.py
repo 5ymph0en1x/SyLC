@@ -18,6 +18,17 @@ import sys
 import struct
 import logging
 import numpy as np
+try:
+    import velvet_probe  # read-only timing probe; no-op unless SYLC_VELVET_PROBE=1
+except Exception:  # pragma: no cover - keep player runnable if probe is absent
+    class _VelvetNoop:
+        ENABLED = False
+        @staticmethod
+        def _noop(*a, **k):
+            return None
+        on_emit = on_present = on_drop = on_hold = on_bulkdrop = record = tick = incr = _noop
+        now = __import__('time').perf_counter
+    velvet_probe = _VelvetNoop()
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal, Slot, QByteArray, QSize, QFile, QIODevice
@@ -266,6 +277,8 @@ class FramepackingDisplayWidgetD3D11(QRhiWidget if HAS_RHI_WIDGET else QWidget):
 
     def _on_frame_submitted(self):
         """Called when GPU has finished processing a frame - enables next frame."""
+        if velvet_probe.ENABLED:
+            velvet_probe.on_present()
         self._frame_in_flight = False
         # If we have a pending frame, schedule next update immediately
         if self._pending_frame and not self._rendering_paused:
@@ -709,6 +722,8 @@ class FramepackingDisplayWidgetD3D11(QRhiWidget if HAS_RHI_WIDGET else QWidget):
         # holes" playback. Use this counter in the monitoring overlay if needed.
         if self._pending_frame is not None:
             self._frames_dropped += 1
+            if velvet_probe.ENABLED:
+                velvet_probe.on_drop()
 
         # PERF OPTIM (modified A): in 2D mode the shader only samples *_L,
         # so passing right planes uploads ~3 MB/frame to the GPU for nothing.

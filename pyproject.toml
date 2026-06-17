@@ -1,6 +1,6 @@
 [project]
 name = "sylc-3d-player"
-version = "3.1.0"
+version = "3.2.0"
 description = "SyLC 3D MVC Stereoscopic Video Player"
 requires-python = "==3.13.*"
 dependencies = [

@@ -60,6 +60,20 @@ static const i8x16 Default_8x8_Inter[4] = {
  */
 static void unset_currPic(Edge264Decoder *dec) {
 	assert(dec->currPic >= 0);
+	// FORCE-COMPLETE (MVC robustness): unset_currPic is only called at a picture
+	// boundary (a new frame begins, or an explicit bump/flush), so all of currPic's
+	// slices have already been fed. If it still has remaining_mbs > 0 — a slice
+	// stopped mid-decode (e.g. CABAC desync on a malformed Blu-ray MVC dependent
+	// slice; the MVC-tolerant path only rescues fully-decoded slices with bad
+	// trailing bits) — the frame would otherwise sit in get_frame_queue with
+	// next_deblock_addr != INT_MAX forever, which edge264_get_frame rejects, leading
+	// to a DPB-saturation deadlock (Gravity 3D / other BD3D discs freeze at ~frame 25).
+	// Mark it complete so it can be output; the undecoded macroblocks keep their
+	// (concealed/stale) buffer content — a transient artifact on one frame beats a freeze.
+	if (dec->next_deblock_addr[dec->currPic] != INT_MAX) {
+		dec->remaining_mbs[dec->currPic] = 0;
+		dec->next_deblock_addr[dec->currPic] = INT_MAX;
+	}
 	int non_base_view = dec->non_base_frames >> dec->currPic & 1;
 	if ((dec->short_term_frames | dec->long_term_frames) & 1 << dec->currPic) {
 		unsigned same_views = non_base_view ? dec->non_base_frames : ~dec->non_base_frames;
@@ -872,6 +886,27 @@ static void parse_ref_pic_list_modification(Edge264Decoder *dec, Edge264SeqParam
 		}
 	}
 	
+	// CONCEALMENT (post-seek robustness): after a mid-stream random-access point a
+	// needed reference can be ABSENT from the DPB — pre-recovery short-term refs not
+	// yet decoded (base view), or the MVC inter-view base picture (dec->basePic == -1,
+	// added above for nal_unit_type 20). Such RefPicList entries are -1 or point to an
+	// unallocated DPB slot, and motion compensation does samples_buffers[refPic]
+	// (edge264_inter.c) with no bounds/NULL check -> out-of-bounds pointer ->
+	// access-violation storm during post-seek priming (the intermittent fatal seek
+	// crash). Substitute any missing reference with the current picture's own
+	// (always-allocated) buffer so MC reads valid memory: concealment (wrong pixels on
+	// those transient post-seek frames, never a crash). Normal playback is unaffected —
+	// present references pass the check, so the list is left unchanged.
+	if (dec->currPic >= 0) {
+		for (int lx = 0; lx <= t->slice_type; lx++) {
+			for (int i = 0; i < t->pps.num_ref_idx_active[lx]; i++) {
+				int pic = t->RefPicList[lx][i];
+				if ((unsigned)pic >= 32u || dec->samples_buffers[pic] == NULL)
+					t->RefPicList[lx][i] = dec->currPic;
+			}
+		}
+	}
+
 	#ifdef LOGS
 		for (int lx = 0; lx <= t->slice_type; lx++) {
 			log_dec(dec, lx == 0 ? "  RefPicLists: [[" : "], [");
@@ -1104,7 +1139,7 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 	if (__builtin_expect(gap > 1, 0)) {
 		// make enough non-reference slots by dereferencing short-term and non-existing frames
 		int sref_slots = sps->max_num_ref_frames - __builtin_popcount(same_views & dec->prev_long_term_frames & ~dec->prev_short_term_frames);
-		assert(sref_slots > 0);
+		if (sref_slots < 0) sref_slots = 0; // graceful (post-seek): long-term refs may fill all ref slots
 		int non_existing = min(gap - 1, sref_slots);
 		for (int num_srefs = non_existing + __builtin_popcount(same_views & dec->prev_short_term_frames); num_srefs > sref_slots; num_srefs--) {
 			int unref = 0, lowest = INT_MAX;
@@ -1121,7 +1156,13 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 		assert(dec->currPic < 0);
 		// MVC FIX: max_dec_frame_buffering applies per-view, so filter by same_views like other DPB checks
 		while (non_existing + __builtin_popcount((reference_frames | dec->to_get_frames & ~dec->output_frames) & same_views) > sps->max_dec_frame_buffering && bump_frame(dec, non_base_view, 0));
-		assert(non_existing + __builtin_popcount((reference_frames | dec->to_get_frames & ~dec->output_frames) & same_views) <= sps->max_dec_frame_buffering);
+		// graceful (post-seek robustness): a huge FrameNum gap from a random-access seek can
+		// leave bump_frame unable to free enough slots (MVC frames awaiting an absent pair),
+		// which would trip this invariant and abort(). Cap the synthesized non-existing frames
+		// to the room actually available instead — the gap fill is best-effort concealment.
+		int _room = sps->max_dec_frame_buffering - __builtin_popcount((reference_frames | dec->to_get_frames & ~dec->output_frames) & same_views);
+		if (non_existing > _room)
+			non_existing = _room > 0 ? _room : 0;
 		if (non_existing + __builtin_popcount(reference_frames | dec->to_get_frames | dec->output_frames) > 32)
 			return ENOBUFS; // exit here if we must wait for get_frame to consume and return enough frames
 		// wait until enough empty slots are undepended

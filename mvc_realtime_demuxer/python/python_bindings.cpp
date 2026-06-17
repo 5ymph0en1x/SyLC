@@ -608,7 +608,49 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
              py::arg("timestamp_ms"))
         .def("set_external_duration_ms", &MVCSSIFDemuxer::setExternalDurationMs,
              "Provide media duration (ms) so seek() can map timestamp -> byte offset",
-             py::arg("duration_ms"));
+             py::arg("duration_ms"))
+        .def("set_base_seek_table", &MVCSSIFDemuxer::setBaseSeekTable,
+             "Provide base EP_map seek table (pts_ms[], byte[]) for exact base seeking",
+             py::arg("pts_ms"), py::arg("bytes"))
+        .def("set_ssif_seek_table", &MVCSSIFDemuxer::setSsifSeekTable,
+             "Provide the BD3D Extent-Start-Point seek map (pts_ms[], ssif_byte[]) for "
+             "byte-exact, both-views-aligned streaming seeks",
+             py::arg("pts_ms"), py::arg("ssif_bytes"))
+        .def("request_abort", &MVCSSIFDemuxer::requestAbort,
+             "Cooperatively abort an in-flight read/scan. Safe to call from another thread "
+             "(read_next_* releases the GIL); the read returns early so a slow cold/contended "
+             "disc read can never pin the decoder thread into a watchdog force-terminate. "
+             "Call before stopping the thread or when a newer seek supersedes the scan.")
+        .def("clear_abort", &MVCSSIFDemuxer::clearAbort,
+             "Clear the abort flag. Call at the start of each seek/scan.")
+        .def("get_subtitle_pids",
+             [](MVCSSIFDemuxer& self) -> py::list {
+                 py::list result;
+                 for (uint16_t pid : self.getSubtitlePids()) result.append(pid);
+                 return result;
+             },
+             "Get PGS subtitle PIDs found in the base PMT (stream_type 0x90)")
+        .def("set_subtitle_pid", &MVCSSIFDemuxer::setSubtitlePid,
+             "Select a PGS subtitle PID to stream (0 = disable)",
+             py::arg("pid"))
+        .def("set_subtitle_track", &MVCSSIFDemuxer::setSubtitlePid,
+             "Alias of set_subtitle_pid (the decoder calls set_subtitle_track first)",
+             py::arg("pid"))
+        .def("has_subtitle_data", &MVCSSIFDemuxer::hasSubtitleData,
+             "Check if a reassembled PGS subtitle block is queued")
+        .def("read_subtitle_block",
+             [](MVCSSIFDemuxer& self) -> py::tuple {
+                 int64_t ts = 0;
+                 std::vector<uint8_t> data;
+                 if (!self.readSubtitleBlock(ts, data)) {
+                     return py::make_tuple(false, py::none());
+                 }
+                 py::dict d;
+                 d["timestampMs"] = ts;
+                 d["data"] = py::array_t<uint8_t>(data.size(), data.data());
+                 return py::make_tuple(true, d);
+             },
+             "Read next PGS subtitle block. Returns (success, dict with timestampMs, data).");
 
     // === MVC DECODER (edge264 integration) ===
 

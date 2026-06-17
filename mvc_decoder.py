@@ -13,11 +13,23 @@ import ctypes
 import sys
 import os
 import struct
+import bisect
 import time
 import logging
 import threading
 import gc
 import numpy as np
+try:
+    import velvet_probe  # read-only timing probe; no-op unless SYLC_VELVET_PROBE=1
+except Exception:  # pragma: no cover - keep player runnable if probe is absent
+    class _VelvetNoop:
+        ENABLED = False
+        @staticmethod
+        def _noop(*a, **k):
+            return None
+        on_emit = on_present = on_drop = on_hold = on_bulkdrop = record = tick = incr = _noop
+        now = time.perf_counter
+    velvet_probe = _VelvetNoop()
 from collections import deque
 from PySide6.QtCore import QThread, Signal, QMutex, QWaitCondition
 
@@ -124,6 +136,116 @@ def _find_clpi_for_media(media_path):
     except Exception:
         pass
     return None
+
+
+# -----------------------------------------------------------------------------
+# Blu-ray 3D Extent Start Point map (the interleaving map -> EXACT .ssif byte).
+#
+# A .ssif file carries NO embedded extent table; the interleaving map lives in the .clpi
+# ExtensionData under ID1=0x0002, ID2=0x0004 (verified on real discs). Combined with the base
+# EP_map it yields the EXACT .ssif byte of the interleaved-unit boundary that contains any base
+# IDR, so a seek lands on a clean RAPI with BOTH views present -- no size-ratio estimate, no
+# disc binary-search. Validated to ~3 ms (sub-frame) vs ~7.5 s for the old ratio heuristic.
+# -----------------------------------------------------------------------------
+def _parse_clpi_extent_start_points(path):
+    """Return the extent-start SPN list (longest monotonic table) from a .clpi ExtensionData,
+    or [] if absent. Block layout: [block_len u32][num_point u32][SPN u32 x num_point]."""
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+    except Exception:
+        return []
+    if len(data) < 28 or data[0:4] != b'HDMV':
+        return []
+    try:
+        ext_start = struct.unpack('>I', data[24:28])[0]
+        if ext_start == 0 or ext_start + 12 > len(data):
+            return []
+        if struct.unpack('>I', data[ext_start:ext_start + 4])[0] == 0:  # ExtensionData length
+            return []
+        p = ext_start + 4
+        p += 4 + 3                       # data_block_start_address (u32) + reserved (24 bits)
+        n_entries = data[p]; p += 1
+        best = []
+        for _ in range(n_entries):
+            if p + 12 > len(data):
+                break
+            ext_off = struct.unpack('>I', data[p + 4:p + 8])[0]   # rel. to ExtensionData start
+            p += 12
+            block_off = ext_start + ext_off
+            # The block is length-prefixed, so num_point sits at +4; tolerate a missing prefix.
+            for num_off in (block_off + 4, block_off):
+                if num_off + 4 > len(data):
+                    continue
+                num = struct.unpack('>I', data[num_off:num_off + 4])[0]
+                spn_off = num_off + 4
+                if num < 2 or num > 2_000_000 or spn_off + num * 4 > len(data):
+                    continue
+                spns = list(struct.unpack('>%dI' % num, data[spn_off:spn_off + num * 4]))
+                if all(spns[i] <= spns[i + 1] for i in range(num - 1)):
+                    if len(spns) > len(best):
+                        best = spns
+                    break
+        return best
+    except Exception:
+        return []
+
+
+def _derive_bd_companion_paths(base_clpi):
+    """From a base .clpi, derive (dep_clpi, base_m2ts, dep_m2ts). The dependent clip is the
+    base stream number + 1 (00001 -> 00002). Returns existing paths or None per slot."""
+    try:
+        clipinf = os.path.dirname(base_clpi)             # .../CLIPINF
+        bdmv = os.path.dirname(clipinf)                  # .../BDMV
+        stream = os.path.join(bdmv, 'STREAM')
+        stem = os.path.splitext(os.path.basename(base_clpi))[0]
+        depnum = '%05d' % (int(stem) + 1)
+    except (ValueError, TypeError):
+        return None, None, None
+    def existing(p):
+        return p if os.path.isfile(p) else None
+    return (existing(os.path.join(clipinf, depnum + '.clpi')),
+            existing(os.path.join(stream, stem + '.m2ts')),
+            existing(os.path.join(stream, depnum + '.m2ts')))
+
+
+def _build_ssif_seek_table(base_clpi, dep_clpi, base_m2ts, dep_m2ts):
+    """Combine the base EP_map with the base+dependent Extent Start Point tables into a
+    frame-accurate SSIF seek table: parallel (pts_ms[], ssif_byte[]) where ssif_byte is the
+    EXACT byte offset of the interleaved-unit boundary (dependent-first; clean RAPI, both views)
+    that contains each base IDR. Returns ([], []) when the extent tables are unavailable."""
+    idr_pts_ms, idr_byte = _parse_clpi_epmap(base_clpi)
+    if not idr_pts_ms:
+        return [], []
+    base_starts = _parse_clpi_extent_start_points(base_clpi)
+    dep_starts = _parse_clpi_extent_start_points(dep_clpi) if dep_clpi else []
+    if len(base_starts) < 2 or len(dep_starts) < 2:
+        return [], []
+    n = min(len(base_starts), len(dep_starts))
+    try:
+        base_total = (os.path.getsize(base_m2ts) // 192) if (base_m2ts and os.path.isfile(base_m2ts)) else None
+        dep_total = (os.path.getsize(dep_m2ts) // 192) if (dep_m2ts and os.path.isfile(dep_m2ts)) else None
+    except OSError:
+        base_total = dep_total = None
+
+    def ext_len(starts, j, total):
+        nxt = starts[j + 1] if j + 1 < len(starts) else (total if total else starts[j])
+        return max(0, nxt - starts[j])
+
+    # Cumulative .ssif source-packet offset of the start of interleaved unit j (dependent-first:
+    # each unit = [dependent extent j][base extent j]).
+    cum = [0] * n
+    for j in range(1, n):
+        cum[j] = cum[j - 1] + ext_len(dep_starts, j - 1, dep_total) + ext_len(base_starts, j - 1, base_total)
+
+    pts_out, byte_out = [], []
+    for pts_ms, byte_off in zip(idr_pts_ms, idr_byte):
+        spn = byte_off // 192                          # base-view source packet number
+        j = bisect.bisect_right(base_starts, spn) - 1
+        if 0 <= j < n:
+            pts_out.append(int(pts_ms))
+            byte_out.append(int(cum[j]) * 192)         # .ssif byte of the unit boundary
+    return pts_out, byte_out
 
 
 # -----------------------------------------------------------------------------
@@ -483,6 +605,17 @@ class MVCDecoderThread(QThread):
         self._external_audio_clock = 0.0
         self._external_audio_clock_update_ts = 0.0   # liveness: bumped on EVERY push (post-seek acquisition)
         self._external_audio_clock_value_ts = 0.0    # V53: when the VALUE last CHANGED (extrapolation base)
+        # Velvet "liquid" pacing: replace the binary V12 early-HOLD (which FREEZES the
+        # picture for a cycle = the measured dense-scene judder) with a gentle per-frame
+        # deceleration that NEVER blanks a cycle. Root cause (probe-confirmed): in dense
+        # scenes the video-ahead diff parks on the +150ms hold trigger and normal jitter
+        # dithers it across the line -> hold bursts -> ~90ms emit gaps. _liquid_stretch is
+        # the one-shot seconds added to the NEXT frame's schedule while easing back to sync.
+        # Default ON (probe-proven on Ruin.mkv: dense-scene emit-std 8-15ms->3-4ms, holds
+        # 348->0, ~90ms freezes gone, calm scenes byte-identical). SYLC_LIQUID=0 reverts to
+        # the legacy freeze-hold for A/B.
+        self._liquid_pacing = os.environ.get('SYLC_LIQUID', '1') not in ('0', 'false', 'False', 'no', 'off')
+        self._liquid_stretch = 0.0
         self._enable_audio_sync = True
         # V58: A/V sync offset — DELAY the video by this many seconds to compensate the
         # audio OUTPUT latency (Windows WASAPI mixer / Bluetooth / HDMI) that MPV's
@@ -915,15 +1048,26 @@ class MVCDecoderThread(QThread):
             # Blu-ray .clpi so the demuxer lands exactly on an IDR instead of binary-searching.
             # Best-effort — the dual-file PTS binary-search seek works fine without it.
             try:
-                if hasattr(self.demuxer, "set_base_seek_table"):
-                    clpi = _find_clpi_for_media(self.filepath)
-                    if clpi:
-                        pts_ms, byte_off = _parse_clpi_epmap(clpi)
-                        if pts_ms:
-                            self.demuxer.set_base_seek_table(pts_ms, byte_off)
-                            logger.info(f"[MVC-THREAD] EP_map seek table: {len(pts_ms)} entries from {os.path.basename(clpi)}")
+                clpi = _find_clpi_for_media(self.filepath) if hasattr(self.demuxer, "set_base_seek_table") else None
+                if clpi:
+                    pts_ms, byte_off = _parse_clpi_epmap(clpi)
+                    if pts_ms:
+                        self.demuxer.set_base_seek_table(pts_ms, byte_off)
+                        logger.info(f"[MVC-THREAD] EP_map seek table: {len(pts_ms)} entries from {os.path.basename(clpi)}")
+                    # BD3D EXACT seek map: combine the EP_map with the CLPI Extent Start Point
+                    # tables to land on the precise interleaved-unit boundary in the .ssif (clean
+                    # RAPI, both views present). Preferred over the EP_map size-ratio estimate;
+                    # falls back to it silently when the extent tables aren't on disc.
+                    if hasattr(self.demuxer, "set_ssif_seek_table"):
+                        dep_clpi, base_m2ts, dep_m2ts = _derive_bd_companion_paths(clpi)
+                        s_pts, s_byte = _build_ssif_seek_table(clpi, dep_clpi, base_m2ts, dep_m2ts)
+                        if s_pts:
+                            self.demuxer.set_ssif_seek_table(s_pts, s_byte)
+                            logger.info(f"[MVC-THREAD] SSIF exact seek map: {len(s_pts)} IDR->unit entries (byte-exact)")
+                        else:
+                            logger.info("[MVC-THREAD] SSIF exact map unavailable (no extent tables) — EP_map ratio fallback in use")
             except Exception as e:
-                logger.warning(f"[MVC-THREAD] EP_map load skipped: {e}")
+                logger.warning(f"[MVC-THREAD] EP_map/SSIF seek-map load skipped: {e}")
 
             logger.info("[MVC-THREAD] Demuxer opened successfully")
 
@@ -1163,14 +1307,23 @@ class MVCDecoderThread(QThread):
         """
         logger.info(f"[MVC-THREAD] Scanning for IDR frame (max {max_frames} frames, tol={tolerance}s, skip_ts_check={skip_timestamp_check})...")
         skipped_idr_count = 0
+        _scan_diag = os.environ.get('SYLC_SCAN_DIAG')
+        _scan_t0 = time.time() if _scan_diag else 0.0
 
         for i in range(max_frames):
-            if self._stop_requested:
+            if self._stop_requested or getattr(self, '_cleanup_in_progress', False):
                 logger.info("[MVC-THREAD] Scan aborted by stop request")
                 return None, None, False
 
             try:
+                _c0 = time.time() if _scan_diag else 0.0
                 success, base, dep = self.demuxer.read_next_frame_pair()
+                if _scan_diag:
+                    _dt = time.time() - _c0
+                    if _dt > 1.0 or i % 100 == 0:
+                        logger.error(f"[SCAN-DIAG] read#{i} dt={_dt:.2f}s total={time.time()-_scan_t0:.1f}s "
+                                     f"base={len(base['data']) if base and 'data' in base else 0} "
+                                     f"dep={len(dep['data']) if dep and 'data' in dep else 0} ok={success}")
                 if not success:
                     logger.warning("[MVC-THREAD] End of stream reached while scanning for IDR.")
                     return None, None, False
@@ -1181,7 +1334,7 @@ class MVCDecoderThread(QThread):
             au_data = bytearray()
             base_size = len(base['data']) if base and 'data' in base else 0
             dep_size = len(dep['data']) if dep and 'data' in dep else 0
-            if i < 5:  # Log first 5 frames for diagnostic
+            if _scan_diag and i < 5:  # Log first 5 frames for diagnostic (env-gated: console I/O is slow)
                 logger.info(f"[MVC-DIAG] Scan frame {i}: base={base_size} bytes, dep={dep_size} bytes")
                 # Dump first bytes to see if Annex B start codes are present
                 if base and 'data' in base and base_size > 0:
@@ -1218,7 +1371,7 @@ class MVCDecoderThread(QThread):
                     sc_len = 4 if nal_data.startswith(b'\x00\x00\x00\x01') else 3
                     if len(nal_data) > sc_len:
                         nal_type = nal_data[sc_len] & 0x1F
-                        if i < 5:
+                        if _scan_diag and i < 5:
                             nal_type_summary.append(nal_type)
                         # Track parameter sets for recovery point detection
                         if nal_type == 7:  # SPS
@@ -1230,7 +1383,7 @@ class MVCDecoderThread(QThread):
                         # Check for standard IDR (type 5) OR MVC IDR (type 20 with idr flag)
                         if (nal_type == NAL_TYPE_IDR) or is_mvc_idr_nal(nal_data, sc_len):
                             is_true_idr = True
-                if i < 5:
+                if _scan_diag and i < 5:
                     logger.info(f"[MVC-IDR-DIAG] Frame {i}: NALs={nal_type_summary[:30]}... sps={has_sps} pps={has_pps} subset_sps={has_subset_sps} keyframe={base.get('isKeyframe', False) if base else False} true_idr={is_true_idr}")
 
                 # Accept true IDR OR recovery point (SPS+PPS+SubsetSPS with keyframe flag)
@@ -1650,6 +1803,7 @@ class MVCDecoderThread(QThread):
                     self.mutex.unlock()
 
                     logger.info(f"[MVC-THREAD] ========== V8 SEEK START: {target:.3f}s (was_paused={was_paused_before_seek}) ==========")
+                    self._seek_perf_t0 = time.time()  # SEEK-PERF: per-phase timing breakdown
 
                     # ╔═══════════════════════════════════════════════════════════════════╗
                     # ║  V8 INDEX-BASED SYNC: RECREATE decoder instead of FLUSH           ║
@@ -1802,6 +1956,7 @@ class MVCDecoderThread(QThread):
                                     logger.warning(f"[MVC-THREAD] Extended backoff failed: {e}")
                         
                         if idr_au_data:
+                            logger.debug(f"[SEEK-PERF] scan(+seek) done +{time.time() - self._seek_perf_t0:.2f}s")
                             # ╔═══════════════════════════════════════════════════════════════════╗
                             # ║  V8 ÉTAPE 6: RECREATE - Allouer un nouveau décodeur propre        ║
                             # ║  Mathématiquement: alloc() = état initial déterministe           ║
@@ -1828,8 +1983,16 @@ class MVCDecoderThread(QThread):
                                 if hasattr(self.demuxer, 'get_codec_private'):
                                     codec_private = self.demuxer.get_codec_private()
                                     if codec_private:
+                                        cp_bytes = bytes(codec_private)
                                         logger.info("[MVC-THREAD] V8: Injecting CodecPrivate headers...")
-                                        annexb_headers = self._convert_avcc_to_annexb(bytes(codec_private))
+                                        # SSIF codec_private is already Annex-B; only MKV is AVCC.
+                                        # (The seek path used to assume AVCC unconditionally → the SSIF
+                                        # Annex-B header was rejected with "Unexpected AVCC version: 0",
+                                        # leaving the fresh post-seek decoder with NO SPS/PPS.)
+                                        if cp_bytes[:4] == b'\x00\x00\x00\x01' or cp_bytes[:3] == b'\x00\x00\x01':
+                                            annexb_headers = cp_bytes
+                                        else:
+                                            annexb_headers = self._convert_avcc_to_annexb(cp_bytes)
                                         if annexb_headers:
                                             for h_nal in find_nal_units(annexb_headers):
                                                 sc = 4 if h_nal.startswith(b'\x00\x00\x00\x01') else 3
@@ -1864,9 +2027,9 @@ class MVCDecoderThread(QThread):
                                     logger.warning(f"[MVC-THREAD] V8: Priming AU read error: {e}")
                                     break
 
+                            logger.info(f"[MVC-THREAD] V8: Priming {len(prime_aus)} AUs...")
                             for i, au_data in enumerate(prime_aus):
                                 if self._stop_requested: break
-                                logger.info(f"[MVC-THREAD] V8: Priming AU #{i + 1}/{len(prime_aus)}")
                                 self._process_au_data(bytes(au_data), force=True)
                                 # Drain frames pendant le priming
                                 # V8 CRASH FIX: Add try/except and stop check for safety
@@ -1905,6 +2068,7 @@ class MVCDecoderThread(QThread):
                                 if abs(old_base - idr_timestamp) > 0.5:
                                     logger.warning(f"[MVC-THREAD] V8: IDR timestamp ({idr_timestamp:.3f}s) differs from Cues ({old_base:.3f}s) - using IDR")
                             logger.info(f"[MVC-THREAD] V8: SEEK COMPLETE - base_timestamp={self.base_timestamp:.3f}s")
+                            logger.info(f"[SEEK-PERF] ===== TOTAL decoder seek +{time.time() - self._seek_perf_t0:.2f}s (scan+alloc+prime) =====")
                             logger.info(f"[MVC-THREAD] ========== V8 SEEK END ==========")
                             # V8 CRASH FIX: DON'T emit seekIDRFound here!
                             # Moving to AFTER stabilization to prevent race condition with MPV seek
@@ -3006,6 +3170,7 @@ class MVCDecoderThread(QThread):
             except Exception as e:
                 logger.debug(f"[MVC-DIAG] AU #{self._au_count}: (hex preview failed: {e})")
 
+        _vp_t0 = velvet_probe.now() if velvet_probe.ENABLED else 0.0
         try:
             # 1. Collect all NAL units
             nal_units = []
@@ -3138,6 +3303,9 @@ class MVCDecoderThread(QThread):
 
         except Exception as e:
             logger.error(f"[MVC-THREAD] Parse error: {e}")
+        finally:
+            if velvet_probe.ENABLED and _vp_t0:
+                velvet_probe.record('au_ms', (velvet_probe.now() - _vp_t0) * 1000.0)
 
     def _push_nal_direct(self, nal_data, start_code_len=3, force=False, _nal_retry=0):
         # V30 FIX: Bail out immediately if reset flagged to prevent infinite loop
@@ -3535,6 +3703,8 @@ class MVCDecoderThread(QThread):
                 return
 
             # Emit generic ready signal AFTER barrier validation
+            if velvet_probe.ENABLED:
+                velvet_probe.on_emit(len(self.presentation_queue))
             self.frameReady.emit()
 
             # V7b SYNC FIX: ALWAYS emit YUV data to allow GUI to route to multiple widgets
@@ -3742,6 +3912,7 @@ class MVCDecoderThread(QThread):
 
         try:
             self._frame_delivery_active = True
+            _vp_dt0 = velvet_probe.now() if velvet_probe.ENABLED else 0.0
 
             # V14 GRACEFUL ENDING: Check cleanup flag FIRST
             if self._cleanup_in_progress:
@@ -3933,6 +4104,8 @@ class MVCDecoderThread(QThread):
             import traceback
             traceback.print_exc()
         finally:
+            if velvet_probe.ENABLED and _vp_dt0:
+                velvet_probe.record('deliver_ms', (velvet_probe.now() - _vp_dt0) * 1000.0)
             # V14 CRASH FIX: Always release the frame delivery lock
             self._frame_delivery_active = False
             self._frame_delivery_lock.release()
@@ -4242,6 +4415,8 @@ class MVCDecoderThread(QThread):
                         return
 
                     # Audio started OR Timeout! Release the Hold.
+                    logger.debug(f"[SEEK-PERF] audio-hold released after {time.time() - self._audio_gate_timeout_start:.2f}s "
+                                f"(diff={diff:.2f}s timeout={is_timeout})")
                     self._waiting_for_audio_edge = False
                     self._catchup_mode = True
 
@@ -4283,6 +4458,11 @@ class MVCDecoderThread(QThread):
 
                     diff = frame_ts - audio_smooth
 
+                    if velvet_probe.ENABLED:
+                        velvet_probe.record('v12diff_ms', diff * 1000.0)
+                        velvet_probe.record('adjframe_ms', adjusted_frame_time * 1000.0)
+                        velvet_probe.record('drift_ms', drift_ms)
+
                     # V12 DEBUG: Log drift periodically
                     if not hasattr(self, '_v12_drift_log_counter'):
                         self._v12_drift_log_counter = 0
@@ -4312,6 +4492,8 @@ class MVCDecoderThread(QThread):
                                 break
                             self.presentation_queue.popleft()
                             dropped += 1
+                        if velvet_probe.ENABLED:
+                            velvet_probe.on_bulkdrop(dropped)
                         if self._v12_drift_log_counter % 10 == 0:
                             logger.debug(f"[V12-SYNC] Video Late ({diff*1000:.1f}ms). Bulk-dropped {dropped} frame(s).")
                         # V55 SMOOTH CATCH-UP: the old code `return`ed here, emitting NOTHING
@@ -4331,20 +4513,39 @@ class MVCDecoderThread(QThread):
                     # V43 FIX: Added 2-second timeout to prevent infinite video freeze.
                     # Without this timeout, if audio clock is stale or stuck, video would
                     # freeze permanently (the frame gets put back and retried forever).
-                    elif diff > 0.150:  # 150ms threshold
-                        # Track hold start time for timeout
-                        if not hasattr(self, '_v12_hold_start') or self._v12_hold_start is None:
-                            self._v12_hold_start = time.time()
-                        hold_duration = time.time() - self._v12_hold_start
-                        if hold_duration < 2.0:  # 2-second timeout
-                            self._precise_wait(0.010)
-                            self.presentation_queue.appendleft(frame)  # Put back to retry
-                            return
+                    elif diff > 0.150:  # 150ms threshold: video ahead of audio
+                        if self._liquid_pacing and diff < 0.350:
+                            # LIQUID PACING: gentle decel instead of a freeze. Probe-measured
+                            # root cause of the dense-scene wobble: diff parks on this +150ms
+                            # line and the binary hold (precise_wait+appendleft+return) blanks
+                            # the cycle in bursts (=judder, ~90ms emit gaps). Instead, EMIT this
+                            # frame but lengthen the NEXT interval ∝ the excess (capped +12ms),
+                            # so audio eases back into sync with forward progress every cycle.
+                            # Self-limiting: as diff falls under 150 the stretch returns to 0.
+                            # The hard freeze below is kept for a genuine runaway (>350ms) only.
+                            self._liquid_stretch = min((diff - 0.150) * 0.30, 0.012)
+                            if velvet_probe.ENABLED:
+                                velvet_probe.record('stretch_ms', self._liquid_stretch * 1000.0)
+                            if hasattr(self, '_v12_hold_start'):
+                                self._v12_hold_start = None
+                            # fall through to emit `frame`
                         else:
-                            # V43: Timeout reached - force emit to prevent permanent freeze
-                            logger.warning(f"[V12-SYNC] Hold timeout ({hold_duration:.1f}s). "
-                                         f"Force-emitting frame (diff={diff*1000:.0f}ms).")
-                            self._v12_hold_start = None  # Reset for next hold
+                            # Hard hold (legacy freeze): SYLC_LIQUID=0, or runaway (>350ms) desync.
+                            # Track hold start time for timeout
+                            if not hasattr(self, '_v12_hold_start') or self._v12_hold_start is None:
+                                self._v12_hold_start = time.time()
+                            hold_duration = time.time() - self._v12_hold_start
+                            if hold_duration < 2.0:  # 2-second timeout
+                                if velvet_probe.ENABLED:
+                                    velvet_probe.on_hold()
+                                self._precise_wait(0.010)
+                                self.presentation_queue.appendleft(frame)  # Put back to retry
+                                return
+                            else:
+                                # V43: Timeout reached - force emit to prevent permanent freeze
+                                logger.warning(f"[V12-SYNC] Hold timeout ({hold_duration:.1f}s). "
+                                             f"Force-emitting frame (diff={diff*1000:.0f}ms).")
+                                self._v12_hold_start = None  # Reset for next hold
                     else:
                         # Frame is synced - reset hold timer
                         if hasattr(self, '_v12_hold_start'):
@@ -4365,7 +4566,11 @@ class MVCDecoderThread(QThread):
                     # current_time, so per-frame overhead (~2ms) doesn't accumulate into a slow
                     # drift (which made the video fall behind -> bulk-drops). Resync on a real
                     # stall (>1 frame behind) to avoid a catch-up burst.
-                    self._last_display_time += adjusted_frame_time
+                    # Velvet "liquid": _liquid_stretch (>=0, one-shot) gently lengthens THIS
+                    # interval to ease a dense-scene video-ahead diff back into sync without
+                    # ever blanking a cycle. It is 0 in baseline (SYLC_LIQUID=0).
+                    self._last_display_time += adjusted_frame_time + self._liquid_stretch
+                    self._liquid_stretch = 0.0
                     if current_time - self._last_display_time > adjusted_frame_time:
                         self._last_display_time = current_time
                     # V43: Track frames emitted for startup grace period

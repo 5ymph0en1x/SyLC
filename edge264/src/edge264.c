@@ -474,6 +474,7 @@ unsigned edge264_bump_and_get_busy(Edge264Decoder *dec) {
 	return dec->busy_tasks;
 }
 
+
 int edge264_is_frame_ready(Edge264Decoder *dec) {
 	if (dec == NULL)
 		return 0;

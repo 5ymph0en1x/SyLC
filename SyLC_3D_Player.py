@@ -535,7 +535,10 @@ class RobustSeekQueue(QObject):
 
     DEBOUNCE_DELAY_MS = 150  # Temps d'attente avant d'exécuter un seek
     COOLDOWN_PERIOD_MS = 200  # Délai minimum entre seeks consécutifs
-    SEEK_TIMEOUT_MS = 8000  # Timeout pour un seek bloqué
+    SEEK_TIMEOUT_MS = 45000  # Timeout pour un seek bloqué. Raised to 45s: a COLD optical SSIF
+    # seek legitimately takes a few seconds (re-pairing the interleaved base+dependent views);
+    # the old 8s fired mid-seek and its forced reset (resume MPV + seek_completed) raced the
+    # decode thread → hard crash. 30s only ever fires on a genuine hang, not a slow seek.
 
     def __init__(self, parent_window):
         super().__init__(parent_window)
@@ -652,27 +655,43 @@ class RobustSeekQueue(QObject):
     def _do_mvc_seek(self, target_time: float):
         """Exécute le seek MVC après la pause audio.
 
-        V7b+++++ ATOMIC HANDOFF FIX:
-        - DO NOT seek MPV here! This causes race condition.
-        - Only seek the decoder, it will find the IDR and emit seekIDRFound signal.
-        - _on_mvc_seek_idr_found will then seek MPV to the EXACT IDR timestamp.
-        - This ensures audio and video start at the same position.
+        SSIF SEEK-FREEZE FIX (MEASURED 2026-06-16): do NOT seek MPV here. On a physical
+        Blu-ray, MPV (audio) and the video demuxer both stream the same 45 GB .ssif from the
+        single optical head. The decoder alone reads the post-seek IDR in ~0.04 s (measured) —
+        the head is fine. The freeze came from making MPV seek the RAW target while the decoder
+        scans forward to the actual IDR: the two readers land ~1-2 s of stream APART and the
+        head thrashes between them (~0.5 MB/s, 5-15 s). The cure is to keep MPV PAUSED and idle
+        at the old position during the (fast, uncontended) scan, then let seekIDRFound seek MPV
+        to the EXACT IDR timestamp and resume it — so both readers are CONVERGED at the same
+        spot when they finally read together (this is why steady playback never stalls).
         """
         try:
-            # V7b+++++ FIX: DO NOT seek MPV here!
-            # The race condition was: MPV seeked to target (e.g., 120s), but decoder
-            # finds IDR at 118.5s. By the time seekIDRFound corrects MPV, audio has
-            # already buffered 1.5s of wrong content.
-            #
-            # SOLUTION: Let decoder seek first, find IDR, then seekIDRFound will
-            # seek MPV to the exact IDR timestamp (atomic handoff).
-            #
-            # OLD CODE (caused race condition):
-            # self.request_mpv_seek.emit(target_time)
+            logger.info(f"[SEEK-QUEUE] MVC seek: decoder scans (MPV stays paused/idle) at {target_time:.3f}s")
 
-            logger.info(f"[SEEK-QUEUE] V7b+++++ Atomic handoff: decoder seeking to {target_time:.3f}s (MPV will sync on IDR found)")
+            # SSIF ANTI-THRASH (measured 2026-06-17): MPV (audio-only in MVC) and the video
+            # demuxer share the single optical head. A concurrent disc reader turns the demuxer's
+            # ~1.3s cold post-seek scan into 45-120s (head thrash between two far stream
+            # positions — measured directly). MPV is paused here, BUT the global MPV config reads
+            # 20s / 2 GB ahead, so even a PAUSED MPV pre-reads ~120 MB at the OLD position while
+            # the decoder reads the NEW one → it starves the scan → timeout → _force_reset_state
+            # resumes MPV → "audio plays while the image freezes". So force MPV paused and CLAMP
+            # its read-ahead to a few MB right before every scan (the init-time shrink doesn't
+            # reach this path reliably). seekIDRFound's ATOMIC SYNC re-seeks + resumes MPV after
+            # the scan, when both readers are converged on the new region (steady playback shares
+            # the OS cache, so it never thrashes).
+            try:
+                p = getattr(self._parent, 'player', None)
+                if p is not None:
+                    p.pause = True
+                    p['demuxer-readahead-secs'] = 1
+                    p['demuxer-max-bytes'] = '8MiB'
+                    p['demuxer-max-back-bytes'] = '4MiB'
+            except Exception as _e:
+                logger.warning(f"[SEEK-QUEUE] MPV read-ahead clamp skipped: {_e}")
 
-            # Only seek the decoder - MPV will be seeked by _on_mvc_seek_idr_found
+            # Seek ONLY the decoder. MPV stays paused + read-ahead-clamped (idle on the disc) so
+            # the scan runs uncontended. seekIDRFound re-seeks MPV to the exact IDR timestamp and
+            # resumes it (atomic handoff) → both readers converged.
             self.request_decoder_seek.emit(target_time)
         except Exception as e:
             logger.error(f"[SEEK-QUEUE] MVC seek failed: {e}")
@@ -2034,6 +2053,35 @@ class PlayerWindow(QMainWindow):
         # DO NOT reconnect here to avoid double execution!
         self._seek_queue = RobustSeekQueue(self)
 
+        # Seek-race repro harness (DEV ONLY, env-gated SYLC_SEEK_STRESS=<sec>): auto-seek
+        # through the real user seek path to reproduce the intermittent D3D11 render-thread
+        # crash (0xe24c4a02). No-op unless the env var is set.
+        self._seek_stress_n = 0
+        _stress = os.environ.get('SYLC_SEEK_STRESS', '')
+        if _stress:
+            try:
+                self._seek_stress_interval = max(1.0, float(_stress))
+            except Exception:
+                self._seek_stress_interval = 3.0
+            self._seek_stress_timer = QTimer(self)
+            self._seek_stress_timer.timeout.connect(self._seek_stress_tick)
+            QTimer.singleShot(12000, lambda: self._seek_stress_timer.start(int(self._seek_stress_interval * 1000)))
+            logger.warning(f"[SEEK-STRESS] enabled: auto-seek every {self._seek_stress_interval:.1f}s after 12s warmup")
+
+        # Reload repro harness (DEV ONLY, env-gated SYLC_RELOAD_AFTER=<sec>): load a 2nd
+        # file (SYLC_RELOAD_FILE, default = same file) to reproduce the black-screen-on-
+        # reload bug through the real play_file path. No-op unless the env var is set.
+        self._reload_done = False
+        _reload = os.environ.get('SYLC_RELOAD_AFTER', '')
+        if _reload:
+            try:
+                self._reload_after = max(5.0, float(_reload))
+            except Exception:
+                self._reload_after = 40.0
+            self._reload_file = os.environ.get('SYLC_RELOAD_FILE', '')
+            QTimer.singleShot(int(self._reload_after * 1000), self._reload_test_tick)
+            logger.warning(f"[RELOAD-TEST] will load a 2nd file after {self._reload_after:.0f}s")
+
         # --- MVC Performance Fix: Utiliser multiprocessing.Array ---
         self.MVC_WIDTH = 1920
         self.MVC_HEIGHT = 2205
@@ -2413,6 +2461,37 @@ class PlayerWindow(QMainWindow):
             self._handle_seek_request(target_time)
 
         # Resume logic is handled by the seek queue or explicit pause/unpause signals
+
+    def _seek_stress_tick(self):
+        """DEV (SYLC_SEEK_STRESS): drive an auto-seek through the real seek queue to
+        reproduce the intermittent seek crash. Cycles positions across the file."""
+        try:
+            try:
+                dur = float(self.player.duration or 0.0)
+            except Exception:
+                dur = 0.0
+            if dur <= 20.0:
+                return
+            self._seek_stress_n += 1
+            frac = (self._seek_stress_n * 0.137) % 1.0   # spread targets across the file
+            target = 5.0 + frac * (dur - 15.0)
+            logger.warning(f"[SEEK-STRESS] #{self._seek_stress_n} -> {target:.2f}s (dur={dur:.1f})")
+            if hasattr(self, '_seek_queue') and self._seek_queue:
+                self._seek_queue.request_seek(target, is_mvc=self.mvc_mode_active)
+        except Exception as e:
+            logger.error(f"[SEEK-STRESS] tick error: {e}")
+
+    def _reload_test_tick(self):
+        """DEV (SYLC_RELOAD_AFTER): load a 2nd file to reproduce the reload black screen."""
+        try:
+            if getattr(self, '_reload_done', False):
+                return
+            self._reload_done = True
+            f = getattr(self, '_reload_file', '') or self.current_file_path
+            logger.warning(f"[RELOAD-TEST] loading 2nd file now: {f}")
+            self.play_file(f)
+        except Exception as e:
+            logger.error(f"[RELOAD-TEST] error: {e}")
 
     def _handle_seek_request(self, time_pos):
         """Performs the actual seek operation."""
@@ -4684,7 +4763,12 @@ class PlayerWindow(QMainWindow):
                     self.show_3d_notification("2D edge264 decoder active", success=True, permanent=True)
                 except Exception as e:
                     logger.error(f"[2D-EDGE264] Failed to start edge264 for 2D: {e}")
-                    # Fall through silently — MPV continues to play the file natively.
+                    self._present_via_mpv_native()  # edge264 failed -> MPV plays natively
+            else:
+                # 2D not edge264-eligible (non-h264, or non-.mkv: .mp4/.avi/.m2ts/VC-1…):
+                # MPV plays it natively. If a 3D/MVC file was loaded before, MPV video was
+                # disabled and the stack shows the MVC widget -> black unless we restore both.
+                self._present_via_mpv_native()
 
     def configure_3d_output(self, enable_3d=True, stereo_mode='auto'):
         """Configures the 3D output of mpv."""
@@ -4845,6 +4929,26 @@ class PlayerWindow(QMainWindow):
         self._stop_mvc_decoder()
 
         print(f"[MVC INIT] Starting MVC decoder initialization")
+
+        # SSIF SEEK-FREEZE FIX: in MVC mode MPV is AUDIO-ONLY (video is decoded by the
+        # demuxer+edge264). The global config gives MPV a 20s / 2 GB read-ahead — fine for
+        # 2D, but on a physical Blu-ray it makes MPV pre-read tens of MB of the 45 GB .ssif,
+        # which fights the video demuxer for the single optical head on every seek (→ 10-20s
+        # freezes). Audio needs only a small buffer, so shrink MPV's cache here (restored to
+        # the generous defaults for 2D playback in _present_via_mpv_native / on 2D load).
+        if self.player:
+            try:
+                # Modest, CHUNKED read-ahead: MPV (audio-only here) reads the disc in a few
+                # 16 MB sequential chunks (not 2 GB of constant pre-read, and NOT cache=no which
+                # made it do tiny head-seeking reads) so it shares the optical head with the
+                # video demuxer with minimal thrash. 2D playback keeps the generous default.
+                self.player['cache'] = 'yes'
+                self.player['demuxer-readahead-secs'] = 1
+                self.player['demuxer-max-bytes'] = '16MiB'
+                self.player['demuxer-max-back-bytes'] = '8MiB'
+                logger.info("[MVC INIT] MPV cache set to modest chunked read-ahead for MVC mode (anti seek-freeze)")
+            except Exception as e:
+                logger.warning(f"[MVC INIT] Could not adjust MPV cache: {e}")
 
         # Demuxer initialization moved to thread to avoid blocking GUI
 
@@ -5142,6 +5246,27 @@ class PlayerWindow(QMainWindow):
             logger.error(f"[MVC INIT] Warning: Could not disable mpv video: {e}")
             return False
 
+    def _present_via_mpv_native(self):
+        """Route presentation to MPV's OWN video output, for 2D files not decoded by
+        edge264 (non-h264 or non-.mkv: .mp4/.avi/.m2ts/VC-1…). Idempotent.
+
+        BLACK-SCREEN-ON-RELOAD (2D-after-3D) FIX: a prior 3D/MVC file put MPV in
+        audio-only mode (vid=no, vo=null via _disable_mpv_video_output) AND left
+        video_stack showing the MVC widget. On a fresh load there is no seek/3D path to
+        undo that, so a subsequent 2D MPV-native file plays audio with a black picture.
+        Restore BOTH: MPV video output (vo+vid) and the on-screen MPV video widget."""
+        try:
+            self._restore_mpv_video_output()  # restores vo + sets video='auto'
+            try:
+                self.player['vid'] = 'auto'   # belt-and-suspenders: ensure track re-selected
+            except Exception:
+                pass
+            if getattr(self, 'video_widget', None) is not None:
+                self.video_stack.setCurrentWidget(self.video_widget)
+            logger.info("[2D-MPV] Restored MPV native video output + switched to video_widget")
+        except Exception as e:
+            logger.warning(f"[2D-MPV] present-via-mpv failed: {e}")
+
     def _restore_mpv_video_output(self):
         """Restore mpv video output after MVC playback failures/stop."""
         if not self.player:
@@ -5226,6 +5351,18 @@ class PlayerWindow(QMainWindow):
         # This must be done BEFORE anything else to give decoder thread time to notice
         if self.mvc_decoder_thread:
             self.mvc_decoder_thread._cleanup_in_progress = True
+            # Break any in-flight C++ SSIF read NOW so the thread can promptly see the stop
+            # flags. read_next_*() releases the GIL, so this cross-thread abort lands mid-read;
+            # without it a slow cold/contended dependent-extent read pins the thread for tens of
+            # seconds and we fall through to the force-terminate path below (which can crash
+            # inside the C extension). The flag stays set; the demuxer is recreated on restart.
+            try:
+                _dmx = getattr(self.mvc_decoder_thread, 'demuxer', None)
+                if _dmx is not None and hasattr(_dmx, 'request_abort'):
+                    _dmx.request_abort()
+                    logger.info("[MVC CLEANUP] Demuxer read abort requested")
+            except Exception:
+                pass
             # Brief pause to allow decoder thread to see the flag and abort operations
             import time
             time.sleep(0.050)  # 50ms

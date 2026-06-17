@@ -77,13 +77,29 @@ public:
     // Get file size
     uint64_t getFileSize() const { return fileSize_; }
 
+    // DIAG: count of resync events (forward-scans on sync-byte loss)
+    long getResyncCount() const { return resync_count_; }
+
 private:
     std::ifstream file_;
+    // EXPLICIT big-chunk read buffer. pubsetbuf is unreliable on MSVC (the demuxer still
+    // read ~2 MB/s while the SAME disc does 18 MB/s with 1 MB reads — measured), so we buffer
+    // ourselves: one big file_.read() fills io_buffer_, packets are served from it. Few large
+    // sequential reads instead of thousands of tiny ones = optical drive streams at full speed.
+    std::vector<char> io_buffer_;
+    size_t bufPos_ = 0;            // consumed offset within io_buffer_
+    size_t bufLen_ = 0;            // valid bytes currently in io_buffer_
+    uint64_t bufFileStart_ = 0;    // file byte offset of io_buffer_[0]
     uint64_t fileSize_;
     int packetSize_;  // 188 or 192
+    long resync_count_ = 0;  // DIAG: resync events
 
     // OPTIMIZATION: Pre-allocated buffer to avoid malloc() on every packet read
     std::vector<uint8_t> packetBuffer_;
+
+    // Serve n bytes from io_buffer_, refilling with one big file_.read() when drained.
+    // Returns false only at genuine EOF. Keeps bufFileStart_/bufPos_ = logical read position.
+    bool readBuffered(uint8_t* dst, size_t n);
 
     // PAT/PMT parsing state
     std::vector<ProgramInfo> programs_;
@@ -91,6 +107,12 @@ private:
 
     // Auto-detect packet size (188 or 192)
     bool detectPacketSize();
+
+    // Forward-resync after a sync-byte loss (e.g. non-TS gaps at SSIF interleave
+    // boundaries). Scans ahead for the next position where the packet cadence
+    // resumes, repositions, and loads packetBuffer_ with that packet. Bounded;
+    // returns false only at genuine EOF / unrecoverable stream.
+    bool resyncToNextPacket();
 
     // Parse PAT (Program Association Table)
     void parsePAT(const std::vector<uint8_t>& data);
