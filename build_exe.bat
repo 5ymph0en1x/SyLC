@@ -1,6 +1,6 @@
 @echo off
 REM === SyLC 3D Player - standalone no-console build (Nuitka) ===
-REM Prereqs: a Python 3.13 venv with: pip install -r requirements.txt nuitka pybind11
+REM Prereqs: a Python 3.14 venv with: requirements.txt + nuitka (run from the activated venv)
 REM          + MSVC 2022 build tools. Run from this folder.
 cd /d "%~dp0"
 
@@ -27,8 +27,7 @@ python -m nuitka SyLC_3D_Player.py ^
   --include-data-files=icon.png=icon.png ^
   --output-dir=build_nuitka ^
   --output-filename=SyLC_3D_Player.exe ^
-  --company-name=SyLC --product-name="SyLC 3D Player" --file-version=3.2.0 --product-version=3.2.0
+  --company-name=SyLC --product-name="SyLC 3D Player" --file-version=4.0.0 --product-version=4.0.0
 
 echo.
 echo Build done. Result: build_nuitka\SyLC_3D_Player.dist\SyLC_3D_Player.exe
-pause

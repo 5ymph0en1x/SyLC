@@ -253,7 +253,7 @@ class PremiumIconButton(QPushButton):
 
             # === BACKGROUND ===
             if self.is_primary:
-                # Primary button: gradient avec glow
+                # Primary button: gradient with glow
                 gradient = QRadialGradient(cx, cy, radius * 1.2)
                 gradient.setColorAt(0, QColor(0, 180, 240, 255))
                 gradient.setColorAt(0.7, QColor(0, 130, 200, 255))
@@ -464,6 +464,28 @@ class PremiumIconButton(QPushButton):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawEllipse(QPointF(cx, cy), r * 0.12, r * 0.12)
 
+        elif self.icon_type == 'archive':
+            # Optical disc above a down-arrow: save/rip the disc to an .iso image
+            painter.setPen(QPen(color, 1.7, Qt.PenStyle.SolidLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            dcy = cy - s * 0.16
+            r = s * 0.34
+            painter.drawEllipse(QPointF(cx, dcy), r, r)
+            painter.drawEllipse(QPointF(cx, dcy), r * 0.34, r * 0.34)
+            painter.setBrush(QBrush(color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QPointF(cx, dcy), r * 0.11, r * 0.11)
+            # down arrow (export to file)
+            pen = QPen(color, 2.0)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            ay0, ay1 = cy + s * 0.20, cy + s * 0.50
+            painter.drawLine(QPointF(cx, ay0), QPointF(cx, ay1))
+            painter.drawLine(QPointF(cx - s * 0.13, ay1 - s * 0.15), QPointF(cx, ay1))
+            painter.drawLine(QPointF(cx + s * 0.13, ay1 - s * 0.15), QPointF(cx, ay1))
+
 
 # =============================================================================
 # PREMIUM STATUS BADGE
@@ -492,12 +514,12 @@ class PremiumStatusBadge(QWidget):
 
     def set_status(self, text, status_type="info", active=False):
         """
-        DÃ©finit le statut affichÃ©.
+        Sets the displayed status.
 
         Args:
-            text: Texte Ã  afficher
+            text: Text to display
             status_type: 'info', 'success', 'warning', 'error'
-            active: Si True, active l'animation de glow
+            active: If True, enables the glow animation
         """
         self._status = text
         self._status_type = status_type
@@ -528,7 +550,7 @@ class PremiumStatusBadge(QWidget):
                 return
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-            # Couleurs selon le type
+            # Colors by type
             colors = {
                 'info': (PremiumColors.INFO, QColor(138, 180, 248, 30)),
                 'success': (PremiumColors.SUCCESS, QColor(0, 230, 118, 40)),
@@ -537,7 +559,7 @@ class PremiumStatusBadge(QWidget):
             }
             accent_color, bg_color = colors.get(self._status_type, colors['info'])
 
-            # Background avec glow si actif
+            # Background with glow if active
             rect = QRectF(0, 0, self.width(), self.height())
 
             if self._is_active:
@@ -703,12 +725,12 @@ class PremiumTimelineSlider(QSlider):
         self._anim_timer.timeout.connect(self._animate)
         self._anim_timer.setInterval(30)
 
-        # === SCRUBBING SYSTEM CORRIGÉ ===
+        # === CORRECTED SCRUBBING SYSTEM ===
         self._is_scrubbing = False
         self._scrub_start_value = 0
         self._scrub_debounce_timer = QTimer(self)
         self._scrub_debounce_timer.setSingleShot(True)
-        self._scrub_debounce_timer.setInterval(50)  # Réduit à 50ms pour plus de réactivité
+        self._scrub_debounce_timer.setInterval(50)  # Reduced to 50ms for more responsiveness
         self._scrub_debounce_timer.timeout.connect(self._on_scrub_debounce_expired)
         self._pending_scrub_value = None
 
@@ -853,7 +875,7 @@ class PremiumTimelineSlider(QSlider):
     def _on_scrub_debounce_expired(self):
         """Called after debounce - emits scrub_finished signal."""
         if self._pending_scrub_value is not None:
-            # Convertir ms en secondes pour le signal
+            # Convert ms to seconds for the signal
             self.scrub_finished.emit(float(self._pending_scrub_value) / 1000.0)
             self._pending_scrub_value = None
 
@@ -1180,6 +1202,7 @@ class PremiumControlsOverlay(QWidget):
     volume_changed = Signal(int)
     file_opened = Signal()
     disc_opened = Signal()  # open a Blu-ray 3D disc/folder (auto-detect the feature)
+    archive_requested = Signal()  # archive the current optical disc to an .iso image
     stereo_mode_changed = Signal(str)
     mode_3d_toggled = Signal(bool)
     audio_track_changed = Signal(int)
@@ -1238,6 +1261,9 @@ class PremiumControlsOverlay(QWidget):
         self.open_file_button.setToolTip("Open file")
         self.open_disc_button = PremiumIconButton('disc', 'medium')
         self.open_disc_button.setToolTip("Open Blu-ray 3D (drive or BDMV folder)")
+        self.archive_button = PremiumIconButton('archive', 'medium')
+        self.archive_button.setToolTip("Archive this Blu-ray to an ISO image")
+        self.archive_button.setEnabled(False)  # enabled only when a Blu-ray disc is the source
 
         # Audio track
         self.audio_track_combo = QComboBox()
@@ -1255,6 +1281,7 @@ class PremiumControlsOverlay(QWidget):
 
         left_group.addWidget(self.open_file_button)
         left_group.addWidget(self.open_disc_button)
+        left_group.addWidget(self.archive_button)
         left_group.addWidget(self.audio_track_combo, 1)  # stretch factor 1
         left_group.addWidget(self.subtitle_track_combo, 1)  # stretch factor 1 (same width)
 
@@ -1389,11 +1416,12 @@ class PremiumControlsOverlay(QWidget):
         self.fullscreen_button.clicked.connect(self.fullscreen_toggled)
         self.open_file_button.clicked.connect(self.file_opened)
         self.open_disc_button.clicked.connect(self.disc_opened)
+        self.archive_button.clicked.connect(self.archive_requested)
         self.volume_slider.volume_changed.connect(self.volume_changed)
         self.time_slider.sliderMoved.connect(lambda pos: self._on_slider_scrub(pos))
-        # ANTI-SPAM: Utiliser scrub_finished (debounced) au lieu de sliderReleased
+        # ANTI-SPAM: Use scrub_finished (debounced) instead of sliderReleased
         self.time_slider.scrub_finished.connect(self._emit_seek)
-        # Garder sliderReleased en backup pour les clics simples
+        # Keep sliderReleased as a backup for simple clicks
         self.time_slider.sliderReleased.connect(self._on_slider_released)
         self.mode_3d_button.toggled.connect(self.mode_3d_toggled)
         self.stereo_mode_combo.currentTextChanged.connect(self._on_stereo_mode_changed)
@@ -1405,6 +1433,7 @@ class PremiumControlsOverlay(QWidget):
         buttons = [
             self.open_file_button,
             self.open_disc_button,
+            self.archive_button,
             self.skip_back_button,
             self.stop_button,
             self.play_pause_button,
@@ -1421,6 +1450,7 @@ class PremiumControlsOverlay(QWidget):
         buttons = [
             self.open_file_button,
             self.open_disc_button,
+            self.archive_button,
             self.skip_back_button,
             self.stop_button,
             self.play_pause_button,
@@ -1435,12 +1465,12 @@ class PremiumControlsOverlay(QWidget):
     # === PUBLIC API ===
 
     def set_status_info(self, text, status_type="info", active=False):
-        """Met Ã  jour le badge de statut. (NO-OP: Badge supprimÃ©)"""
+        """Updates the status badge. (NO-OP: Badge removed)"""
         # self.status_badge.set_status(text, status_type, active)
         pass
 
     def set_tech_info(self, resolution="", fps="", codec=""):
-        """Met Ã  jour les infos techniques."""
+        """Updates the technical info."""
         self.tech_info.set_info(resolution, fps, codec)
 
     def set_mvc_active(self, active):
@@ -1475,13 +1505,13 @@ class PremiumControlsOverlay(QWidget):
         self.duration_label.setText(self._format_time(seconds))
 
     def set_time(self, seconds):
-        """Met Ã  jour la position actuelle."""
+        """Updates the current position."""
         if seconds is not None and not self.time_slider.isSliderDown():
             self.time_slider.setValue(int(seconds * 1000))
         self.time_label.setText(self._format_time(seconds))
 
     def set_buffer_progress(self, progress):
-        """Met Ã  jour l'indicateur de buffer (0-1)."""
+        """Updates the buffer indicator (0-1)."""
         self.time_slider.set_buffer_progress(progress)
 
     def enable_3d_controls(self, enabled):
@@ -1490,7 +1520,7 @@ class PremiumControlsOverlay(QWidget):
         self.stereo_mode_combo.setEnabled(enabled)
 
     def update_audio_tracks(self, tracks):
-        """Met Ã  jour la liste des pistes audio."""
+        """Updates the audio track list."""
         self.audio_track_combo.blockSignals(True)
         self.audio_track_combo.clear()
         if not tracks:
@@ -1499,7 +1529,7 @@ class PremiumControlsOverlay(QWidget):
         else:
             self.audio_track_combo.addItem("Select...")
             for track_id, title, lang in tracks:
-                # Format compact mais lisible
+                # Compact but readable format
                 if lang:
                     label = f"{title} [{lang.upper()}]"
                 else:
@@ -1510,14 +1540,14 @@ class PremiumControlsOverlay(QWidget):
         self.audio_track_combo.blockSignals(False)
 
     def update_subtitle_tracks(self, tracks):
-        """Met Ã  jour la liste des sous-titres."""
+        """Updates the subtitle list."""
         logger.info(f"[UI] update_subtitle_tracks called with {len(tracks) if tracks else 0} tracks")
         self.subtitle_track_combo.blockSignals(True)
         self.subtitle_track_combo.clear()
         self.subtitle_track_combo.addItem("None", 0)
         if tracks:
             for track_id, title, lang in tracks:
-                # Format compact mais lisible
+                # Compact but readable format
                 if lang:
                     label = f"{title} [{lang.upper()}]"
                 else:
@@ -1563,8 +1593,8 @@ class PremiumControlsOverlay(QWidget):
                 )
                 parts = []
                 if name and not is_placeholder:
-                    parts.append(name)
-                if language:
+                    parts.append(name)               # already conveys the language (BD PGS)
+                elif language:
                     parts.append(f"[{language.upper()}]")
                 if codec_label:
                     parts.append(f"({codec_label})")
@@ -1593,11 +1623,11 @@ class PremiumControlsOverlay(QWidget):
 
     def _emit_seek(self, value=None):
         """Emits seeked signal with value in seconds."""
-        # La valeur reçue de scrub_finished est déjà en secondes
+        # The value received from scrub_finished is already in seconds
         if value is not None:
             self.seeked.emit(float(value))
         else:
-            # Fallback: utiliser la valeur du slider (en ms) convertie en secondes
+            # Fallback: use the slider value (in ms) converted to seconds
             self.seeked.emit(self.time_slider.value() / 1000.0)
 
     def _on_slider_released(self):
@@ -1606,7 +1636,7 @@ class PremiumControlsOverlay(QWidget):
         Debounced scrub_finished handles most cases, but this ensures
         simple clicks are processed even if scrub_finished didn't trigger.
         """
-        # Ne rien faire - scrub_finished gère le seek via mouseReleaseEvent
+        # Do nothing - scrub_finished handles the seek via mouseReleaseEvent
         pass
 
     def _on_slider_scrub(self, pos):

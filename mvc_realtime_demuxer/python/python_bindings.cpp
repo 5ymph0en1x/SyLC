@@ -11,6 +11,7 @@
 #include "matroska_reader.h"
 #include "mvc_decoder.h"
 #include "frame_ring_buffer.h"
+#include "native_renderer.h"   // gated internally on SYLC_NATIVE_RENDERER
 
 namespace py = pybind11;
 using namespace mvc_demux;
@@ -746,5 +747,84 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
     // Edge264 not available - do NOT expose MVCDecoder
     // Python code will check hasattr(module, 'MVCDecoder') and fallback to ctypes
     m.attr("EDGE264_UNAVAILABLE") = true;
+#endif
+
+    // --- Native D3D11 renderer (Tokyo #3), STAGE S1 -------------------------
+    // Exposed only when built with SYLC_NATIVE_RENDERER (Windows + d3d11/dxgi).
+    // Python checks hasattr(module, 'NativeRenderer') / NATIVE_RENDERER_AVAILABLE.
+#ifdef SYLC_NATIVE_RENDERER
+    py::class_<sylc::NativeRenderer>(m, "NativeRenderer")
+        .def(py::init<>())
+        // GIL released around device/swapchain creation and the blocking Present,
+        // per the design's GIL discipline (never freeze the UI / starve audio).
+        .def("initialize", &sylc::NativeRenderer::initialize,
+             py::arg("hwnd"), py::arg("width"), py::arg("height"), py::arg("hdr") = false,
+             py::call_guard<py::gil_scoped_release>(),
+             "Create the flip-model swapchain on an existing HWND (int). "
+             "hdr=False -> 8-bit SDR (G22/gamma, no EOTF; matches Qt on an SDR display); "
+             "hdr=True -> FP16 scRGB linear (needs in-shader EOTF + SDR-white scaling).")
+        .def("resize", &sylc::NativeRenderer::resize,
+             py::arg("width"), py::arg("height"),
+             py::call_guard<py::gil_scoped_release>(),
+             "ResizeBuffers to the new physical size (flip-model requirement).")
+        .def("present", &sylc::NativeRenderer::present,
+             py::call_guard<py::gil_scoped_release>(),
+             "Clear to black and Present (interval 1). Call from the owning thread only.")
+        .def("is_hdr", &sylc::NativeRenderer::is_hdr,
+             "True if the scRGB HDR color space was accepted.")
+        .def("set_uniforms", &sylc::NativeRenderer::set_uniforms,
+             py::arg("stereo_mode"), py::arg("subtitle_enabled"),
+             py::arg("rect_x") = 0.f, py::arg("rect_y") = 0.f,
+             py::arg("rect_w") = 1.f, py::arg("rect_h") = 1.f,
+             py::arg("sdr_white_level") = 1.f, py::arg("output_gamma") = 0.f,
+             "Set shader uniforms (stereo_mode 0=2D/1=framepack/2=SBS/3=TAB; "
+             "output_gamma>0 linearizes the gamma-domain RGB before scaling).")
+        .def("set_yuv_frame",
+             [](sylc::NativeRenderer& r, py::object yl, py::object ul, py::object vl,
+                py::object yr, py::object ur, py::object vr) {
+                 py::object planes[6] = { yl, ul, vl, yr, ur, vr };
+                 bool ok = true;
+                 for (int i = 0; i < 6; ++i) {
+                     if (planes[i].is_none()) continue;
+                     auto a = planes[i].cast<py::array_t<uint8_t,
+                                  py::array::c_style | py::array::forcecast>>();
+                     if (a.ndim() != 2)
+                         throw std::runtime_error("YUV plane must be a 2-D uint8 array");
+                     const uint32_t h = static_cast<uint32_t>(a.shape(0));
+                     const uint32_t w = static_cast<uint32_t>(a.shape(1));
+                     const uint32_t stride = static_cast<uint32_t>(a.strides(0));
+                     if (!r.upload_plane(i, a.data(), w, h, stride)) ok = false;
+                 }
+                 return ok;
+             },
+             py::arg("y_l"), py::arg("u_l"), py::arg("v_l"),
+             py::arg("y_r") = py::none(), py::arg("u_r") = py::none(), py::arg("v_r") = py::none(),
+             "Upload the 6 YUV planes (uint8 2-D arrays; right planes optional for 2D).")
+        .def("set_subtitle_rgba",
+             [](sylc::NativeRenderer& r,
+                py::array_t<uint8_t, py::array::c_style | py::array::forcecast> a) {
+                 if (a.ndim() != 3 || a.shape(2) != 4)
+                     throw std::runtime_error("subtitle must be HxWx4 uint8 RGBA");
+                 const uint32_t h = static_cast<uint32_t>(a.shape(0));
+                 const uint32_t w = static_cast<uint32_t>(a.shape(1));
+                 const uint32_t stride = static_cast<uint32_t>(a.strides(0));
+                 return r.upload_subtitle(a.data(), w, h, stride);
+             },
+             py::arg("rgba"), "Upload an HxWx4 uint8 RGBA subtitle overlay.")
+        .def("clear_frame", &sylc::NativeRenderer::clear_frame,
+             "Forget the current frame (present() falls back to black).")
+        .def("pause", &sylc::NativeRenderer::pause,
+             py::call_guard<py::gil_scoped_release>(),
+             "Seek/pause gate: present() holds the last frame (no GPU work).")
+        .def("resume", &sylc::NativeRenderer::resume,
+             py::call_guard<py::gil_scoped_release>(),
+             "Resume presenting.")
+        .def("is_paused", &sylc::NativeRenderer::is_paused)
+        .def("backend_info", &sylc::NativeRenderer::backend_info)
+        .def("last_error", &sylc::NativeRenderer::last_error)
+        .def("shutdown", &sylc::NativeRenderer::shutdown);
+    m.attr("NATIVE_RENDERER_AVAILABLE") = true;
+#else
+    m.attr("NATIVE_RENDERER_AVAILABLE") = false;
 #endif
 }

@@ -246,6 +246,11 @@ class SubtitleManager(QObject):
         self._current_display_set = None
         self._last_update_pts = -1.0
         self._last_img_key = None
+        # Clear any caption still on screen from the previous track/stream. Switching
+        # subtitle tracks (e.g. English Forced -> English) restarts streaming with a fresh
+        # parser; without this the old caption stays displayed until the new track's first
+        # cue arrives (the widget only clears on a subtitle_cleared signal).
+        self.subtitle_cleared.emit()
 
     @Slot(bytes, float)
     def on_pgs_data(self, pgs_data: bytes, pts: float):

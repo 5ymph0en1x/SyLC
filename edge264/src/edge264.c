@@ -82,6 +82,14 @@
 
 #include "edge264_headers.c"
 
+#if defined(LOGS) && !defined(HAS_LOGS)
+// SyLC diagnostic stub: the separate _log-variant build pass (HAS_LOGS) is not compiled
+// here. Under -DLOGS the BASE worker_loop already has log_mb active and performs the
+// per-mb trace via print_mb, so this stub merely satisfies the lone worker_loop_log
+// reference (a log-format check at headers.c) and is never executed.
+void *worker_loop_log(void *d) { (void)d; return (void *)0; }
+#endif
+
 
 
 const uint8_t *edge264_find_start_code(const uint8_t *buf, const uint8_t *end, int four_byte) {
@@ -383,6 +391,12 @@ int edge264_decode_NAL(Edge264Decoder *dec, const uint8_t *buf, const uint8_t *e
 }
 
 
+
+// NOTE: MVC base/dependent OUTPUT pairing (matching the two views by PictureOrderCnt) is
+// done in the HOST (mvc_decoder.py), not here: pairing by POC inside get_frame would have
+// to wait for the lagging dependent picture, which holds the base picture's DPB slot and
+// deadlocks deblocking. get_frame therefore emits both views (each deblocked) by queue
+// position; the host re-associates base[X] with dep[X] by POC for display.
 
 /**
  * By default all frames with POC lower or equal with the last non-reference

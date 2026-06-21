@@ -331,37 +331,24 @@
 				coeff_level = 2;
 				while (get_ae_inline(ctx, ctxIdx1) && ++coeff_level != 15)
 					continue;
-				#if SIZE_BIT == 32
-					if (coeff_level == 15) {
-						// the largest value to encode is -2^(14+7)+14, for which k=20 (see 9.3.2.3)
-						int k = 0;
-						while (get_bypass(ctx) && k < 20)
-							k++;
-						coeff_level = 1;
-						while (k--)
-							coeff_level += coeff_level + get_bypass(ctx);
-						coeff_level += 14;
-					}
-					coeff_level = get_bypass(ctx) ? -coeff_level : coeff_level;
-				#elif SIZE_BIT == 64
-					if (coeff_level != 15) {
-						coeff_level = get_bypass(ctx) ? -coeff_level : coeff_level;
-					} else {
-						// we need at least 51 bits in offset to get 42 bits with a division by 9 bits
-						int zeros = clz(ctx->t.gb.range);
-						if (zeros > 64 - 51)
-							zeros = renorm_bits(ctx, zeros);
-						size_t range = ctx->t.gb.range >> 42;
-						size_t quo = ctx->t.gb.offset / range; // contains 42 bypass bits in lsb
-						size_t rem = ctx->t.gb.offset % range;
-						int k = clz(~quo << (64 - 42) | (size_t)1 << (64 - 21));
-						int unused = 42 - k * 2 - 2;
-						coeff_level = 14 + (1 << k) + ((unsigned)(quo >> unused >> 1) & ((1 << k) - 1));
-						coeff_level = (quo & (size_t)1 << unused) ? -coeff_level : coeff_level;
-						ctx->t.gb.offset = (quo & (((size_t)1 << unused) - 1)) * range + rem;
-						ctx->t.gb.range = range << unused;
-					}
-				#endif
+				// coeff_abs_level_minus1 suffix (9.3.2.3): the truncated-unary prefix reached
+				// 14, so the remainder is EG0-coded. Decode it with the simple, verified
+				// bit-by-bit method (identical math to the 32-bit path: 14 + 2^k + suffix).
+				// This replaces a 64-bit "division" fast-path whose manual offset/range
+				// update intermittently desynchronised the CABAC engine on large coefficients
+				// in complex scenes — the root cause of the transient macroblock band. Large
+				// coefficients are rare, so the bit-by-bit cost is negligible.
+				if (coeff_level == 15) {
+					// the largest value to encode is -2^(14+7)+14, for which k=20 (see 9.3.2.3)
+					int k = 0;
+					while (get_bypass(ctx) && k < 20)
+						k++;
+					coeff_level = 1;
+					while (k--)
+						coeff_level += coeff_level + get_bypass(ctx);
+					coeff_level += 14;
+				}
+				coeff_level = get_bypass(ctx) ? -coeff_level : coeff_level;
 				ctxIdx0 = ctx->ctxIdxOffsets[3];
 				ctxIdx1 = ctxIdx0 + ctx->coeff_abs_inc[ctxIdx1 - ctxIdx0 - 5];
 			}
@@ -369,6 +356,7 @@
 			// store in transposed scan position
 			int i = 63 - __builtin_clzll(significant_coeff_flags);
 			ctx->c[ctx->scan[i]] = coeff_level;
+			log_mb(ctx, " c%d:%d", ctx->scan[i], coeff_level);
 			significant_coeff_flags &= ~((uint64_t)1 << i);
 		} while (significant_coeff_flags != 0);
 	}
@@ -991,46 +979,24 @@ static noinline void CAFUNC(parse_inter_residual)
 			while (mvd != 9 && get_ae_inline(ctx, ctxIdx))
 				ctxIdx = ctxBase + min(mvd++, 3);
 			if (mvd == 9) {
-				#if SIZE_BIT == 32
-					// we need at least 21 bits in offset to get 12 bypass bits (max prefix size)
-					int zeros = clz(ctx->t.gb.range);
-					if (zeros > 32 - 21)
-						zeros = renorm_bits(ctx, zeros);
-					unsigned range = ctx->t.gb.range >> (32 - 9 - zeros); // maximum shift to get as many bypass bits as possible
-					unsigned quo = ctx->t.gb.offset / range; // contains 32-9-zeros bypass bits in lsb
-					unsigned rem = ctx->t.gb.offset % range;
-					int k = 3 + clz(~quo << (zeros + 9) | 1 << (32 - 12));
-					int unused = 32 - 9 - zeros - k * 2 + 1;
-					if (__builtin_expect(unused < 0, 0)) {
-						unsigned ref = get_bytes(&ctx->t.gb, 3);
-						unsigned div = shld(ref, rem, -unused);
-						quo = shld((div / range) << (32 + unused), quo, -unused);
-						rem = shld(ref << -unused, div % range, 24 + unused);
-						range <<= 24 + unused;
-						unused = 0;
-					}
-					mvd = 1 + (1 << k) + (quo >> unused >> 1 & ((1 << k) - 1));
-					mvd = (quo & 1 << unused) ? -mvd : mvd;
-					ctx->t.gb.offset = (quo & ((1 << unused) - 1)) * range + rem;
-					ctx->t.gb.range = range << unused;
-				#else
-					// we need at least 36 bits in offset to get 27 bypass bits (max code size)
-					int zeros = clz(ctx->t.gb.range);
-					if (zeros > 64 - 36)
-						zeros = renorm_bits(ctx, zeros);
-					size_t range = ctx->t.gb.range >> 27; // shift to get exactly 27 bypass bits
-					size_t quo = ctx->t.gb.offset / range; // contains 27 bypass bits in lsb
-					size_t rem = ctx->t.gb.offset % range;
-					int k = 3 + clz(~quo << (64 - 27) | (size_t)1 << (64 - 12));
-					int unused = 27 - k * 2 + 1;
-					mvd = 1 + (1 << k) + ((unsigned)(quo >> unused >> 1) & ((1 << k) - 1));
-					mvd = (quo & (size_t)1 << unused) ? -mvd : mvd;
-					ctx->t.gb.offset = (quo & (((size_t)1 << unused) - 1)) * range + rem;
-					ctx->t.gb.range = range << unused;
-				#endif
-			} else if (mvd > 0) {
-				mvd = get_bypass(ctx) ? -mvd : mvd;
+				// UEG3 suffix (9.3.2.3, uCoff=9, order 3): decode bit-by-bit. The decoded
+				// magnitude is |mvd| = 1 + 2^(3+m) + suffix, where m is the unary-prefix
+				// length and the suffix is (3+m) bits. This replaces a 64-bit "division"
+				// fast-path whose up-front renormalisation could leave the CABAC engine
+				// desynced on large motion vectors — the root cause of the residual
+				// transient macroblock band (e.g. a spurious mvd of 258 that mis-counted
+				// bins and tripped a premature end_of_slice_flag a few MBs later). Large
+				// mvds are rare, so the bit-by-bit cost is negligible.
+				int k = 3;
+				while (get_bypass(ctx) && k < 14)
+					k++;
+				unsigned suffix = 0;
+				for (int b = 0; b < k; b++)
+					suffix = (suffix << 1) | (unsigned)get_bypass(ctx);
+				mvd = 1 + (1 << k) + (int)suffix;
 			}
+			if (mvd > 0)
+				mvd = get_bypass(ctx) ? -mvd : mvd;
 			
 			if (++i == 2) {
 				res[1] = mvd;
@@ -1684,8 +1650,9 @@ static noinline void CAFUNC(parse_slice_data)
 
 		// update flip_bit atomically to signal mb is a priori decoded, otherwise end the slice
 		int prev_recovery_bits = __atomic_exchange_n(&mb->recovery_bits, ctx->t.frame_flip_bit, __ATOMIC_ACQ_REL);
-		if (prev_recovery_bits == ctx->t.frame_flip_bit)
+		if (prev_recovery_bits == ctx->t.frame_flip_bit) {
 			return;
+		}
 
 		// set and reset neighbouring pointers depending on their availability
 		int unavail16x16 = (ctx->mbx == 0 ? 9 : 0) | (ctx->mbx == ctx->t.pic_width_in_mbs - 1) << 2 | (ctx->mby == 0 ? 14 : 0);

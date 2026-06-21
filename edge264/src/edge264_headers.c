@@ -1217,6 +1217,24 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 		dec->FieldOrderCnt[1][currPic] = dec->BottomFieldOrderCnt;
 		dec->remaining_mbs[currPic] = sps->pic_width_in_mbs * sps->pic_height_in_mbs;
 		dec->next_deblock_addr[currPic] = 0;
+		// RECOVERY-BITS INVARIANT FIX: reset every macroblock of the (possibly reused) slot
+		// to the OPPOSITE of this frame's flip bit, so each mb starts as "not yet decoded
+		// this frame". parse_slice_data ends a slice early when mb->recovery_bits already
+		// equals frame_flip_bit; relying on the previous frame to have left every mb at
+		// !flip is unsafe — an incomplete decode (force-complete) OR an SPS-driven
+		// frame_flip_bits reset (every GOP on Blu-ray) leaves stale values that collide
+		// with the new flip, so the a-priori-decoded test fires falsely and the slice is
+		// truncated (the transient macroblock band, in BOTH views, on complex BD3D scenes
+		// and the studio logo). Touches only the 1-byte recovery_bits metadata, never the
+		// sample/reference pixels (unlike the removed zero-fill noted below).
+		{
+			int8_t rb_flip_inv = (int8_t)(((dec->frame_flip_bits >> currPic) & 1) ^ 1);
+			Edge264Macroblock *rb_mb = dec->mb_buffers[currPic];
+			int rb_n = (sps->pic_width_in_mbs + 1) * sps->pic_height_in_mbs - 1;
+			for (int rb_i = 0; rb_i < rb_n; rb_i += sps->pic_width_in_mbs + 1)
+				for (int rb_j = rb_i; rb_j < rb_i + sps->pic_width_in_mbs; rb_j++)
+					rb_mb[rb_j].recovery_bits = rb_flip_inv;
+		}
 		// (Removed ANTI-STALE zero-fill: this destroyed reference frame data
 		// used by subsequent P/B-frame motion compensation, causing visible
 		// 1Hz chroma drift on GOP boundaries.)

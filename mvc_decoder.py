@@ -5,7 +5,7 @@ Version: 5.7 - CRITICAL FIX for 64GB memory leak in minutes
                - Added maxlen to presentation_queue (prevents unlimited growth)
                - Added decoder throttling when queue is full
                - Added periodic garbage collection
-               Now relies on edge264's built-in emergency SPSâ†’SSPS copy logic.
+               Now relies on edge264's built-in emergency SPS->SSPS copy logic.
                Fixes access violation crashes on NAL 20 (MVC coded slices).
 """
 
@@ -350,7 +350,7 @@ except Exception:
     mvc_demuxer_cpp = None
 
 # -----------------------------------------------------------------------------
-# Configuration & Chargement Librairie (Edge264)
+# Configuration & Library Loading (Edge264)
 # -----------------------------------------------------------------------------
 logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -409,12 +409,12 @@ edge264 = None
 try:
     dll_path = _find_dll(lib_name)
     edge264 = ctypes.CDLL(dll_path)
-    logger.info(f"[MVC-DLL] Chargé depuis: {dll_path}")
+    logger.info(f"[MVC-DLL] Loaded from: {dll_path}")
 except OSError as e:
-    logger.critical(f"[MVC-DLL] ERREUR CRITIQUE: Impossible de charger {lib_name}. {e}")
+    logger.critical(f"[MVC-DLL] CRITICAL ERROR: Unable to load {lib_name}. {e}")
 
 # -----------------------------------------------------------------------------
-# Structures & Constantes C
+# C Structures & Constants
 # -----------------------------------------------------------------------------
 NAL_TYPE_SLICE = 1
 NAL_TYPE_IDR = 5
@@ -537,7 +537,7 @@ def find_nal_units(data: bytes):
         start = next_start
 
 # -----------------------------------------------------------------------------
-# Thread de DÃ©codage MVC
+# MVC Decoding Thread
 # -----------------------------------------------------------------------------
 class MVCDecoderThread(QThread):
     frameReady = Signal()
@@ -548,11 +548,11 @@ class MVCDecoderThread(QThread):
     stats_update = Signal(int, int)
     decodingFinished = Signal()
     decoderCrashed = Signal()
-    seekFinished = Signal()  # Signal émis quand le seek est totalement terminé (IDR trouvé + primed)
-    # V7b+ SYNC FIX: Signal émis avec le timestamp EXACT de l'IDR trouvé après seek
-    # Le GUI doit seeker MPV à ce timestamp pour garantir la synchronisation audio/vidéo
+    seekFinished = Signal()  # Signal emitted when the seek is fully complete (IDR found + primed)
+    # V7b+ SYNC FIX: Signal emitted with the EXACT timestamp of the IDR found after seek
+    # The GUI must seek MPV to this timestamp to guarantee audio/video synchronization
     seekIDRFound = Signal(float)  # (idr_timestamp_seconds)
-    # Nouveau signal pour la synchronisation audio basée sur les marqueurs du décodeur
+    # New signal for audio synchronization based on the decoder's markers
     frameTimestampReady = Signal(int, float, int)  # (frame_id, timestamp_seconds, poc)
     # PGS subtitle streaming - emits raw PGS data for real-time parsing
     pgsDataReady = Signal(bytes, float)  # (pgs_data, pts_seconds)
@@ -644,12 +644,17 @@ class MVCDecoderThread(QThread):
         self._cached_nal_pps = None
         self._cached_nal_ssps = None
 
-        # V7b FLUIDITY FIX: Augmenter à 4 (aligné avec ultimate_mvc_player buffer >= 3)
-        # Améliore la fluidité avec les B-frames, latency +83ms acceptable
+        # V7b FLUIDITY FIX: Increase to 4 (aligned with ultimate_mvc_player buffer >= 3)
+        # Improves smoothness with B-frames, latency +83ms acceptable
         self.REORDER_DEPTH = 4
         self.epoch = 0
         self.last_poc_ordered = -100
         self.force_next_epoch = False
+        # MVC RE-PAIRING: edge264 can emit base[X] glued with dependent[X-1] (the two
+        # per-view output queues drift by one on B-frame GOPs; fixing it inside the decoder
+        # deadlocks the DPB). We pool each dependent picture by its own PictureOrderCnt_mvc
+        # and re-associate base[X] with dep[X] (same instant) when queueing for display.
+        self._dep_pool = {}
 
         # V7c STARTUP FIX: Counter to track frames emitted since startup/seek
         # First REORDER_DEPTH+2 frames bypass reordering to establish visual flow
@@ -666,8 +671,8 @@ class MVCDecoderThread(QThread):
         self.presentation_queue = deque(maxlen=MAX_PRESENTATION_QUEUE_SIZE)
         # V54: dedicated PRESENTER thread decouples presentation from decode. A heavy
         # I-frame decode (~100ms, every ~1s GOP) used to block the single-threaded
-        # decode+present loop → a ~100ms video freeze per keyframe (the "saccade
-        # toutes les secondes"). With a presenter thread, the buffer is drained at a
+        # decode+present loop → a ~100ms video freeze per keyframe (the "stutter
+        # every second"). With a presenter thread, the buffer is drained at a
         # steady cadence WHILE the decode thread absorbs the I-frame spike. Backpressure
         # (_await_queue_space, applied at the decode entry OUTSIDE the delivery lock)
         # stops the freed-up decoder from over-filling and evicting unshown frames.
@@ -1033,7 +1038,7 @@ class MVCDecoderThread(QThread):
                 self.demuxer = mvc_demuxer_cpp.MVCMatroskaDemuxer()
 
             if not self.demuxer.open(self.filepath):
-                self.error.emit(f"Impossible d'ouvrir le fichier: {self.filepath}")
+                self.error.emit(f"Unable to open file: {self.filepath}")
                 return False
 
             # Provide duration hint when available (helps seek positioning when MKV header lacks Duration)
@@ -1090,7 +1095,9 @@ class MVCDecoderThread(QThread):
                 elif hasattr(self.demuxer, 'get_subtitle_pids'):
                     subtitle_pids = self.demuxer.get_subtitle_pids()
                     if subtitle_pids:
-                        # Convert PIDs to track-like format for consistent API
+                        # Convert PIDs to track-like format for consistent API. The language is
+                        # filled in by the GUI (_on_subtitle_tracks_detected) from the Blu-ray
+                        # .clpi — raw M2TS/SSIF carries no language tag in the PMT.
                         tracks = [{'trackNumber': pid, 'name': f'PGS Track (PID 0x{pid:04X})',
                                    'language': '', 'codecId': 'S_HDMV/PGS', 'isPGS': True}
                                   for pid in subtitle_pids]
@@ -1107,7 +1114,7 @@ class MVCDecoderThread(QThread):
 
         except Exception as e:
             logger.error(f"[MVC-THREAD] Demuxer init exception: {e}")
-            self.error.emit(f"Erreur demuxer: {str(e)}")
+            self.error.emit(f"Demuxer error: {str(e)}")
             return False
 
     def _cache_idr_position(self, timestamp_seconds):
@@ -1479,18 +1486,18 @@ class MVCDecoderThread(QThread):
         finally:
             # V54: stop the presenter thread before tearing down the decoder/demuxer.
             self._stop_presenter()
-            # NOUVEAU: Fermer demuxer DANS le thread pour éviter race conditions
+            # NEW: Close demuxer INSIDE the thread to avoid race conditions
             if self.demuxer:
                 try:
                     self.demuxer.close()
                     logger.info("[MVC-THREAD] Demuxer closed in thread")
                 except:
-                    pass  # Ignorer erreurs de fermeture
+                    pass  # Ignore close errors
                 self.demuxer = None
 
     def _run_ctypes_pipeline(self):
         if not edge264:
-            self.error.emit("Bibliothèque edge264 non chargée.")
+            self.error.emit("edge264 library not loaded.")
             return
 
         # Demuxer is already initialized by _init_demuxer() in run()
@@ -1504,7 +1511,7 @@ class MVCDecoderThread(QThread):
             # 2000 MVC frames, 0 errors with n_threads=0.
             alloc_threads = 0  # Synchronous decode (no worker thread, no DPB overflow)
             self._alloc_threads = alloc_threads  # V51: remember threading mode to skip pointless async drain-retries
-            logger.info(f"[MVC-THREAD] Alloc avec {alloc_threads} thread")
+            logger.info(f"[MVC-THREAD] Alloc with {alloc_threads} thread")
             ptr = edge264.edge264_alloc(alloc_threads, None, None, 0, None, None, None)
             if not ptr:
                 raise MemoryError("Alloc failed")
@@ -1534,7 +1541,7 @@ class MVCDecoderThread(QThread):
             skip_check = (self.base_timestamp > 0.0)
             idr_au_data, idr_timestamp, is_recovery_only = self.scan_for_idr(skip_timestamp_check=skip_check)
             if not idr_au_data:
-                self.error.emit("Impossible de trouver une image IDR pour initialiser le décodeur.")
+                self.error.emit("Unable to find an IDR frame to initialize the decoder.")
                 return
 
             # V7b CRITICAL FIX: Only update base_timestamp from IDR if we're NOT at initial load (0.0)
@@ -1807,11 +1814,11 @@ class MVCDecoderThread(QThread):
 
                     # ╔═══════════════════════════════════════════════════════════════════╗
                     # ║  V8 INDEX-BASED SYNC: RECREATE decoder instead of FLUSH           ║
-                    # ║  Mathématiquement: RECREATE garantit état initial propre          ║
-                    # ║  flush() laisse des threads internes dans un état indéterminé     ║
+                    # ║  Mathematically: RECREATE guarantees a clean initial state        ║
+                    # ║  flush() leaves internal threads in an indeterminate state        ║
                     # ╚═══════════════════════════════════════════════════════════════════╝
 
-                    # ÉTAPE 1: DESTROY - Libérer le décodeur actuel proprement
+                    # STEP 1: DESTROY - Free the current decoder cleanly
                     if self.decoder:
                         logger.info("[MVC-THREAD] V8: Destroying old decoder (clean slate)...")
 
@@ -1831,12 +1838,12 @@ class MVCDecoderThread(QThread):
                             self.decoder = None
                             self._frame_delivery_lock.release()
 
-                    # ÉTAPE 2: CLEAR - Vider tous les buffers (état propre)
+                    # STEP 2: CLEAR - Empty all buffers (clean state)
                     self.frame_buffer.clear()
                     self.presentation_queue.clear()
                     self.au_buffers.clear()
 
-                    # ÉTAPE 3: RESET - Réinitialiser les compteurs
+                    # STEP 3: RESET - Reset the counters
                     self.frame_count = 0
                     self.epoch += 1
                     self.last_poc_ordered = -100
@@ -1859,8 +1866,8 @@ class MVCDecoderThread(QThread):
                             optimized_target = cached_idr
                             logger.info(f"[MVC-THREAD] V8: Using cached IDR at {cached_idr:.3f}s (requested: {target:.3f}s)")
 
-                    # ÉTAPE 4: SEEK DEMUXER - Positionner à la Cue la plus proche
-                    # Le timestamp Cues est LA SOURCE DE VÉRITÉ (pas de correction)
+                    # STEP 4: SEEK DEMUXER - Position at the nearest Cue
+                    # The Cues timestamp is THE SOURCE OF TRUTH (no correction)
                     cues_timestamp_ms = None
                     success = False
                     try:
@@ -1875,14 +1882,14 @@ class MVCDecoderThread(QThread):
                                 except Exception:
                                     pass
                             success = self.demuxer.seek(int(optimized_target * 1000))
-                            # Récupérer le timestamp Cues réel si disponible
+                            # Retrieve the actual Cues timestamp if available
                             if hasattr(self.demuxer, 'getLastCueTimestamp'):
                                 cues_timestamp_ms = self.demuxer.getLastCueTimestamp()
                     except Exception as e:
                         logger.error(f"[MVC-THREAD] V8: Demuxer seek error: {e}")
 
-                    # ÉTAPE 5: DETERMINER LE TIMESTAMP DE BASE
-                    # Utiliser le timestamp Cues si disponible, sinon target
+                    # STEP 5: DETERMINE THE BASE TIMESTAMP
+                    # Use the Cues timestamp if available, otherwise target
                     if cues_timestamp_ms is not None and cues_timestamp_ms > 0:
                         self.base_timestamp = cues_timestamp_ms / 1000.0
                         logger.info(f"[MVC-THREAD] V8: Using Cues timestamp: {self.base_timestamp:.3f}s")
@@ -1958,8 +1965,8 @@ class MVCDecoderThread(QThread):
                         if idr_au_data:
                             logger.debug(f"[SEEK-PERF] scan(+seek) done +{time.time() - self._seek_perf_t0:.2f}s")
                             # ╔═══════════════════════════════════════════════════════════════════╗
-                            # ║  V8 ÉTAPE 6: RECREATE - Allouer un nouveau décodeur propre        ║
-                            # ║  Mathématiquement: alloc() = état initial déterministe           ║
+                            # ║  V8 STEP 6: RECREATE - Allocate a fresh clean decoder            ║
+                            # ║  Mathematically: alloc() = deterministic initial state           ║
                             # ╚═══════════════════════════════════════════════════════════════════╝
                             logger.info("[MVC-THREAD] V8: Allocating fresh decoder...")
                             try:
@@ -1977,7 +1984,7 @@ class MVCDecoderThread(QThread):
                                 continue
 
                             # ╔═══════════════════════════════════════════════════════════════════╗
-                            # ║  V8 ÉTAPE 7: INJECT HEADERS - CodecPrivate = source de vérité    ║
+                            # ║  V8 STEP 7: INJECT HEADERS - CodecPrivate = source of truth      ║
                             # ╚═══════════════════════════════════════════════════════════════════╝
                             try:
                                 if hasattr(self.demuxer, 'get_codec_private'):
@@ -2001,7 +2008,7 @@ class MVCDecoderThread(QThread):
                                 logger.warning(f"[MVC-THREAD] V8: CodecPrivate injection warning: {e}")
 
                             # ╔═══════════════════════════════════════════════════════════════════╗
-                            # ║  V8 ÉTAPE 8: PRIME - Fill DPB with initial frames                ║
+                            # ║  V8 STEP 8: PRIME - Fill DPB with initial frames                 ║
                             # ║  RECOVERY POINT FIX: When seeking to a non-IDR keyframe, we     ║
                             # ║  need MANY MORE frames for P-slices to build correct references.║
                             # ║  True IDR: 25 AUs (DPB fill), Recovery: 100 AUs (~4s at 24fps)   ║
@@ -2031,7 +2038,7 @@ class MVCDecoderThread(QThread):
                             for i, au_data in enumerate(prime_aus):
                                 if self._stop_requested: break
                                 self._process_au_data(bytes(au_data), force=True)
-                                # Drain frames pendant le priming
+                                # Drain frames during priming
                                 # V8 CRASH FIX: Add try/except and stop check for safety
                                 # V12 NON-BLOCKING FIX: Add retry loop with yields
                                 if self.decoder:
@@ -2044,7 +2051,7 @@ class MVCDecoderThread(QThread):
                                             ret = edge264.edge264_get_frame(self.decoder, ctypes.byref(tmp_frame), 0)
                                             if ret == 0:
                                                 drain_retry = 0  # Reset on success
-                                                # else: Juste drainer, ne pas présenter
+                                                # else: Just drain, do not present
                                             else:
                                                 # V12 NON-BLOCKING FIX: Retry with yield
                                                 drain_retry += 1
@@ -2056,7 +2063,7 @@ class MVCDecoderThread(QThread):
                                         logger.warning(f"[MVC-THREAD] V8: Seek priming drain error (ignored): {e}")
 
                             # ╔═══════════════════════════════════════════════════════════════════╗
-                            # ║  V8 ÉTAPE 9: UPDATE base_timestamp with ACTUAL IDR timestamp     ║
+                            # ║  V8 STEP 9: UPDATE base_timestamp with ACTUAL IDR timestamp      ║
                             # ║  The Cues may point to a non-IDR keyframe, so we must use the    ║
                             # ║  timestamp of the actual IDR found by scan_for_idr()             ║
                             # ╚═══════════════════════════════════════════════════════════════════╝
@@ -2509,7 +2516,7 @@ class MVCDecoderThread(QThread):
 
                         # Flush remaining buffered frames
                         while self.frame_buffer:
-                            self.presentation_queue.append(self.frame_buffer.pop(0)['data'])
+                            self._repair_and_queue(self.frame_buffer.pop(0)['data'])
 
                         while self.presentation_queue:
                             self._emit_single_frame(self.presentation_queue.popleft())
@@ -2746,7 +2753,7 @@ class MVCDecoderThread(QThread):
             logger.error(f"[MVC-THREAD] CRASH in run loop: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            self.error.emit(f"Erreur: {str(e)}")
+            self.error.emit(f"Error: {str(e)}")
         finally:
             # V7c CRASH FIX: Give GUI time to set cleanup flags before we touch memory
             # This prevents race between GUI's _on_mvc_finished and our cleanup
@@ -3119,6 +3126,11 @@ class MVCDecoderThread(QThread):
             if dep and 'data' in dep:
                 au_data.extend(bytes(dep['data']))
 
+            if os.environ.get("SYLC_DECODE_DIAG") == "1":
+                _bs = len(base['data']) if base and 'data' in base else 0
+                _ds = len(dep['data']) if dep and 'data' in dep else 0
+                import sys as _sys; _sys.stderr.write(f"[PY-AU] base={_bs} dep={_ds} total={len(au_data)}\n")
+
             if au_data:
                 self._process_au_data(bytes(au_data))
 
@@ -3402,6 +3414,8 @@ class MVCDecoderThread(QThread):
             # NAL types > 20 are rare or indicate corruption
             if nal_type > 20 and nal_type != 31:  # 31 is sometimes used
                 logger.warning(f"[MVC-THREAD] V7b++++++ Skipping suspicious NAL type {nal_type}")
+                if os.environ.get("SYLC_DECODE_DIAG") == "1":
+                    import sys as _sys; _sys.stderr.write(f"[PY-SKIP] suspicious NAL type {nal_type}\n")
                 return
 
             # SSIF FIX: For NAL type 14 (Prefix) and 20 (MVC slice extension),
@@ -3429,6 +3443,9 @@ class MVCDecoderThread(QThread):
                                        f"bytes: {hex_preview}")
                         logger.warning(f"[MVC-THREAD] This may indicate missing base view data (SSIF combined MVC issue)")
                         self._warned_small_mvc_nal = True
+                    if os.environ.get("SYLC_DECODE_DIAG") == "1":
+                        self._diag_trunc20 = getattr(self, '_diag_trunc20', 0) + 1
+                        import sys as _sys; _sys.stderr.write(f"[PY-SKIP] truncated NAL20 ({data_len}B) #{self._diag_trunc20}\n")
                     return
 
                 # Log first valid MVC NAL type 20 for diagnosis
@@ -3786,7 +3803,7 @@ class MVCDecoderThread(QThread):
             if startup_bypass and len(self.frame_buffer) >= 1:
                 # During startup, push frames immediately (in arrival order)
                 item = self.frame_buffer.pop(0)
-                self.presentation_queue.append(item['data'])
+                self._repair_and_queue(item['data'])
                 self._startup_frames_emitted += 1
                 if self._startup_frames_emitted <= 10:
                     logger.debug(f"[DIAG] STARTUP: Frame #{self._startup_frames_emitted} pushed immediately (bypassing reorder)")
@@ -3795,7 +3812,7 @@ class MVCDecoderThread(QThread):
             elif len(self.frame_buffer) > self.REORDER_DEPTH:
                 # Pop the oldest frame (lowest epoch, lowest POC)
                 item = self.frame_buffer.pop(0)
-                self.presentation_queue.append(item['data'])
+                self._repair_and_queue(item['data'])
                 # DIAG: Log when frames move to presentation_queue
                 if len(self.presentation_queue) <= 10 or len(self.presentation_queue) % 50 == 0:
                     logger.debug(f"[DIAG] -> presentation_queue: {len(self.presentation_queue)} frames")
@@ -3899,6 +3916,22 @@ class MVCDecoderThread(QThread):
             self._frame_delivery_active = False
             self._frame_delivery_lock.release()
 
+    def _repair_and_queue(self, data):
+        """Push a frame to the presentation queue, first re-pairing its dependent (right-eye)
+        view by POC: replace the frame's dependent with the pooled dependent whose POC equals
+        this frame's base POC, so the two views show the SAME instant. The reorder buffer
+        depth absorbs the ~1-frame delay before the matching dependent is decoded. Falls back
+        to the frame's own dependent when the match isn't pooled (e.g. startup / genuine gap)."""
+        try:
+            bp = data.get('base_poc')
+            if bp is not None:
+                rep = self._dep_pool.get(bp)
+                if rep is not None:
+                    data['right'] = rep
+        except Exception:
+            pass
+        self.presentation_queue.append(data)
+
     def _deliver_frame_to_gpu(self, frame):
         # self.frameReady.emit()  <-- MOVED to _emit_single_frame
         if not hasattr(self, '_valid_frames_received'):
@@ -3940,7 +3973,7 @@ class MVCDecoderThread(QThread):
             sy, sc = frame.stride_Y, frame.stride_C
 
 
-            # Synchronisation audio (dÃ©sactivÃ©e par dÃ©faut pour Ã©viter les crashes)
+            # Audio synchronization (disabled by default to avoid crashes)
             frame_timestamp_info = {}
             if self._enable_audio_sync:
                 try:
@@ -3949,9 +3982,9 @@ class MVCDecoderThread(QThread):
 
                     if self._first_poc is None:
                         self._first_poc = poc
-                        logger.info(f"[SYNC] Premier POC de référence: {poc}")
+                        logger.info(f"[SYNC] First reference POC: {poc}")
 
-                    # Calculer le timestamp relatif en secondes
+                    # Compute the relative timestamp in seconds
                     # CRITICAL FIX: Use frame count instead of POC.
                     # POC gap varies (2 for 24fps, 1 for others), causing 2x speedup if assumed 2.
                     # Using frame_count is robust and matches target FPS perfectly.
@@ -4085,13 +4118,24 @@ class MVCDecoderThread(QThread):
             poc_base = frame.PictureOrderCnt
             poc_mvc = frame.PictureOrderCnt_mvc
 
+            # Reorder by the BASE view's POC (display order), NOT max(base, dep): with the
+            # decoder's off-by-one view pairing a B-frame's dependent POC equals the anchor's,
+            # so max() collides B-frames with anchors and scrambles the reorder. The dependent
+            # view is re-associated by POC separately (_dep_pool / _repair_and_queue).
             current_poc = poc_base
-            if frame.samples_mvc[0]:
-                current_poc = max(poc_base, poc_mvc)
 
+
+            # Pool this dependent picture by its OWN POC so a later base of the same POC
+            # can re-pair with it (see _repair_and_queue). Only real dependent views.
+            if frame.samples_mvc[0]:
+                self._dep_pool[poc_mvc] = (y_r, u_r, v_r)
+                if len(self._dep_pool) > 16:
+                    for _k in sorted(self._dep_pool)[:-12]:
+                        del self._dep_pool[_k]
 
             frame_data = {
                 'poc': current_poc,
+                'base_poc': poc_base,
                 'left': (y_l, u_l, v_l),
                 'right': (y_r, u_r, v_r),
                 **frame_timestamp_info
@@ -4661,7 +4705,7 @@ class MVCDecoderThread(QThread):
 
                             # Move buffer to presentation
                             while self.frame_buffer:
-                                self.presentation_queue.append(self.frame_buffer.pop(0)['data'])
+                                self._repair_and_queue(self.frame_buffer.pop(0)['data'])
 
                             # Emit remaining
                             # V14 GRACEFUL ENDING: Also check cleanup flag to exit early

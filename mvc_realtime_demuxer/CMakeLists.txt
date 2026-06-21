@@ -592,6 +592,28 @@ set_target_properties(mvc_demuxer_cpp PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/python"
 )
 
+# --- Native D3D11 renderer (Tokyo #3) ------------------------------------------
+# Isolated, opt-in, Windows-only. Adds ONLY to the python module target; does not
+# touch the HAVE_EDGE264 / anti-virus-safe gate above. The renderer source and the
+# pybind exposure are both guarded by SYLC_NATIVE_RENDERER, so when this is OFF the
+# module builds exactly as before.
+if(WIN32)
+    option(BUILD_NATIVE_RENDERER "Build the native D3D11 renderer (Tokyo #3)" ON)
+else()
+    set(BUILD_NATIVE_RENDERER OFF)
+endif()
+
+if(BUILD_NATIVE_RENDERER)
+    target_sources(mvc_demuxer_cpp PRIVATE src/native_renderer.cpp)
+    target_compile_definitions(mvc_demuxer_cpp PRIVATE SYLC_NATIVE_RENDERER)
+    # Windows SDK (MSVC) and MinGW both resolve these to the system D3D libs.
+    # d3dcompiler is used to compile the embedded HLSL at runtime (S2+).
+    target_link_libraries(mvc_demuxer_cpp PRIVATE d3d11 dxgi dxguid d3dcompiler)
+    message(STATUS "Native D3D11 renderer: ENABLED (NativeRenderer exposed)")
+else()
+    message(STATUS "Native D3D11 renderer: disabled")
+endif()
+
 # Installation
 install(TARGETS mvc_demuxer_cpp
     LIBRARY DESTINATION .

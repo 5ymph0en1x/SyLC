@@ -206,12 +206,12 @@ locale.setlocale(locale.LC_NUMERIC, 'C')
 try:
     import cv2
 
-    print("[STARTUP] cv2 importe")
+    print("[STARTUP] cv2 imported")
 except ImportError as e:
-    print(f"[CRITICAL] Impossible d'importer 'cv2' (OpenCV): {e}")
+    print(f"[CRITICAL] Unable to import 'cv2' (OpenCV): {e}")
     sys.exit(1)
 
-print("[STARTUP] Imports de base reussis")
+print("[STARTUP] Base imports succeeded")
 
 os.environ["PATH"] = os.path.dirname(__file__) + os.pathsep + os.environ["PATH"]
 from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QRectF, QPointF, Slot, QEvent, QObject
@@ -399,7 +399,7 @@ import mpv
 import numpy as np
 from premium_controls_overlay import PremiumControlsOverlay as ControlsOverlay
 
-print("[STARTUP] Imports PySide6/mpv/numpy reussis")
+print("[STARTUP] PySide6/mpv/numpy imports succeeded")
 
 # Import MonitoringOverlay (always available, not MVC-dependent)
 from monitoring_overlay import MonitoringOverlay
@@ -414,7 +414,7 @@ MVC_SUPPORT_AVAILABLE = False
 SYNC_TRACER_AVAILABLE = False
 
 try:
-    print("[STARTUP] Tentative d'import des modules MVC...")
+    print("[STARTUP] Attempting to import MVC modules...")
 
     # CRITICAL FIX: Ensure we import from script directory, NOT from other SyLC_* directories
     _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -435,37 +435,37 @@ try:
     # V42: Make mvc_demuxer_cpp optional - ctypes fallback will be used if unavailable
     try:
         import mvc_demuxer_cpp
-        print("[STARTUP] OK mvc_demuxer_cpp importe")
+        print("[STARTUP] OK mvc_demuxer_cpp imported")
     except ImportError as pyd_err:
         mvc_demuxer_cpp = None
-        print(f"[STARTUP] mvc_demuxer_cpp non disponible ({pyd_err}) - ctypes fallback sera utilise")
+        print(f"[STARTUP] mvc_demuxer_cpp not available ({pyd_err}) - ctypes fallback will be used")
 
     from mvc_decoder import MVCDecoderThread
-    print("[STARTUP] OK MVCDecoderThread importe")
+    print("[STARTUP] OK MVCDecoderThread imported")
 
     # D3D11 NATIVE rendering for HDR preservation in fullscreen
     try:
         from framepacking_window_d3d11 import Framepacking3DWindow, FramepackingDisplayWidget
-        print("[STARTUP] OK Framepacking3DWindow (D3D11 NATIVE HDR) importe")
+        print("[STARTUP] OK Framepacking3DWindow (D3D11 NATIVE HDR) imported")
     except ImportError as e1:
         # Fallback to hybrid (OpenGL windowed + D3D11 fullscreen)
         try:
             from framepacking_window_hybrid import Framepacking3DWindow, FramepackingDisplayWidget
-            print(f"[STARTUP] D3D11 natif non disponible ({e1}), utilisation HYBRID")
+            print(f"[STARTUP] Native D3D11 not available ({e1}), using HYBRID")
         except ImportError as e2:
             # Last resort: pure OpenGL version
             from framepacking_window import Framepacking3DWindow, FramepackingDisplayWidget
-            print(f"[STARTUP] Hybrid non disponible ({e2}), utilisation OpenGL")
+            print(f"[STARTUP] Hybrid not available ({e2}), using OpenGL")
 
     # Sync Tracer for pipeline diagnostics (V7 feature)
     try:
         from sync_tracer import get_tracer, SyncStage
 
         SYNC_TRACER_AVAILABLE = True
-        print("[STARTUP] OK SyncTracer importe (V7 feature)")
+        print("[STARTUP] OK SyncTracer imported (V7 feature)")
     except ImportError:
         SYNC_TRACER_AVAILABLE = False
-        print("[STARTUP] SyncTracer non disponible (optionnel)")
+        print("[STARTUP] SyncTracer not available (optional)")
 
     # PGS Subtitle System for MVC mode
     try:
@@ -473,20 +473,20 @@ try:
         from subtitle_extractor import SubtitleExtractor, get_pgs_tracks
 
         PGS_SUBTITLE_AVAILABLE = True
-        print("[STARTUP] OK PGS Subtitle System importe")
+        print("[STARTUP] OK PGS Subtitle System imported")
     except ImportError as e:
         PGS_SUBTITLE_AVAILABLE = False
-        print(f"[STARTUP] PGS Subtitle non disponible: {e}")
+        print(f"[STARTUP] PGS Subtitle not available: {e}")
 
     MVC_SUPPORT_AVAILABLE = True
-    print("[STARTUP] === Support MVC complet disponible ===")
+    print("[STARTUP] === Full MVC support available ===")
 except ImportError as e:
-    print(f"[CRITICAL] Echec de l'import des modules MVC: {e}")
+    print(f"[CRITICAL] Failed to import MVC modules: {e}")
     traceback.print_exc()
     MVC_SUPPORT_AVAILABLE = False
     SYNC_TRACER_AVAILABLE = False
     PGS_SUBTITLE_AVAILABLE = False
-    print("[STARTUP] Mode degrade : support MVC desactive.")
+    print("[STARTUP] Degraded mode: MVC support disabled.")
 
 print(f"[STARTUP] MVC_SUPPORT_AVAILABLE = {MVC_SUPPORT_AVAILABLE}")
 print(f"[STARTUP] SYNC_TRACER_AVAILABLE = {SYNC_TRACER_AVAILABLE}")
@@ -498,44 +498,44 @@ print(f"[STARTUP] PGS_SUBTITLE_AVAILABLE = {PGS_SUBTITLE_AVAILABLE if 'PGS_SUBTI
 # =============================================================================
 
 class SeekState(Enum):
-    """États de la machine à états de seek."""
-    IDLE = auto()  # Prêt à accepter un seek
-    SEEKING = auto()  # Seek en cours
-    COOLDOWN = auto()  # Période de refroidissement après seek
+    """States of the seek state machine."""
+    IDLE = auto()  # Ready to accept a seek
+    SEEKING = auto()  # Seek in progress
+    COOLDOWN = auto()  # Cooldown period after a seek
 
 
 @dataclass
 class SeekRequest:
-    """Représente une demande de seek."""
+    """Represents a seek request."""
     target_time: float
-    timestamp: float  # Quand la demande a été faite
+    timestamp: float  # When the request was made
     is_mvc: bool
 
 
 class RobustSeekQueue(QObject):
     """
-    File d'attente robuste pour les opérations de seek.
+    Robust queue for seek operations.
 
-    THREAD-SAFETY: Utilise des signaux Qt pour garantir que toutes les
-    opérations MPV sont exécutées dans le thread principal Qt.
+    THREAD-SAFETY: Uses Qt signals to guarantee that all
+    MPV operations are executed on the main Qt thread.
 
     Features:
-    - Debounce: Coalesce les seeks rapides en un seul
-    - Cooldown: Délai minimum entre les seeks
-    - Timeout: Protection contre les états bloqués
-    - Thread-safe via signaux Qt
+    - Debounce: Coalesce rapid seeks into a single one
+    - Cooldown: Minimum delay between seeks
+    - Timeout: Protection against stuck states
+    - Thread-safe via Qt signals
     """
 
-    # Signaux pour communication thread-safe avec PlayerWindow
+    # Signals for thread-safe communication with PlayerWindow
     request_mpv_pause = Signal(bool)  # True = pause, False = unpause
     request_mpv_seek = Signal(float)  # Seek MPV audio to position
-    request_decoder_seek = Signal(float)  # Seek decoder vidéo
+    request_decoder_seek = Signal(float)  # Seek video decoder
     seek_started = Signal(float)  # Notify UI seek started
     seek_completed = Signal()  # Notify UI seek completed
 
-    DEBOUNCE_DELAY_MS = 150  # Temps d'attente avant d'exécuter un seek
-    COOLDOWN_PERIOD_MS = 200  # Délai minimum entre seeks consécutifs
-    SEEK_TIMEOUT_MS = 45000  # Timeout pour un seek bloqué. Raised to 45s: a COLD optical SSIF
+    DEBOUNCE_DELAY_MS = 150  # Wait time before executing a seek
+    COOLDOWN_PERIOD_MS = 200  # Minimum delay between consecutive seeks
+    SEEK_TIMEOUT_MS = 45000  # Timeout for a stuck seek. Raised to 45s: a COLD optical SSIF
     # seek legitimately takes a few seconds (re-pairing the interleaved base+dependent views);
     # the old 8s fired mid-seek and its forced reset (resume MPV + seek_completed) raced the
     # decode thread → hard crash. 30s only ever fires on a genuine hang, not a slow seek.
@@ -558,7 +558,7 @@ class RobustSeekQueue(QObject):
         self._seeks_coalesced = 0
         self._timeouts = 0
 
-        # Connecter les signaux au parent
+        # Connect the signals to the parent
         self.request_mpv_pause.connect(self._parent._on_seek_queue_pause_request)
         self.request_mpv_seek.connect(self._parent._on_seek_queue_mpv_seek)
         self.request_decoder_seek.connect(self._parent._on_seek_queue_decoder_seek)
@@ -640,7 +640,7 @@ class RobustSeekQueue(QObject):
             if request.is_mvc and self._parent.mvc_mode_active:
                 # MVC seek: pause audio, seek audio, seek decoder
                 self.request_mpv_pause.emit(True)
-                # Petit délai pour laisser MPV se stabiliser avant le seek
+                # Small delay to let MPV stabilize before the seek
                 QTimer.singleShot(50, lambda: self._do_mvc_seek(target))
             else:
                 # Simple seek: just seek MPV
@@ -653,7 +653,7 @@ class RobustSeekQueue(QObject):
             self._force_reset_state()
 
     def _do_mvc_seek(self, target_time: float):
-        """Exécute le seek MVC après la pause audio.
+        """Executes the MVC seek after the audio pause.
 
         SSIF SEEK-FREEZE FIX (MEASURED 2026-06-16): do NOT seek MPV here. On a physical
         Blu-ray, MPV (audio) and the video demuxer both stream the same 45 GB .ssif from the
@@ -698,7 +698,7 @@ class RobustSeekQueue(QObject):
             self._force_reset_state()
 
     def notify_seek_finished(self):
-        """Appelé par le décodeur quand le seek est terminé."""
+        """Called by the decoder when the seek is finished."""
         QTimer.singleShot(0, self._handle_seek_finished)
 
     def _handle_seek_finished(self):
@@ -734,7 +734,7 @@ class RobustSeekQueue(QObject):
 
         with self._lock:
             if self._pending_request:
-                # Démarrer le cooldown puis exécuter
+                # Start the cooldown then execute
                 self._state = SeekState.COOLDOWN
                 self._cooldown_timer.start(self.COOLDOWN_PERIOD_MS)
             else:
@@ -778,13 +778,13 @@ class RobustSeekQueue(QObject):
             pending = self._pending_request
             self._pending_request = None
 
-        # Reprendre la lecture audio (thread-safe via signal)
+        # Resume audio playback (thread-safe via signal)
         self.request_mpv_pause.emit(False)
-        
+
         # CRITICAL FIX: Unblock UI (slider) and reset seeking flags
         self.seek_completed.emit()
 
-        # Re-tenter le seek en attente après un délai
+        # Retry the pending seek after a delay
         if pending:
             logger.info(f"[SEEK-QUEUE] Re-requesting pending seek to {pending.target_time:.2f}s")
             QTimer.singleShot(200, lambda: self.request_seek(pending.target_time, pending.is_mvc))
@@ -794,7 +794,7 @@ class RobustSeekQueue(QObject):
             return self._state != SeekState.IDLE
 
 
-# --- Style HDR Image Converter (Professionnel) ---
+# --- Style HDR Image Converter (Professional) ---
 APP_STYLE = """
     QMainWindow, QWidget {
         background-color: #1e1e1e;
@@ -995,7 +995,7 @@ _STEREO_PRIORITY = {
 
 
 def _classify_stereo_mode(mode_str):
-    """Normalise une valeur de stereo_mode vers sbs/tab/mvc/anaglyph."""
+    """Normalizes a stereo_mode value to sbs/tab/mvc/anaglyph."""
     if not mode_str:
         return None
 
@@ -1031,7 +1031,7 @@ def _classify_stereo_mode(mode_str):
 
 
 def _promote_stereo_mode(result_dict, mode, mark_mvc=False):
-    """Met Ã  jour le resultat de detection 3D avec priorite."""
+    """Updates the 3D detection result with priority."""
     if not mode:
         return
 
@@ -1278,7 +1278,7 @@ class Video3DAnalyzer:
         return result
 
 
-# ThreadPool GLOBAL pour extraction parallele de thumbnails (max 2 workers)
+# GLOBAL ThreadPool for parallel thumbnail extraction (max 2 workers)
 _thumbnail_executor = ThreadPoolExecutor(max_workers=2)
 
 
@@ -1829,6 +1829,8 @@ class InfoOverlay(QWidget):
         self._timer_initialized = False
         self._pulse_direction = -1
         self._pulse_value = 0.0
+        self._hover = False
+        self.setAcceptDrops(True)  # allow dropping a file onto the welcome area / icon too
 
     def _ensure_timer_initialized(self):
         """Initialize pulse timer in GUI thread when first needed"""
@@ -1872,8 +1874,6 @@ class InfoOverlay(QWidget):
         center_y = self.height() // 2 - 40
 
         icon_color = QColor(0, 122, 204, 200)
-        painter.setPen(QPen(icon_color, 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
         path = QPainterPath()
         path.moveTo(center_x - 30, center_y - 12)
         path.lineTo(center_x - 10, center_y - 12)
@@ -1882,6 +1882,14 @@ class InfoOverlay(QWidget):
         path.lineTo(center_x + 30, center_y + 20)
         path.lineTo(center_x - 30, center_y + 20)
         path.closeSubpath()
+        # Fill the folder so its ENTIRE surface is clickable, not just the outline: a
+        # translucent (WA_TranslucentBackground) window only receives mouse input on painted
+        # pixels, so a hollow icon let clicks fall through its transparent interior. A gentle
+        # pulse (brighter on hover) also signals that it is clickable.
+        fill_alpha = 95 if self._hover else 42 + int(self._pulse_value * 26)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 122, 204, fill_alpha))
+        painter.drawPath(path)
         painter.strokePath(path, QPen(icon_color, 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
                                       Qt.PenJoinStyle.RoundJoin))
 
@@ -1917,17 +1925,44 @@ class InfoOverlay(QWidget):
         painter.setPen(QColor(0, 122, 204, 180))
         painter.drawText(int(center_x - edition_width / 2), 78, edition)
 
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        try:
+            urls = event.mimeData().urls()
+            if urls:
+                path = urls[0].toLocalFile()
+                if path:
+                    event.acceptProposedAction()
+                    parent = self.parent()
+                    if parent is not None and hasattr(parent, 'play_file'):
+                        parent.play_file(path)
+        except Exception:
+            pass
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.file_clicked.emit()
         super().mousePressEvent(event)
 
 
-# --- NOUVEAU THREAD (V12) ---
+# --- NEW THREAD (V12) ---
 
 
 class PlayerWindow(QMainWindow):
-    """FenÃªtre principale."""
+    """Main window."""
 
     # Signals for thread-safe PGS callbacks (cross-thread communication)
     pgs_extraction_complete = Signal(str)  # Emits file_path when extraction is done
@@ -1938,9 +1973,9 @@ class PlayerWindow(QMainWindow):
     extraction_progress = Signal(float)  # Emits progress 0.0-1.0 during subtitle extraction
 
     def __init__(self, parent=None):
-        print("[STARTUP] Initialisation de PlayerWindow...")
+        print("[STARTUP] Initializing PlayerWindow...")
         super().__init__(parent)
-        print("[STARTUP] QMainWindow.__init__() termine")
+        print("[STARTUP] QMainWindow.__init__() finished")
         self.setWindowTitle("SyLC 3D Player - Premium Edition")
         _icon_path = _find_asset('icon.png')
         if _icon_path:
@@ -1949,7 +1984,7 @@ class PlayerWindow(QMainWindow):
         self.setStyleSheet(APP_STYLE)
         self.setAcceptDrops(True)
 
-        # --- CORRECTION DU LAYOUT (Base sur V4) ---
+        # --- LAYOUT FIX (Based on V4) ---
         self.video_container = QWidget()
         self.setCentralWidget(self.video_container)
         self.video_layout = QVBoxLayout(self.video_container)
@@ -1969,14 +2004,14 @@ class PlayerWindow(QMainWindow):
         self.video_stack.addWidget(self.video_widget)  # Index 0: MPV
         self.video_layout.addWidget(self.video_stack_container, 1)
 
-        print("[STARTUP] Video widget cree (Stacked)")
+        print("[STARTUP] Video widget created (Stacked)")
 
         self.metrics_overlay = MonitoringOverlay(self.video_widget)
         self.metrics_overlay.hide()
         self.metrics_overlay.raise_()
-        print("[STARTUP] Metrics overlay cree")
+        print("[STARTUP] Metrics overlay created")
 
-        self.player = None  # Sera initialise par _setup_mpv_player
+        self.player = None  # Will be initialized by _setup_mpv_player
 
         # --- Controls Overlay (Floating) ---
         # Reparent to self (QMainWindow) to ensure it sits above the Central Widget
@@ -1984,18 +2019,18 @@ class PlayerWindow(QMainWindow):
         # Note: We do NOT add it to the layout anymore. It will be positioned manually in resizeEvent.
         self.controls_overlay.raise_()
 
-        print("[STARTUP] Controls overlay cree")
+        print("[STARTUP] Controls overlay created")
         self.info_overlay = InfoOverlay("Click here or drop a file", self)
-        print("[STARTUP] Info overlay cree")
+        print("[STARTUP] Info overlay created")
         self.loading_overlay = LoadingOverlay(self)
-        print("[STARTUP] Loading overlay cree")
-        # --- FIN CORRECTION DU LAYOUT ---
+        print("[STARTUP] Loading overlay created")
+        # --- END LAYOUT FIX ---
 
         # MVC related
         self.demuxer = None
         self.mvc_decoder_thread = None
         self.mvc_mode_active = False
-        self.framepacking_window = None  # Sera cree au besoin
+        self.framepacking_window = None  # Will be created when needed
 
         # V14b: State flags for graceful shutdown
         self._playback_ended = False
@@ -2006,7 +2041,7 @@ class PlayerWindow(QMainWindow):
         self._subtitle_extractor = None
         self._pgs_subtitle_tracks = []  # List of detected PGS tracks
         self._active_pgs_track_index = None  # Currently selected PGS track stream index
-        self._subtitle_connected_widget = None  # Track which widget has subtitle signals connected
+        self._subtitle_connected_widgets = []  # Track which widgets have subtitle signals connected
         # ========== STREAMING SUBTITLE SUPPORT ==========
         self._streaming_subtitle_tracks = []  # Tracks detected from demuxer (no extraction needed)
         self._active_streaming_track = None   # Currently active streaming track number
@@ -2021,9 +2056,9 @@ class PlayerWindow(QMainWindow):
             self.pgs_notification.connect(lambda msg, ok: self.show_3d_notification(msg, success=ok))
             self.pgs_tracks_detected.connect(self._on_pgs_tracks_detected)
             self.extraction_progress.connect(self._on_extraction_progress)
-            print("[STARTUP] PGS SubtitleManager initialise")
+            print("[STARTUP] PGS SubtitleManager initialized")
 
-        # Synchronisation audio basee sur les marqueurs du decodeur
+        # Audio synchronization based on the decoder markers
         # V7b STABILITY FIX: DISABLED - causes crashes with MPV thread safety
         # Timeline progression works without this (uses _last_mvc_timestamp instead)
         self._audio_sync_enabled = True  # SOL 2A: Re-enabled (crashes fixed by hybrid wait SOL 3A)
@@ -2090,21 +2125,21 @@ class PlayerWindow(QMainWindow):
 
         try:
             self.shared_buffer = multiprocessing.Array(ctypes.c_ubyte, buffer_size)
-            print("[MVC INIT] Tampon memoire partagee alloue.")
+            print("[MVC INIT] Shared memory buffer allocated.")
         except Exception as e:
-            print(f"[CRIT] Ã‰chec d'allocation du tampon memoire partagee: {e}")
+            print(f"[CRIT] Failed to allocate shared memory buffer: {e}")
             self.shared_buffer = None
             self._mvc_restarting = False
             self.mvc_mode_active = False
 
-        # Pre-allouer les tampons numpy pour la conversion BGR->RGB
+        # Pre-allocate the numpy buffers for the BGR->RGB conversion
         self.rgb_frame_buffer = np.zeros((self.MVC_HEIGHT, self.MVC_WIDTH, self.MVC_CHANNELS), dtype=np.uint8)
         self.current_qimage_ref = None  # Reference to prevent garbage collection
 
         # Monitoring overlay
         self.monitoring_overlay = MonitoringOverlay(self.video_container)
         self.monitoring_overlay.hide()
-        print("[STARTUP] Monitoring overlay cree")
+        print("[STARTUP] Monitoring overlay created")
         self._last_display_frame_ts = None
         self._display_fps_avg = None
         self._framepacking_visible = False
@@ -2113,7 +2148,7 @@ class PlayerWindow(QMainWindow):
         self._stall_watchdog = QTimer(self)
         self._stall_watchdog.setInterval(3000)
         self._stall_watchdog.timeout.connect(self._check_decoder_stall)
-        # Ne pas demarrer le watchdog maintenant - il sera demarre quand le decodeur MVC demarre
+        # Do not start the watchdog now - it will be started when the MVC decoder starts
 
         # State
         self.has_media = False
@@ -2123,12 +2158,13 @@ class PlayerWindow(QMainWindow):
         self.video_3d_info = None
         self.current_video_fps = 24.0
         self.current_file_path = None
+        self._archiving = False  # True while a disc→ISO image runs (locks playback)
         self.is_3d_capable = False
         self.controls_hide_timer = None  # Lazy initialization
         self._controls_timer_initialized = False
-        self._is_loading_file = False  # V7a: Protection contre changements rapides de fichier
+        self._is_loading_file = False  # V7a: Protection against rapid file changes
 
-        # Timer de mise à jour périodique de la timeline (pour mode MVC où MPV peut ne pas reporter time-pos)
+        # Timer for periodic timeline updates (for MVC mode where MPV may not report time-pos)
         self._playback_timer = QTimer(self)
         self._playback_timer.setInterval(100)  # V7b: 100ms refresh for smoother timeline progression
         self._playback_timer.timeout.connect(self._update_playback_position)
@@ -2176,22 +2212,22 @@ class PlayerWindow(QMainWindow):
         self._is_seeking = False
         self._was_playing_before_seek = False
 
-        # Initialisation (style V4)
-        print("[STARTUP] Appel de _initialize_player()...")
+        # Initialization (V4 style)
+        print("[STARTUP] Calling _initialize_player()...")
         self._initialize_player()
-        print("[STARTUP] _initialize_player() termine")
+        print("[STARTUP] _initialize_player() finished")
 
-        print("[STARTUP] Connexion des signaux...")
+        print("[STARTUP] Connecting signals...")
         self._connect_signals()
-        print("[STARTUP] Signaux connectes")
+        print("[STARTUP] Signals connected")
 
-        print("[STARTUP] Mise Ã  jour de l'UI...")
+        print("[STARTUP] Updating UI...")
         self.update_ui_state()
-        print("[STARTUP] UI mise Ã  jour")
+        print("[STARTUP] UI updated")
 
-        print("[STARTUP] Verification 3D Vision...")
+        print("[STARTUP] Checking 3D Vision...")
         self._check_3d_vision_availability()
-        print("[STARTUP] Verification 3D Vision terminee")
+        print("[STARTUP] 3D Vision check finished")
 
         self.thumbnail_cache = {}
         QTimer.singleShot(0, self._update_monitoring_overlay_geometry)
@@ -2199,7 +2235,7 @@ class PlayerWindow(QMainWindow):
         # Fix: Position floating overlays on startup
         QTimer.singleShot(0, self._update_overlays_geometry)
 
-        print("[STARTUP] PlayerWindow initialise avec succes")
+        print("[STARTUP] PlayerWindow initialized successfully")
 
     def _check_3d_vision_availability(self):
         """
@@ -2229,12 +2265,12 @@ class PlayerWindow(QMainWindow):
     def _setup_mpv_player(self):
         """Advanced MPV configuration with 3D support."""
         if not self.video_widget.winId():
-            logger.warning("winId non disponible, nouvelle tentative dans 100ms.")
+            logger.warning("winId not available, retrying in 100ms.")
             QTimer.singleShot(100, self._setup_mpv_player)
             return
 
         win_id = str(int(self.video_widget.winId()))
-        logger.info(f"Configuration de MPV avec winId: {win_id}")
+        logger.info(f"Configuring MPV with winId: {win_id}")
 
         mpv_config = {
             'wid': win_id,
@@ -2310,7 +2346,7 @@ class PlayerWindow(QMainWindow):
         try:
             self.player = mpv.MPV(**mpv_config)
             self.player['msg-level'] = 'all=info'
-            logger.info("Instance MPV creee avec succes.")
+            logger.info("MPV instance created successfully.")
 
             # FIX: Delay property observers to let MPV event thread fully initialize
             # This prevents the "Windows fatal exception: code 0xe24c4a02" error
@@ -2379,6 +2415,7 @@ class PlayerWindow(QMainWindow):
 
         self.controls_overlay.file_opened.connect(self.open_file_dialog)
         self.controls_overlay.disc_opened.connect(self.open_disc_dialog)
+        self.controls_overlay.archive_requested.connect(self.open_archive_dialog)
         self.controls_overlay.mode_3d_toggled.connect(self.toggle_3d_mode)
         self.controls_overlay.stereo_mode_changed.connect(self.change_stereo_mode)
         self.controls_overlay.audio_track_changed.connect(self.change_audio_track)
@@ -2583,19 +2620,19 @@ class PlayerWindow(QMainWindow):
 
     @Slot(float)
     def _on_mvc_seek_idr_found(self, cues_timestamp: float):
-        """V8 INDEX-BASED SYNC: Synchronisation atomique MPV ↔ Decoder.
+        """V8 INDEX-BASED SYNC: Atomic MPV ↔ Decoder synchronization.
 
         ╔═══════════════════════════════════════════════════════════════════╗
-        ║  FORMULE MATHÉMATIQUE:                                            ║
-        ║  T_audio = T_video = T_cues (source de vérité unique)            ║
+        ║  MATHEMATICAL FORMULA:                                            ║
+        ║  T_audio = T_video = T_cues (single source of truth)              ║
         ║                                                                   ║
-        ║  Avant V8: T_audio ≠ T_video car corrections de timestamp         ║
-        ║  Après V8: T_audio = T_video = T_cues (synchronisation parfaite) ║
+        ║  Before V8: T_audio ≠ T_video due to timestamp corrections        ║
+        ║  After V8: T_audio = T_video = T_cues (perfect synchronization)   ║
         ╚═══════════════════════════════════════════════════════════════════╝
         """
         logger.info(f"[V8-SYNC] ========== ATOMIC SYNC: {cues_timestamp:.3f}s ==========")
 
-        # ÉTAPE ATOMIQUE 1: MPV audio → T_cues
+        # ATOMIC STEP 1: MPV audio → T_cues
         if self.player:
             try:
                 self.player.time_pos = cues_timestamp
@@ -2603,17 +2640,17 @@ class PlayerWindow(QMainWindow):
             except Exception as e:
                 logger.warning(f"[V8-SYNC] MPV seek warning: {e}")
 
-        # ÉTAPE ATOMIQUE 2: Tous les trackers → T_cues
+        # ATOMIC STEP 2: All trackers → T_cues
         self._current_precise_time = cues_timestamp
         self._last_mvc_timestamp = cues_timestamp
         self._last_ui_time = cues_timestamp
         self._last_timeline_update_time = time.monotonic()
 
-        # ÉTAPE ATOMIQUE 3: Decoder audio clock → T_cues
+        # ATOMIC STEP 3: Decoder audio clock → T_cues
         if self.mvc_decoder_thread:
             self.mvc_decoder_thread.update_audio_clock(cues_timestamp)
 
-        # ÉTAPE ATOMIQUE 4: UI → T_cues
+        # ATOMIC STEP 4: UI → T_cues
         self.controls_overlay.set_time(cues_timestamp)
 
         # RESET sync state (clean slate)
@@ -2976,7 +3013,7 @@ class PlayerWindow(QMainWindow):
             pass
 
     def _update_playback_position(self):
-        """Mise à jour périodique de la position de lecture (pour fiabilité en mode MVC)."""
+        """Periodic update of the playback position (for reliability in MVC mode)."""
         # CRITICAL FIX: Do not access player if media is not loaded or loading
         if not self.has_media or getattr(self, '_is_loading_file', False):
             return
@@ -3053,15 +3090,15 @@ class PlayerWindow(QMainWindow):
                 if self._subtitle_manager and self.mvc_mode_active:
                     self._subtitle_manager.update_time(new_time)
 
-                # V7b DEBUG: Log périodique toutes les 30 updates pour vérifier progression
+                # V7b DEBUG: Periodic log every 30 updates to verify progression
                 if not hasattr(self, '_timeline_update_count'):
                     self._timeline_update_count = 0
                 self._timeline_update_count += 1
                 if self._timeline_update_count % 30 == 0:
-                    logger.debug(f"[TIMELINE] Position updated: {new_time:.2f}s (mode MVC: {self.mvc_mode_active})")
+                    logger.debug(f"[TIMELINE] Position updated: {new_time:.2f}s (MVC mode: {self.mvc_mode_active})")
 
         except Exception:
-            pass  # Ignorer les erreurs si MPV est occupe
+            pass  # Ignore errors if MPV is busy
 
     def on_pause_state_change(self, _, is_paused):
         """MPV pause state changed - called from MPV event thread!"""
@@ -3097,9 +3134,9 @@ class PlayerWindow(QMainWindow):
                 # V14b RENDER HEARTBEAT: Stop heartbeat when paused
                 if self._render_heartbeat_timer.isActive():
                     self._render_heartbeat_timer.stop()
-                # V7b FIX: En mode MVC, garder le timer actif meme en pause pour que le curseur progresse
+                # V7b FIX: In MVC mode, keep the timer active even when paused so the cursor progresses
                 if not (self.mvc_mode_active or getattr(self, '_mvc_file_detected', False)):
-                    self._playback_timer.stop()  # ArrÃªter la mise Ã  jour de la timeline
+                    self._playback_timer.stop()  # Stop the timeline update
                     logger.info(f"[TIMELINE] Timer stopped (MVC: {self.mvc_mode_active}, detected: {getattr(self, '_mvc_file_detected', False)})")
                 else:
                     logger.info(f"[TIMELINE] Timer kept active (MVC: {self.mvc_mode_active}, detected: {getattr(self, '_mvc_file_detected', False)})")
@@ -3110,7 +3147,7 @@ class PlayerWindow(QMainWindow):
             else:
                 # V15: Start inactivity timer when playback resumes
                 self._mouse_inactivity_timer.start()
-                self._playback_timer.start()  # Demarrer la mise Ã  jour de la timeline
+                self._playback_timer.start()  # Start the timeline update
                 # Notify decoder
                 if self.mvc_decoder_thread:
                     self.mvc_decoder_thread.resume()
@@ -3142,6 +3179,8 @@ class PlayerWindow(QMainWindow):
         return self._safe_mpv_command('seek', str(time_pos), 'absolute')
 
     def toggle_play(self):
+        if getattr(self, '_archiving', False):
+            return  # playback is locked while a disc image is being written
         if self.has_media and self.player:
             try:
                 # Normalize MPV property which might be string or None
@@ -3183,7 +3222,7 @@ class PlayerWindow(QMainWindow):
                 self.mvc_embedded_widget.clear_textures()
                 self.mvc_embedded_widget.update()
 
-        self._playback_timer.stop()  # ArrÃªter la mise Ã  jour de la timeline
+        self._playback_timer.stop()  # Stop the timeline update
         # V14b RENDER HEARTBEAT: Stop heartbeat when playback stops
         if self._render_heartbeat_timer.isActive():
             self._render_heartbeat_timer.stop()
@@ -3616,8 +3655,8 @@ class PlayerWindow(QMainWindow):
         if not (self.has_media and self.player):
             return
         try:
-            # mpv.command() sérialise via la file MPV au lieu d'un set_property direct,
-            # ce qui évite la collision avec le decoder thread (SEH 0xe24c4a02).
+            # mpv.command() serializes via the MPV queue instead of a direct set_property,
+            # which avoids the collision with the decoder thread (SEH 0xe24c4a02).
             self.player.command('set', 'aid', str(track_id))
             print(f"Audio track changed: ID {track_id}")
         except (OSError, RuntimeError, Exception) as e:
@@ -3911,44 +3950,51 @@ class PlayerWindow(QMainWindow):
             import traceback
             traceback.print_exc()
 
-    def _connect_subtitle_to_widget(self, widget):
-        """Connect SubtitleManager signals to an OpenGL display widget."""
-        if not self._subtitle_manager or not widget:
+    def _connect_subtitle_to_widget(self, widget=None):
+        """Connect SubtitleManager signals to EVERY active MVC display widget — the embedded
+        2D view in the main window AND the separate 3D FramePack window — so PGS subtitles
+        appear on both, not only the active one (in 3D mode the embedded 2D view stays
+        visible for sync, so it needs the overlay too)."""
+        if not self._subtitle_manager:
             return
 
         try:
-            # Track connected widget to avoid redundant reconnection
-            if getattr(self, '_subtitle_connected_widget', None) == widget:
-                return  # Already connected to this widget
+            # Gather every display widget that can render a subtitle overlay (dedup, keep order)
+            widgets = []
+            for w in (getattr(self, 'mvc_embedded_widget', None),
+                      getattr(getattr(self, 'framepacking_window', None), 'display_widget', None),
+                      widget):
+                if (w is not None and w not in widgets
+                        and hasattr(w, 'set_subtitle') and hasattr(w, 'clear_subtitle')):
+                    widgets.append(w)
+            if not widgets:
+                logger.warning("[PGS] No display widget with subtitle methods to connect")
+                return
 
-            # Disconnect previous connections if any
-            if hasattr(self, '_subtitle_connected_widget') and self._subtitle_connected_widget is not None:
-                try:
-                    self._subtitle_manager.subtitle_changed.disconnect()
-                    self._subtitle_manager.subtitle_cleared.disconnect()
-                except (TypeError, RuntimeError):
-                    pass  # Not connected
+            # Skip if already connected to exactly this set
+            if getattr(self, '_subtitle_connected_widgets', None) == widgets:
+                return
 
-            # Connect to widget's subtitle methods
-            if hasattr(widget, 'set_subtitle') and hasattr(widget, 'clear_subtitle'):
-                # Use a closure that captures widget by reference
-                def make_setter(target_widget):
-                    def setter(rgba, x, y, width, height, vw, vh):
-                        try:
-                            logger.info(f"[PGS] CALLING set_subtitle on {target_widget.__class__.__name__}, pos=({x},{y}), size={width}x{height}")
-                            target_widget.set_subtitle(rgba, x, y, width, height, vw, vh)
-                        except Exception as e:
-                            logger.error(f"[PGS] Error in set_subtitle: {e}")
-                            import traceback
-                            traceback.print_exc()
-                    return setter
+            # Drop any previous connections, then connect every gathered widget
+            try:
+                self._subtitle_manager.subtitle_changed.disconnect()
+                self._subtitle_manager.subtitle_cleared.disconnect()
+            except (TypeError, RuntimeError):
+                pass
 
-                self._subtitle_manager.subtitle_changed.connect(make_setter(widget))
-                self._subtitle_manager.subtitle_cleared.connect(widget.clear_subtitle)
-                self._subtitle_connected_widget = widget
-                logger.info(f"[PGS] CONNECTED subtitle_changed signal to {widget.__class__.__name__}.set_subtitle()")
-            else:
-                logger.warning(f"[PGS] Widget {widget.__class__.__name__} missing subtitle methods")
+            def make_setter(target_widget):
+                def setter(rgba, x, y, width, height, vw, vh):
+                    try:
+                        target_widget.set_subtitle(rgba, x, y, width, height, vw, vh)
+                    except Exception as e:
+                        logger.error(f"[PGS] set_subtitle error on {target_widget.__class__.__name__}: {e}")
+                return setter
+
+            for w in widgets:
+                self._subtitle_manager.subtitle_changed.connect(make_setter(w))
+                self._subtitle_manager.subtitle_cleared.connect(w.clear_subtitle)
+            self._subtitle_connected_widgets = widgets
+            logger.info(f"[PGS] CONNECTED subtitles to {[w.__class__.__name__ for w in widgets]}")
         except Exception as e:
             logger.error(f"[PGS] Error connecting subtitle manager: {e}")
 
@@ -4010,7 +4056,29 @@ class PlayerWindow(QMainWindow):
         self._streaming_subtitle_tracks = tracks
         pgs_tracks = [t for t in tracks if t.get('isPGS', False)]
 
+        # Raw Blu-ray M2TS/SSIF carries no language tag in the PMT — enrich the PID-only PGS
+        # tracks with the language from the .clpi ProgramInfo (cached), so the menu shows the
+        # language (e.g. "French (PID 0x1200)") instead of just the raw PID.
+        try:
+            lang_map = self._get_clpi_lang_map()
+            if lang_map:
+                seen = {}
+                for i, t in enumerate(tracks):
+                    lang = lang_map.get(t.get('trackNumber'), '')
+                    if lang:
+                        t['language'] = lang
+                        base = _humanize_lang(lang) or lang.upper()
+                    else:
+                        base = f"Subtitle {i + 1}"
+                    # label by language only — no PID; a counter disambiguates same-language dupes
+                    seen[base] = seen.get(base, 0) + 1
+                    t['name'] = base if seen[base] == 1 else f"{base} {seen[base]}"
+        except Exception as e:
+            logger.warning(f"[STREAMING-SUBS] CLPI language label skipped: {e}")
+
         logger.info(f"[STREAMING-SUBS] Detected {len(tracks)} subtitle tracks ({len(pgs_tracks)} PGS)")
+        for t in tracks:
+            logger.info(f"  - {t.get('name')} (lang={t.get('language') or '?'})")
         for t in tracks:
             logger.info(f"  - Track {t.get('trackNumber')}: {t.get('name')} (PGS={t.get('isPGS')})")
 
@@ -4043,6 +4111,120 @@ class PlayerWindow(QMainWindow):
         )
         if folder:
             self.play_file(folder)  # play_file auto-detects the feature SSIF on a disc/folder
+
+    # ===================== Blu-ray → ISO archiving =====================
+    def open_archive_dialog(self):
+        """Open the disc-imaging dialog (configure → live throughput/ETA/animation → STOP)."""
+        if getattr(self, '_archiving', False):
+            return
+        try:
+            from disc_archiver import DiscArchiveDialog
+            DiscArchiveDialog(self, parent=self).exec()
+        except Exception as e:
+            logger.error(f"[ARCHIVE] dialog error: {e}")
+            import traceback
+            traceback.print_exc()
+            self.show_3d_notification(f"Archive error: {e}", success=False)
+
+    def _mounted_iso_letters(self):
+        """Drive letters of ISOs WE mounted (excluded from archiving — you already have them)."""
+        out = set()
+        for m in (getattr(self, '_active_iso_mount', None), getattr(self, '_pending_iso_mount', None)):
+            if m and m[1]:
+                L = str(m[1]).rstrip('\\').rstrip(':')[:1].upper()
+                if L:
+                    out.add(L)
+        return out
+
+    def _is_physical_bluray(self, letter):
+        """True iff `letter` is a physical optical drive holding a Blu-ray (BDMV) — i.e. not a
+        mounted ISO and not a non-BD disc. This is the ONLY thing we allow imaging."""
+        if not letter:
+            return False
+        try:
+            import disc_archiver as da
+            import bluray_disc
+            letter = letter.upper()
+            if letter in self._mounted_iso_letters():
+                return False
+            if letter not in da.list_optical_drives():
+                return False
+            return bool(bluray_disc.is_bluray_path(f"{letter}:\\"))
+        except Exception:
+            return False
+
+    def _archivable_disc_drive(self):
+        """Letter of the physical Blu-ray currently loaded, else None. Drives the archive
+        button's enabled state so it lights up ONLY for a Blu-ray source (never MKV/ISO)."""
+        if not getattr(self, 'current_file_path', None):
+            return None
+        d = os.path.splitdrive(os.path.abspath(self.current_file_path))[0]
+        letter = d[0].upper() if d else None
+        return letter if self._is_physical_bluray(letter) else None
+
+    def _update_archive_button_state(self):
+        """Enable the archive button only when a Blu-ray disc is the active source."""
+        try:
+            ok = self._archivable_disc_drive() is not None and not getattr(self, '_archiving', False)
+            self.controls_overlay.archive_button.setEnabled(ok)
+        except Exception:
+            pass
+
+    def _resolve_archive_source(self):
+        """Blu-ray discs ONLY. Returns {found, ready, kind:'volume', drive, label, length, error}.
+        Imaging is offered solely for a physical Blu-ray optical disc — never a mounted ISO,
+        an MKV, or any other source."""
+        import disc_archiver as da
+
+        def vol(letter):
+            info = da.probe_volume(letter)
+            return {"found": True, "ready": bool(info.get("ok")), "kind": "volume",
+                    "drive": letter, "label": info.get("label", ""),
+                    "length": info.get("length", 0), "iso_path": "",
+                    "error": info.get("error", "")}
+
+        # the disc currently playing, if it's a physical Blu-ray
+        cur = self._archivable_disc_drive()
+        if cur:
+            return vol(cur)
+        # otherwise a physical Blu-ray sitting in a drive (with ready media)
+        bd = [c for c in da.list_optical_drives() if self._is_physical_bluray(c)]
+        for c in bd:
+            r = vol(c)
+            if r["ready"]:
+                return r
+        if bd:
+            return vol(bd[0])
+        return {"found": False, "ready": False, "kind": "volume", "drive": "", "label": "",
+                "length": 0, "iso_path": "",
+                "error": "ISO saving is only possible from a Blu-ray disc."}
+
+    def _begin_archive_lock(self):
+        """Lock playback while imaging: stop the player (releases disc handles) and disable
+        the transport so the drive is dedicated to a clean sequential read."""
+        self._archiving = True
+        try:
+            if getattr(self, 'has_media', False):
+                self.stop_playback()
+        except Exception as e:
+            logger.warning(f"[ARCHIVE] stop during lock: {e}")
+        for attr in ('play_pause_button', 'archive_button', 'skip_back_button', 'skip_forward_button'):
+            try:
+                getattr(self.controls_overlay, attr).setEnabled(False)
+            except Exception:
+                pass
+        logger.info("[ARCHIVE] playback locked for disc imaging")
+
+    def _end_archive_lock(self):
+        """Release the playback lock after imaging finishes/cancels."""
+        self._archiving = False
+        for attr in ('play_pause_button', 'skip_back_button', 'skip_forward_button'):
+            try:
+                getattr(self.controls_overlay, attr).setEnabled(True)
+            except Exception:
+                pass
+        self._update_archive_button_state()
+        logger.info("[ARCHIVE] playback lock released")
 
     def dragEnterEvent(self, event):
         """Accept drag of files/folders (including a Blu-ray drive or BDMV folder)."""
@@ -4308,6 +4490,9 @@ class PlayerWindow(QMainWindow):
         an index.bdmv, or any folder containing a BDMV. In that case the feature film
         ("main title") SSIF is auto-detected (duration-based, robust to decoy playlists).
         """
+        if getattr(self, '_archiving', False):
+            self.show_3d_notification("ISO copy in progress — playback unavailable", success=False)
+            return
         try:
             import bluray_disc
             from PySide6.QtWidgets import QApplication
@@ -4428,6 +4613,7 @@ class PlayerWindow(QMainWindow):
     def _continue_play_file(self, file_path):
         """Continue loading file after cleanup delay."""
         self.current_file_path = file_path
+        self._update_archive_button_state()  # archive button lights up only for a Blu-ray disc
 
         # V7b CRITICAL FIX: Reset timeline IMMEDIATELY to prevent stale duration from previous video
         # This ensures the slider maximum() doesn't contain old values during seek calculations
@@ -4568,8 +4754,8 @@ class PlayerWindow(QMainWindow):
             # self.metrics_overlay.show() # Disabled to remove top-left artifact
             self.player.play(file_path)
             self.player.pause = True
-            # V7b FIX: FORCE le timer à rester actif même en pause pour le mode MVC
-            # Cela permet au slider de progresser immédiatement
+            # V7b FIX: FORCE the timer to stay active even when paused for MVC mode
+            # This lets the slider progress immediately
             if self.mvc_mode_active or getattr(self, "_mvc_file_detected", False):
                 self._playback_timer.start()  # Override pause behavior
             self.update_ui_state()
@@ -4680,24 +4866,24 @@ class PlayerWindow(QMainWindow):
         if not self.video_3d_info:
             self.video_3d_info = Video3DAnalyzer.analyze_file(file_path)
 
-        # SOL 1A: Définir flag MVC IMMÉDIATEMENT (avant _start_mvc_decoder)
-        # Permet au timer de rester actif dès player.pause = True
+        # SOL 1A: Set MVC flag IMMEDIATELY (before _start_mvc_decoder)
+        # Allows the timer to stay active as soon as player.pause = True
         if self.video_3d_info.get('stereo_mode') == 'mvc':
             self._mvc_file_detected = True
         else:
             self._mvc_file_detected = False
 
-        # V7b CRITICAL FIX: NE PAS mettre à jour la timeline avec la durée ffprobe
-        # La timeline sera mise à jour UNIQUEMENT par _update_timeline_and_start_playback avec MPV
-        # Ceci évite les conflits d'échelle entre ffprobe et MPV qui causent des seeks incorrects
+        # V7b CRITICAL FIX: DO NOT update the timeline with the ffprobe duration
+        # The timeline will be updated ONLY by _update_timeline_and_start_playback with MPV
+        # This avoids scale conflicts between ffprobe and MPV that cause incorrect seeks
 
-        # MAIS on garde le FPS et le nom du fichier pour les previews
-        self.controls_overlay.time_slider.set_video_file(file_path, 0)  # Duration=0 pour l'instant
+        # BUT we keep the FPS and the file name for the previews
+        self.controls_overlay.time_slider.set_video_file(file_path, 0)  # Duration=0 for now
         fps_val = self.video_3d_info.get('fps')
         if fps_val:
             self.current_video_fps = fps_val
 
-        # NOTE: La durée sera mise à jour par _update_timeline_and_start_playback après chargement MPV
+        # NOTE: The duration will be updated by _update_timeline_and_start_playback after MPV loads
 
         if self.video_3d_info.get('analysis_error'):
             self.show_3d_notification("3D analysis via ffprobe failed.", success=False)
@@ -4918,9 +5104,9 @@ class PlayerWindow(QMainWindow):
         requested_start = self._current_mpv_time() if start_time is None else start_time
         actual_start_time = float(requested_start or 0.0)
 
-        # Stocker la position de depart pour la synchronisation audio
+        # Store the start position for audio synchronization
         self._decoder_start_position = actual_start_time
-        self._sync_adjustment_count = 0  # Reinitialiser le compteur
+        self._sync_adjustment_count = 0  # Reset the counter
         # V7b FIX: Reset timeline trackers to ensure cursor movement
         self._last_mvc_timestamp = actual_start_time
         self._current_precise_time = actual_start_time
@@ -4964,9 +5150,9 @@ class PlayerWindow(QMainWindow):
         #    print(f"Could not seek mpv: {e}")
 
         if not self.shared_buffer:
-            raise RuntimeError("Tampon memoire partagee non alloue.")
+            raise RuntimeError("Shared memory buffer not allocated.")
 
-        # GPU YUVâ†’RGB + frame_struct actives
+        # GPU YUV->RGB + frame_struct active
         USE_GPU_YUV_CONVERSION = True
         STORE_FRAME_STRUCT_FOR_GPU = True
 
@@ -4986,13 +5172,24 @@ class PlayerWindow(QMainWindow):
 
             # 2. Prepare Detached Window (for 3D FramePack)
             if not self.framepacking_window:
-                # Standard init - it creates its own display_widget if None passed
-                # But we want it to be empty initially if we manage reparenting?
-                # No, we will reparent mvc_embedded_widget TO it when needed.
+                # S5a cutover: when SYLC_NATIVE_RENDER=1, the detached 3D window is
+                # rendered by the native C++ D3D11 renderer instead of Qt RHI. Opt-in
+                # and revertible; the Qt path stays the default.
+                _native_dw = None
+                if os.environ.get("SYLC_NATIVE_RENDER") == "1":
+                    try:
+                        from native_renderer.native_framepack_widget import NativeFramepackWidget
+                        _sdrw = getattr(self.mvc_embedded_widget, '_sdr_white_level', 1.0)
+                        _native_dw = NativeFramepackWidget(sdr_white=_sdrw)
+                        _native_dw.set_stereo_mode('framepack')
+                        logger.info("[NATIVE-RENDER] Detached 3D window uses NativeFramepackWidget")
+                    except Exception as _e:
+                        logger.warning(f"[NATIVE-RENDER] native widget unavailable, using Qt: {_e}")
+                        _native_dw = None
                 self.framepacking_window = Framepacking3DWindow(
                     parent=None,
                     use_yuv_shader=USE_GPU_YUV_CONVERSION,
-                    display_widget=None
+                    display_widget=_native_dw
                 )
                 self.framepacking_window.visibilityChanged.connect(self._on_framepacking_visibility_changed)
 
@@ -5059,7 +5256,7 @@ class PlayerWindow(QMainWindow):
             self.mvc_decoder_thread.decodingFinished.connect(self._on_mvc_finished)
             self.mvc_decoder_thread.stats_update.connect(self._on_mvc_stats_update)
             self.mvc_decoder_thread.decoderCrashed.connect(self._on_mvc_decoder_crashed)
-            # Nouveau: Synchronisation audio basee sur les marqueurs du decodeur
+            # New: Audio synchronization based on the decoder markers
             self.mvc_decoder_thread.frameTimestampReady.connect(self._on_frame_timestamp)
             # Smart Queue Signal
             self.mvc_decoder_thread.seekFinished.connect(self._on_mvc_seek_finished)
@@ -5085,8 +5282,8 @@ class PlayerWindow(QMainWindow):
                 logger.info("[MVC INIT] Subtitle track detection signal connected")
             # ========================================================
 
-            # CRITICAL: Laisser OpenGL s'initialiser avant de commencer le decodage
-            # Demarrer le thread apres un court delai pour eviter les race conditions
+            # CRITICAL: Let OpenGL initialize before starting decoding
+            # Start the thread after a short delay to avoid race conditions
             print(f"[MVC INIT] Starting decoder thread in 100ms...")
             QTimer.singleShot(100, lambda: self._delayed_start_decoder(disable_mpv=True))
 
@@ -5124,7 +5321,7 @@ class PlayerWindow(QMainWindow):
                 print("[MVC INIT] Loading overlay hidden")
 
             self.show_3d_notification(
-                "Edge264 MVC Decoder Active - Mettez vos lunettes 3D",
+                "Edge264 MVC Decoder Active - Put on your 3D glasses",
                 success=True,
                 permanent=True
             )
@@ -5168,16 +5365,6 @@ class PlayerWindow(QMainWindow):
         # Increased to 500ms to allow MPV internals to stabilize (fixes 0xe24c4a02 exception).
         self.show_3d_notification("Decoder recovering...", success=False)
         QTimer.singleShot(500, lambda: self._start_mvc_decoder(start_time=resume_time))
-
-    def _current_mpv_time(self):
-        """Helper to safely get the current time from the mpv player."""
-        try:
-            if self.player and self.has_media:
-                return self.player.time_pos
-        except Exception:
-            # mpv might be closing or in a bad state
-            return 0.0
-        return 0.0
 
     def _fallback_to_mpv_mvc(self):
         """Fallback to mpv native MVC handling"""
@@ -5367,7 +5554,7 @@ class PlayerWindow(QMainWindow):
             import time
             time.sleep(0.050)  # 50ms
 
-        # Stop ALL timers (pas juste _sync_timer et watchdog)
+        # Stop ALL timers (not just _sync_timer and watchdog)
         timer_names = ['_sync_timer', '_stall_watchdog', '_playback_timer', 'controls_hide_timer', '_render_heartbeat_timer']
         for timer_name in timer_names:
             timer = getattr(self, timer_name, None)
@@ -5438,7 +5625,7 @@ class PlayerWindow(QMainWindow):
             logger.info("[MVC CLEANUP] Stop signal sent to decoder thread")
 
             # STEP 4: Wait for thread to finish (with timeout)
-            if not self.mvc_decoder_thread.wait(5000):  # 5s timeout (augmenté de 3s)
+            if not self.mvc_decoder_thread.wait(5000):  # 5s timeout (increased from 3s)
                 logger.error("[MVC CLEANUP] Thread did not stop in 5s! Force terminating...")
                 # CRITICAL FIX: NEVER call terminate() on a thread inside a C-extension!
                 # Calling terminate() causes "Windows fatal exception: access violation" (0xc0000005)
@@ -5446,10 +5633,10 @@ class PlayerWindow(QMainWindow):
                 # Last resort: try terminate() with additional wait
                 try:
                     self.mvc_decoder_thread.terminate()
-                    if not self.mvc_decoder_thread.wait(1000):  # 1s pour terminate
+                    if not self.mvc_decoder_thread.wait(1000):  # 1s for terminate
                         logger.critical("[MVC CLEANUP] Thread still alive after terminate! App may hang...")
                 except:
-                    pass  # Terminate peut échouer, on continue quand même
+                    pass  # Terminate may fail, we continue anyway
 
             logger.info("[MVC CLEANUP] Decoder thread stopped successfully")
             self.mvc_decoder_thread = None
@@ -5499,7 +5686,7 @@ class PlayerWindow(QMainWindow):
         # Only clear the connection state, not the parsed subtitle data
         if self._subtitle_manager:
             # self._subtitle_manager.clear()  # REMOVED - preserves loaded subtitles
-            self._subtitle_connected_widget = None  # Will be reconnected when decoder starts
+            self._subtitle_connected_widgets = []  # Will be reconnected when decoder starts
             # Keep _active_pgs_track_index so we know subtitles were previously selected
 
         # Force GC to clean up ctypes objects from decoder thread
@@ -5634,22 +5821,42 @@ class PlayerWindow(QMainWindow):
             except Exception as e:
                 logger.error(f"[FRAME-ROUTE] delivery to {type(target).__name__} failed: {e}")
 
+        # Native renderer A/B tap (Tokyo #3, S4): diagnostic only, env-gated by
+        # SYLC_NATIVE_TAP=1. Mirrors the same frame into a separate native-D3D11
+        # window for live parity comparison. Zero impact when the flag is unset.
+        if os.environ.get("SYLC_NATIVE_TAP") == "1":
+            tap = getattr(self, '_native_tap', None)
+            if tap is None:
+                try:
+                    from native_renderer.native_tap import NativeRendererTap
+                    self._native_tap = tap = NativeRendererTap()
+                except Exception as _e:
+                    logger.warning(f"[NATIVE-TAP] init failed: {_e}")
+                    self._native_tap = tap = False
+            if tap:
+                sm = 1 if (fp_window is not None and fp_window.isVisible()) else 0
+                # Mirror the SAME SDR white level the Qt widget feeds the shader,
+                # so the native window matches brightness/saturation exactly.
+                ref = targets[0] if targets else getattr(self, 'active_mvc_widget', None)
+                sdr = getattr(ref, '_sdr_white_level', None)
+                tap.push(left_planes, right_planes, sm, sdr)
+
         self._record_display_frame_stats()
 
     @Slot(str)
     def _on_mvc_error(self, error_msg):
-        """Slot: MVC decoder error - arrÃªt immediat et cleanup"""
+        """Slot: MVC decoder error - immediate stop and cleanup"""
         logger.error(f"[MVC ERROR] {error_msg}")
 
-        # CRITICAL: ArrÃªter IMMÃ‰DIATEMENT le watchdog AVANT tout le reste
+        # CRITICAL: Stop the watchdog IMMEDIATELY BEFORE everything else
         if hasattr(self, '_stall_watchdog') and self._stall_watchdog.isActive():
             self._stall_watchdog.stop()
             logger.info("[MVC ERROR] Watchdog stopped immediately")
 
-        # CRITICAL: Desactiver le mode MVC immediatement pour eviter que watchdog redemarre
+        # CRITICAL: Disable MVC mode immediately to prevent the watchdog from restarting
         self.mvc_mode_active = False
 
-        # Cleanup complet du decodeur MVC (mais watchdog dejÃ  arrÃªte)
+        # Full cleanup of the MVC decoder (but watchdog already stopped)
         self._stop_mvc_decoder()
 
         # Inform the user - ANY fatal decoder error
@@ -5680,34 +5887,34 @@ class PlayerWindow(QMainWindow):
     @Slot(int, float, int)
     def _on_frame_timestamp(self, frame_id, timestamp, poc):
         """
-        Synchronisation audio basee sur les marqueurs du decodeur.
-        DÃ‰SACTIVÃ‰ par defaut - necessite tests thread-safety approfondis.
+        Audio synchronization based on the decoder markers.
+        DISABLED by default - requires thorough thread-safety testing.
 
-        Nouveau systeme de synchronisation oÃ¹ le decodeur genere un timestamp
-        precis pour chaque frame base sur le PictureOrderCnt (POC).
+        New synchronization system where the decoder generates a precise
+        timestamp for each frame based on the PictureOrderCnt (POC).
 
         Args:
-            frame_id: Identifiant unique de la frame
-            timestamp: Timestamp calcule en secondes
-            poc: Picture Order Count de la frame
+            frame_id: Unique identifier of the frame
+            timestamp: Timestamp computed in seconds
+            poc: Picture Order Count of the frame
         """
         raw_timestamp = timestamp
 
-        # DÃ‰SACTIVÃ‰ par defaut pour eviter crashes thread-safety
+        # DISABLED by default to avoid thread-safety crashes
         if not self._audio_sync_enabled:
             self._last_mvc_timestamp = raw_timestamp
             return
 
-        # Verifications de securite
+        # Safety checks
         if not self.player or not self.mvc_mode_active:
             self._last_mvc_timestamp = raw_timestamp
             return
 
         try:
-            # Timestamp est dÃ©jÃ  absolu depuis la correction du decoder thread
+            # Timestamp is already absolute since the decoder thread fix
             absolute_timestamp = raw_timestamp
 
-            # Obtenir la position audio actuelle de MPV (thread-safe?)
+            # Get the current MPV audio position (thread-safe?)
             # V7b STABILITY FIX: Protect MPV access from crashes
             try:
                 audio_pos = self.player.time_pos
@@ -5789,7 +5996,7 @@ class PlayerWindow(QMainWindow):
         except AttributeError as e:
             logger.error(f"[SYNC] Player attribute error: {e}")
         except Exception as e:
-            logger.error(f"[SYNC] Erreur lors de la synchronisation: {e}")
+            logger.error(f"[SYNC] Error during synchronization: {e}")
 
     @Slot()
     def _on_mvc_finished(self):
@@ -5903,6 +6110,13 @@ class PlayerWindow(QMainWindow):
         return fps
 
     def _current_mpv_time(self):
+        """Current playback time (seconds) from mpv, with a UI fallback.
+
+        Sole definition: a second, shadowing copy of this method previously
+        lived earlier in the class and silently won method resolution. This
+        version is the robust one — it tolerates mpv returning None and, when
+        mpv has no position, falls back to the time-slider value instead of 0.0.
+        """
         if self.player:
             try:
                 pos = self.player.time_pos
@@ -5960,19 +6174,19 @@ class PlayerWindow(QMainWindow):
             self.monitoring_overlay.raise_()
 
     def _check_decoder_stall(self):
-        # Verifier si le mode MVC est actif
+        # Check whether MVC mode is active
         if not self.mvc_mode_active:
             return
 
-        # Verifier si le thread existe et est toujours en vie
+        # Check whether the thread exists and is still alive
         if not self.mvc_decoder_thread or not self.mvc_decoder_thread.isRunning():
-            # Thread arrÃªte, stopper le watchdog
+            # Thread stopped, stop the watchdog
             if self._stall_watchdog.isActive():
                 self._stall_watchdog.stop()
                 logger.info("[WATCHDOG] Decoder thread stopped, watchdog disabled")
             return
 
-        # Verifier le stall seulement si le thread est actif
+        # Check for the stall only if the thread is active
         
         # CRITICAL FIX: Do NOT check for stalls if paused!
         if not self.is_playing:
@@ -6033,13 +6247,13 @@ class PlayerWindow(QMainWindow):
 
 
 if __name__ == "__main__":
-    # Support pour PyInstaller sous Windows
+    # Support for PyInstaller on Windows
     import multiprocessing
     multiprocessing.freeze_support()
 
-    # Activer faulthandler vers un fichier (jamais stderr) pour capturer
-    # les vraies crashes sans polluer la console avec les SEH 0xe24c4a02
-    # transients (cross-thread MPV/decoder) qui sont déjà géré par try/except.
+    # Enable faulthandler to a file (never stderr) to capture
+    # real crashes without polluting the console with the SEH 0xe24c4a02
+    # transients (cross-thread MPV/decoder) that are already handled by try/except.
     import faulthandler
     try:
         _script_dir = os.path.dirname(os.path.abspath(__file__))

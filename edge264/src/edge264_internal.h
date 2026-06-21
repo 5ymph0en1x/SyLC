@@ -1159,7 +1159,7 @@ static const char *ret_to_str(int ret) {
 		dec->log_pos = 0;
 		if (pos >= sizeof(dec->log_buf))
 			ret = ret ?: ENOTSUP;
-		else
+		else if (dec->log_cb)
 			dec->log_cb(dec->log_buf, dec->log_arg);
 		return ret;
 	}
@@ -1171,7 +1171,8 @@ static const char *ret_to_str(int ret) {
 		ctx->log_pos = 0;
 		if (pos >= sizeof(ctx->log_buf))
 			return ENOTSUP;
-		ctx->log_cb(ctx->log_buf, ctx->log_arg);
+		if (ctx->log_cb)
+			ctx->log_cb(ctx->log_buf, ctx->log_arg);
 		return 0;
 	}
 #else
