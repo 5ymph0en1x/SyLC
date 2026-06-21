@@ -2,7 +2,8 @@
 
 # SyLC 3D Player
 
-<img src="splash.png" alt="SyLC 3D Player Logo" width="250" />
+<p align="center"><img src="splash.png" alt="SyLC 3D Player Logo" width="250" /></p>
+<p align="center"><img src="GUI.jpg" alt="SyLC 3D Player Interface" width="1000" /></p>
 
 ### A free, open-source player for the 3D format the industry left behind.
 
