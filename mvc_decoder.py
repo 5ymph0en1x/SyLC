@@ -1033,9 +1033,25 @@ class MVCDecoderThread(QThread):
                 except Exception as e:
                     logger.warning(f"[MVC-THREAD] SSIF detection failed: {e}, using MVCM2TSDemuxer")
                     self.demuxer = mvc_demuxer_cpp.MVCM2TSDemuxer()
-            else:
+            elif ext in ('.mkv', '.mk3d'):
                 logger.info("[MVC-THREAD] Using MVCMatroskaDemuxer")
                 self.demuxer = mvc_demuxer_cpp.MVCMatroskaDemuxer()
+            else:
+                # mp4/avi/mov/flv/webm/raw… : the C++ Matroska demuxer can't open
+                # these, so use the libavformat-backed demuxer (task #391). On any
+                # problem we fall back to the Matroska demuxer, whose open() will
+                # fail → error signal → the player's bulletproof mpv fallback (#388).
+                self.demuxer = None
+                try:
+                    import lavf_h264_demuxer
+                    if lavf_h264_demuxer.is_available():
+                        logger.info(f"[MVC-THREAD] Using LavfH264Demuxer (libavformat) for {ext}")
+                        self.demuxer = lavf_h264_demuxer.LavfH264Demuxer()
+                except Exception as _e:
+                    logger.warning(f"[MVC-THREAD] lavf demuxer unavailable ({_e})")
+                if self.demuxer is None:
+                    logger.info("[MVC-THREAD] Falling back to MVCMatroskaDemuxer")
+                    self.demuxer = mvc_demuxer_cpp.MVCMatroskaDemuxer()
 
             if not self.demuxer.open(self.filepath):
                 self.error.emit(f"Unable to open file: {self.filepath}")

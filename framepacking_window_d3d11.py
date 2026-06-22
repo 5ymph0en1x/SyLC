@@ -19,17 +19,7 @@ from PySide6.QtWidgets import QMainWindow
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeyEvent, QMouseEvent
 
-# Import our D3D11 widget
-from framepacking_widget_d3d11 import (
-    FramepackingDisplayWidgetD3D11,
-    HAS_RHI_WIDGET,
-    check_hdr_support
-)
-
 logger = logging.getLogger(__name__)
-
-# Re-export the widget class with the expected name for compatibility
-FramepackingDisplayWidget = FramepackingDisplayWidgetD3D11
 
 FRAMEPACK_WIDTH = 1920
 FRAMEPACK_HEIGHT = 2205
@@ -50,11 +40,12 @@ class Framepacking3DWindow(QMainWindow):
         self.resize(960, 1102)
         self.setStyleSheet("background-color: black;")
 
-        # Use provided widget or create D3D11 widget
+        # Use the provided widget, or create the native C++ D3D11 renderer widget.
         if display_widget:
             self.display_widget = display_widget
         else:
-            self.display_widget = FramepackingDisplayWidgetD3D11(self)
+            from native_renderer.native_framepack_widget import NativeFramepackWidget
+            self.display_widget = NativeFramepackWidget(self)
             self.display_widget.set_stereo_mode('framepack')
 
         self.setCentralWidget(self.display_widget)
@@ -227,13 +218,23 @@ class Framepacking3DWindow(QMainWindow):
         # Exit fullscreen before closing
         if self._is_fake_fullscreen:
             self.exit_fake_fullscreen()
+        # Release the native renderer's D3D11 resources (no-op if the widget lacks it).
+        try:
+            if hasattr(self.display_widget, 'shutdown'):
+                self.display_widget.shutdown()
+        except Exception:
+            pass
         super().closeEvent(event)
 
 
 # Check availability
 def is_d3d11_available():
-    """Check if D3D11 HDR rendering is available."""
-    return HAS_RHI_WIDGET and check_hdr_support()[0]
+    """Check if the native C++ D3D11 renderer is available."""
+    try:
+        import mvc_demuxer_cpp as _m
+        return bool(getattr(_m, "NATIVE_RENDERER_AVAILABLE", False))
+    except Exception:
+        return False
 
 
 if __name__ == "__main__":
@@ -241,14 +242,8 @@ if __name__ == "__main__":
     from PySide6.QtWidgets import QApplication
 
     logging.basicConfig(level=logging.DEBUG)
-
     app = QApplication(sys.argv)
-
-    available, msg = check_hdr_support()
-    print(f"D3D11 HDR Available: {available}")
-    print(f"Message: {msg}")
-
-    if available:
-        window = Framepacking3DWindow()
-        window.show()
-        sys.exit(app.exec())
+    print(f"Native D3D11 renderer available: {is_d3d11_available()}")
+    window = Framepacking3DWindow()
+    window.show()
+    sys.exit(app.exec())

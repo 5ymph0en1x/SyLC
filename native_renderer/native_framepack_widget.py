@@ -1,10 +1,10 @@
-"""S5a: NativeFramepackWidget — a drop-in replacement for FramepackingDisplayWidgetD3D11
-backed by the native C++ D3D11 renderer.
+"""NativeFramepackWidget — the player's sole video display widget, backed by the
+native C++ D3D11 renderer.
 
-When SYLC_NATIVE_RENDER=1, the player injects this as the detached framepack window's
-display_widget, so the real 3D output is produced by the native renderer instead of Qt
-RHI (removing the tobytes/QByteArray upload copy and the Qt RHI overhead). The Qt path
-remains the default; this is opt-in and revertible.
+The player injects this for both the embedded 2D view and the detached framepack
+window, so all video output is produced by the native renderer (no tobytes/QByteArray
+upload copy, no Qt RHI overhead). It replaced the former Qt RHI widget
+(FramepackingDisplayWidgetD3D11), now removed.
 
 It implements the subset of the widget contract the player actually calls on the
 display widget (verified by grep): set_frame_yuv_views, set_stereo_mode,
@@ -26,8 +26,62 @@ logger = logging.getLogger("SyLC.NativeWidget")
 _MODE = {'2d': 0, 'framepack': 1, 'sbs': 2, 'tab': 3}
 
 
+def query_sdr_white_level():
+    """Windows SDR white level as an scRGB multiplier (1.0 = SDR display, ~2.0-3.5
+    for HDR). Extracted from the Qt widget so the native renderer path is
+    self-sufficient for HDR brightness (no dependency on the Qt widget)."""
+    import ctypes
+    from ctypes import Structure, c_uint32, c_int32, byref, sizeof
+    try:
+        class DISPLAYCONFIG_DEVICE_INFO_HEADER(Structure):
+            _fields_ = [("type", c_uint32), ("size", c_uint32),
+                        ("adapterId_LowPart", c_uint32), ("adapterId_HighPart", c_int32),
+                        ("id", c_uint32)]
+
+        class DISPLAYCONFIG_SDR_WHITE_LEVEL(Structure):
+            _fields_ = [("header", DISPLAYCONFIG_DEVICE_INFO_HEADER), ("SDRWhiteLevel", c_uint32)]
+
+        QDC_ONLY_ACTIVE_PATHS = 0x00000002
+        DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL = 0x0B
+        user32 = ctypes.windll.user32
+
+        num_paths = c_uint32(0)
+        num_modes = c_uint32(0)
+        if (user32.GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, byref(num_paths),
+                                               byref(num_modes)) != 0 or num_paths.value == 0):
+            return 1.0
+
+        class DISPLAYCONFIG_PATH_INFO(Structure):
+            _fields_ = [("data", c_uint32 * 18)]
+
+        class DISPLAYCONFIG_MODE_INFO(Structure):
+            _fields_ = [("data", c_uint32 * 16)]
+
+        paths = (DISPLAYCONFIG_PATH_INFO * num_paths.value)()
+        modes = (DISPLAYCONFIG_MODE_INFO * num_modes.value)()
+        if user32.QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, byref(num_paths), paths,
+                                     byref(num_modes), modes, None) != 0:
+            return 1.0
+        if num_paths.value > 0:
+            pd = paths[0].data
+            sdr = DISPLAYCONFIG_SDR_WHITE_LEVEL()
+            sdr.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL
+            sdr.header.size = sizeof(DISPLAYCONFIG_SDR_WHITE_LEVEL)
+            sdr.header.adapterId_LowPart = pd[8]
+            sdr.header.adapterId_HighPart = pd[9]
+            sdr.header.id = pd[10]
+            if user32.DisplayConfigGetDeviceInfo(byref(sdr)) == 0:
+                mult = (sdr.SDRWhiteLevel / 1000.0) / 80.0   # scRGB 1.0 = 80 nits
+                logger.info(f"[NATIVE-WIDGET] SDR white level multiplier: {mult:.2f}")
+                return mult
+        return 1.0
+    except Exception as e:
+        logger.debug(f"[NATIVE-WIDGET] SDR white level query failed: {e}")
+        return 1.0
+
+
 class NativeFramepackWidget(QWidget):
-    def __init__(self, parent=None, sdr_white=1.0):
+    def __init__(self, parent=None, sdr_white=None):
         super().__init__(parent)
         # Own native HWND for the D3D11 swapchain; don't let Qt paint over it.
         self.setAttribute(Qt.WA_NativeWindow, True)
@@ -38,7 +92,10 @@ class NativeFramepackWidget(QWidget):
         self._r = None                 # NativeRenderer, or False if unavailable
         self._stereo_mode = 1          # framepack default
         self.current_stereo_mode = 1   # public attr the player syncs/reads
-        self._sdr_white = float(sdr_white) if sdr_white else 1.0
+        # Self-sufficient HDR: query the display's SDR white level when not given,
+        # so we no longer depend on the Qt widget having done it.
+        self._sdr_white = float(sdr_white) if sdr_white is not None else query_sdr_white_level()
+        self._sdr_white_level = self._sdr_white   # alias: some call sites read _sdr_white_level
         self._hdr = False
         self._gamma = 0.0
         self._rendering_paused = False

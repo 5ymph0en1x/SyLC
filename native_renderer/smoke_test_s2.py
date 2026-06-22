@@ -87,7 +87,8 @@ if not r.initialize(int(win.winId()), sz.width(), sz.height()):
 print(f"[S2] backend_info: {r.backend_info()}")
 print(f"[S2] is_hdr={r.is_hdr()}  sdr_white={SDR_WHITE}")
 
-if not r.set_yuv_frame(Y_L, U_L, V_L, Y_R, U_R, V_R):
+h, w = Y_L.shape[:2]
+if not r.set_yuv_frame(Y_L, U_L, V_L, Y_R, U_R, V_R, int(w), int(h)):
     print(f"[S2] FAIL: set_yuv_frame -> {r.last_error()}")
     sys.exit(5)
 

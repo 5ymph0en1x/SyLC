@@ -13,6 +13,8 @@ python -m nuitka SyLC_3D_Player.py ^
   --enable-plugin=pyside6 ^
   --include-module=mvc_demuxer_cpp ^
   --include-module=bluray_disc ^
+  --include-module=lavf_h264_demuxer ^
+  --include-package=native_renderer ^
   --include-data-files=edge264.dll=edge264.dll ^
   --include-data-files=libwinpthread-1.dll=libwinpthread-1.dll ^
   --include-data-files=mpv-2.dll=mpv-2.dll ^
@@ -26,10 +28,10 @@ python -m nuitka SyLC_3D_Player.py ^
   --include-data-files=swscale-9.dll=swscale-9.dll ^
   --windows-icon-from-ico=icon.ico ^
   --include-data-files=icon.png=icon.png ^
-  --onefile-tempdir-spec="{CACHE_DIR}/SyLC_3D_Player_v4" ^
+  --onefile-tempdir-spec="{CACHE_DIR}/SyLC_3D_Player_v4_1" ^
   --output-dir=build_onefile ^
-  --output-filename=SyLC_3D_Player_v4.0.0_win-x64.exe ^
-  --company-name=SyLC --product-name="SyLC 3D Player" --file-version=4.0.0 --product-version=4.0.0
+  --output-filename=SyLC_3D_Player_v4.1.0_win-x64.exe ^
+  --company-name=SyLC --product-name="SyLC 3D Player" --file-version=4.1.0 --product-version=4.1.0
 
 echo.
-echo Single-file build done: build_onefile\SyLC_3D_Player_v4.0.0_win-x64.exe
+echo Single-file build done: build_onefile\SyLC_3D_Player_v4.1.0_win-x64.exe

@@ -62,7 +62,8 @@ struct FrameCB {
     float subtitle_rect[4];  // c1   (offset 16)
     float sdr_white_level;   // c2.x (offset 32)
     float output_gamma;      // c2.y (offset 36)  EOTF exponent; <=0 disables
-    float _pad1[2];          // c2.z/.w
+    float fp_vfill;          // c2.z (offset 40)  FramePack: eye vertical fill of a 1080 slot
+    float fp_hfill;          // c2.w (offset 44)  FramePack: eye horizontal fill
 };
 static_assert(sizeof(FrameCB) == 48, "cbuffer must be 48 bytes");
 
@@ -373,6 +374,18 @@ void NativeRenderer::set_uniforms(int stereo_mode, int subtitle_enabled,
     cb.subtitle_rect[2] = rw; cb.subtitle_rect[3] = rh;
     cb.sdr_white_level  = sdr_white;
     cb.output_gamma     = output_gamma;
+    // FramePack letterbox: fit the decoded eye (src_w_ x src_h_) into a 1920x1080
+    // slot preserving aspect — a non-16:9 eye (e.g. Full-SBS 1920x1012) gets black
+    // bars instead of a vertical stretch. 1.0/1.0 = fills the slot (16:9 / MVC).
+    float vfill = 1.0f, hfill = 1.0f;
+    if (src_w_ > 0 && src_h_ > 0) {
+        float eye = float(src_w_) / float(src_h_);
+        const float slot = 1920.0f / 1080.0f;
+        if (eye >= slot) { hfill = 1.0f; vfill = slot / eye; }
+        else             { vfill = 1.0f; hfill = eye / slot; }
+    }
+    cb.fp_vfill = vfill;
+    cb.fp_hfill = hfill;
     impl_->context->UpdateSubresource(impl_->cbuffer.Get(), 0, nullptr, &cb, 0, 0);
 }
 

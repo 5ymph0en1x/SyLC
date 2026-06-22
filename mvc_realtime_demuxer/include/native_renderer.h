@@ -5,18 +5,20 @@
 // this stage only proves the HDR swapchain comes up and presents, and that
 // fullscreen toggling preserves the HDR flip-model path.
 //
-// THREADING CONTRACT (see native_renderer/NATIVE_RENDERER_DESIGN.md §0/§5):
-// there is intentionally NO internal present loop. Every method must be called
-// from the single owning thread (later: the decode/present thread). Presentation
-// is "on arrival", driven by the decoder's existing audio-locked pacing — never
-// by a renderer-side clock — to avoid double-pacing the velvet liquid scheduler.
+// THREADING CONTRACT: The native renderer owns an internal presenter thread.
+// set_yuv_frame(), present(), resize(), pause(), resume(), and shutdown() may be
+// called from the GUI thread. The presenter thread performs all D3D11 upload,
+// draw, and Present operations. Public runtime methods are serialized with
+// internal mutexes so GUI and presenter threads can call concurrently.
 //
 // The whole header is gated on SYLC_NATIVE_RENDERER so the module builds
 // unchanged when the renderer is disabled (e.g. non-Windows or option OFF).
 #pragma once
 #ifdef SYLC_NATIVE_RENDERER
 
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 namespace sylc {
@@ -77,12 +79,18 @@ public:
     // to call concurrently.
     void pause();
     void resume();
-    bool is_paused() const { return paused_; }
+    bool is_paused() const { return paused_.load(); }
+
+    // Copy YUV planes into the ring buffer. Thread-safe; called from GUI thread.
+    bool set_yuv_frame(const uint8_t* yl, const uint8_t* ul, const uint8_t* vl,
+                       const uint8_t* yr, const uint8_t* ur, const uint8_t* vr,
+                       int width, int height);
 
     // Clear the current back buffer to opaque black and Present (interval 1,
     // matching the current ~1-frame latency the audio offset is tuned against).
     // If a frame has been uploaded and the pipeline is ready, draws the shaded,
     // aspect-correct quad before presenting; otherwise presents black (S1).
+    // Thread-safe; called from GUI thread. Notifies the presenter thread.
     bool present();
 
     // True if the scRGB HDR color space was accepted by the swapchain/output.
@@ -90,7 +98,7 @@ public:
 
     // Human-readable backend description and last error, for smoke tests.
     std::string backend_info() const { return backend_info_; }
-    std::string last_error() const { return last_error_; }
+    std::string last_error() const;
 
     // Release all D3D resources. Idempotent.
     void shutdown();
@@ -100,19 +108,26 @@ private:
     void release_backbuffer_views();
     bool create_pipeline();                    // shaders, input layout, sampler, cbuffer, vbuffer
     bool ensure_texture(int slot, uint32_t w, uint32_t h, bool rgba);
+    bool do_resize(uint32_t width, uint32_t height); // called from presenter thread only
+
+    void presenter_loop();
+    bool upload_and_present(const struct PendingFrame& frame);
+    bool internal_present();  // existing present logic
+    bool upload_plane_unlocked_(int plane_index, const uint8_t* data,
+                                uint32_t width, uint32_t height, uint32_t src_stride);
 
     struct Impl;            // holds the ComPtr<> members (kept out of this header)
     Impl* impl_ = nullptr;
 
-    bool        hdr_enabled_   = false;
-    bool        pipeline_ready_ = false;
-    bool        has_frame_     = false;        // a left-Y plane has been uploaded
-    bool        paused_        = false;        // seek/pause gate (guarded by impl_->mtx)
-    uint32_t    width_  = 0;                   // backbuffer size
-    uint32_t    height_ = 0;
-    uint32_t    src_w_  = 0;                   // decoded left-Y size (for 2D aspect)
-    uint32_t    src_h_  = 0;
-    int         stereo_mode_ = 0;
+    bool                 hdr_enabled_   = false;
+    bool                 pipeline_ready_ = false;
+    bool                 has_frame_     = false;        // a left-Y plane has been uploaded
+    std::atomic<bool>    paused_{false};                // seek/pause gate
+    uint32_t             width_  = 0;                   // backbuffer size
+    uint32_t             height_ = 0;
+    uint32_t             src_w_  = 0;                   // decoded left-Y size (for 2D aspect)
+    uint32_t             src_h_  = 0;
+    std::atomic<int>     stereo_mode_{0};
     std::string backend_info_;
     std::string last_error_;
 };

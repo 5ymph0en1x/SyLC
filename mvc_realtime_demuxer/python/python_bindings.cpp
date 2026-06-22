@@ -780,26 +780,42 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
              "Set shader uniforms (stereo_mode 0=2D/1=framepack/2=SBS/3=TAB; "
              "output_gamma>0 linearizes the gamma-domain RGB before scaling).")
         .def("set_yuv_frame",
-             [](sylc::NativeRenderer& r, py::object yl, py::object ul, py::object vl,
-                py::object yr, py::object ur, py::object vr) {
-                 py::object planes[6] = { yl, ul, vl, yr, ur, vr };
-                 bool ok = true;
-                 for (int i = 0; i < 6; ++i) {
-                     if (planes[i].is_none()) continue;
-                     auto a = planes[i].cast<py::array_t<uint8_t,
-                                  py::array::c_style | py::array::forcecast>>();
-                     if (a.ndim() != 2)
-                         throw std::runtime_error("YUV plane must be a 2-D uint8 array");
-                     const uint32_t h = static_cast<uint32_t>(a.shape(0));
-                     const uint32_t w = static_cast<uint32_t>(a.shape(1));
-                     const uint32_t stride = static_cast<uint32_t>(a.strides(0));
-                     if (!r.upload_plane(i, a.data(), w, h, stride)) ok = false;
+             [](sylc::NativeRenderer& r,
+                py::array_t<uint8_t, py::array::c_style | py::array::forcecast> yl,
+                py::array_t<uint8_t, py::array::c_style | py::array::forcecast> ul,
+                py::array_t<uint8_t, py::array::c_style | py::array::forcecast> vl,
+                py::object yr, py::object ur, py::object vr,
+                int width, int height) {
+                 // Buffer pointers must be resolved while the GIL is held; the heavy
+                 // plane copy below is performed with the GIL released.
+                 const uint8_t* yl_ptr = yl.data();
+                 const uint8_t* ul_ptr = ul.data();
+                 const uint8_t* vl_ptr = vl.data();
+                 const uint8_t* yr_ptr = nullptr;
+                 const uint8_t* ur_ptr = nullptr;
+                 const uint8_t* vr_ptr = nullptr;
+                 py::array_t<uint8_t, py::array::c_style | py::array::forcecast> yr_a, ur_a, vr_a;
+                 if (!yr.is_none()) {
+                     yr_a = yr.cast<py::array_t<uint8_t, py::array::c_style | py::array::forcecast>>();
+                     yr_ptr = yr_a.data();
                  }
-                 return ok;
+                 if (!ur.is_none()) {
+                     ur_a = ur.cast<py::array_t<uint8_t, py::array::c_style | py::array::forcecast>>();
+                     ur_ptr = ur_a.data();
+                 }
+                 if (!vr.is_none()) {
+                     vr_a = vr.cast<py::array_t<uint8_t, py::array::c_style | py::array::forcecast>>();
+                     vr_ptr = vr_a.data();
+                 }
+                 py::gil_scoped_release release;
+                 return r.set_yuv_frame(yl_ptr, ul_ptr, vl_ptr,
+                                        yr_ptr, ur_ptr, vr_ptr,
+                                        width, height);
              },
              py::arg("y_l"), py::arg("u_l"), py::arg("v_l"),
              py::arg("y_r") = py::none(), py::arg("u_r") = py::none(), py::arg("v_r") = py::none(),
-             "Upload the 6 YUV planes (uint8 2-D arrays; right planes optional for 2D).")
+             py::arg("width"), py::arg("height"),
+             "Copy the 6 YUV planes (uint8 arrays; right planes optional for 2D) into the ring buffer.")
         .def("set_subtitle_rgba",
              [](sylc::NativeRenderer& r,
                 py::array_t<uint8_t, py::array::c_style | py::array::forcecast> a) {
@@ -808,9 +824,12 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
                  const uint32_t h = static_cast<uint32_t>(a.shape(0));
                  const uint32_t w = static_cast<uint32_t>(a.shape(1));
                  const uint32_t stride = static_cast<uint32_t>(a.strides(0));
-                 return r.upload_subtitle(a.data(), w, h, stride);
+                 const uint8_t* ptr = a.data();
+                 py::gil_scoped_release release;
+                 return r.upload_subtitle(ptr, w, h, stride);
              },
-             py::arg("rgba"), "Upload an HxWx4 uint8 RGBA subtitle overlay.")
+             py::arg("rgba"),
+             "Upload an HxWx4 uint8 RGBA subtitle overlay.")
         .def("clear_frame", &sylc::NativeRenderer::clear_frame,
              "Forget the current frame (present() falls back to black).")
         .def("pause", &sylc::NativeRenderer::pause,
@@ -822,7 +841,10 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
         .def("is_paused", &sylc::NativeRenderer::is_paused)
         .def("backend_info", &sylc::NativeRenderer::backend_info)
         .def("last_error", &sylc::NativeRenderer::last_error)
-        .def("shutdown", &sylc::NativeRenderer::shutdown);
+        .def("shutdown", &sylc::NativeRenderer::shutdown,
+             py::call_guard<py::gil_scoped_release>(),
+             "Release all D3D resources. Idempotent.");
+
     m.attr("NATIVE_RENDERER_AVAILABLE") = true;
 #else
     m.attr("NATIVE_RENDERER_AVAILABLE") = false;

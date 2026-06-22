@@ -7,6 +7,8 @@ cbuffer buf : register(b0)
     float4 _401_subtitle_rect : packoffset(c1);
     float _401_sdr_white_level : packoffset(c2);
     float _401_output_gamma : packoffset(c2.y);
+    float _401_fp_vfill : packoffset(c2.z);
+    float _401_fp_hfill : packoffset(c2.w);
 };
 
 Texture2D<float4> texSubtitle : register(t0);
@@ -227,25 +229,46 @@ void frag_main()
     {
         if (_401_stereo_mode == 1)
         {
+            // FramePack: top eye + 45px gap + bottom eye. Each eye is letterboxed
+            // into its 1080-tall slot using fp_vfill/fp_hfill (derived from the source
+            // aspect) so a non-16:9 eye (e.g. Full-SBS 1920x1012) keeps its native
+            // resolution with black bars instead of a vertical stretch. A 16:9 eye
+            // (MVC) has fp_vfill=fp_hfill=1 and fills the slot exactly (unchanged).
+            float vbar = (1.0f - _401_fp_vfill) * 0.5f;
+            float hbar = (1.0f - _401_fp_hfill) * 0.5f;
             if (y_flipped < 0.4897958934307098388671875f)
             {
-                float local_y = y_flipped / 0.4897958934307098388671875f;
-                float2 uv_1 = float2(v_texCoord.x, local_y);
-                float2 param_1 = uv_1;
-                float3 _534 = sampleYUV(texY_L, _texY_L_sampler, texU_L, _texU_L_sampler, texV_L, _texV_L_sampler, param_1);
-                rgb = _534;
-                videoUV = uv_1;
+                float ly = y_flipped / 0.4897958934307098388671875f;
+                if (ly < vbar || ly > (1.0f - vbar) || v_texCoord.x < hbar || v_texCoord.x > (1.0f - hbar))
+                {
+                    rgb = 0.0f.xxx;
+                    videoUV = (-1.0f).xx;
+                }
+                else
+                {
+                    float2 uv_1 = float2((v_texCoord.x - hbar) / _401_fp_hfill, (ly - vbar) / _401_fp_vfill);
+                    float2 param_1 = uv_1;
+                    rgb = sampleYUV(texY_L, _texY_L_sampler, texU_L, _texU_L_sampler, texV_L, _texV_L_sampler, param_1);
+                    videoUV = uv_1;
+                }
             }
             else
             {
                 if (y_flipped > 0.5102040767669677734375f)
                 {
-                    float local_y_1 = (y_flipped - 0.5102040767669677734375f) / 0.4897958934307098388671875f;
-                    float2 uv_2 = float2(v_texCoord.x, local_y_1);
-                    float2 param_2 = uv_2;
-                    float3 _556 = sampleYUV(texY_R, _texY_R_sampler, texU_R, _texU_R_sampler, texV_R, _texV_R_sampler, param_2);
-                    rgb = _556;
-                    videoUV = uv_2;
+                    float ly2 = (y_flipped - 0.5102040767669677734375f) / 0.4897958934307098388671875f;
+                    if (ly2 < vbar || ly2 > (1.0f - vbar) || v_texCoord.x < hbar || v_texCoord.x > (1.0f - hbar))
+                    {
+                        rgb = 0.0f.xxx;
+                        videoUV = (-1.0f).xx;
+                    }
+                    else
+                    {
+                        float2 uv_2 = float2((v_texCoord.x - hbar) / _401_fp_hfill, (ly2 - vbar) / _401_fp_vfill);
+                        float2 param_2 = uv_2;
+                        rgb = sampleYUV(texY_R, _texY_R_sampler, texU_R, _texU_R_sampler, texV_R, _texV_R_sampler, param_2);
+                        videoUV = uv_2;
+                    }
                 }
                 else
                 {

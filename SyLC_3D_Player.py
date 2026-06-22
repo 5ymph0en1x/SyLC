@@ -444,18 +444,10 @@ try:
     print("[STARTUP] OK MVCDecoderThread imported")
 
     # D3D11 NATIVE rendering for HDR preservation in fullscreen
-    try:
-        from framepacking_window_d3d11 import Framepacking3DWindow, FramepackingDisplayWidget
-        print("[STARTUP] OK Framepacking3DWindow (D3D11 NATIVE HDR) imported")
-    except ImportError as e1:
-        # Fallback to hybrid (OpenGL windowed + D3D11 fullscreen)
-        try:
-            from framepacking_window_hybrid import Framepacking3DWindow, FramepackingDisplayWidget
-            print(f"[STARTUP] Native D3D11 not available ({e1}), using HYBRID")
-        except ImportError as e2:
-            # Last resort: pure OpenGL version
-            from framepacking_window import Framepacking3DWindow, FramepackingDisplayWidget
-            print(f"[STARTUP] Hybrid not available ({e2}), using OpenGL")
+    # Directive 2: the detached 3D window hosts the native C++ D3D11 renderer.
+    # The Qt RHI widget + the OpenGL/hybrid fallbacks are gone.
+    from framepacking_window_d3d11 import Framepacking3DWindow
+    print("[STARTUP] OK Framepacking3DWindow (native C++ D3D11 HDR) imported")
 
     # Sync Tracer for pipeline diagnostics (V7 feature)
     try:
@@ -491,6 +483,32 @@ except ImportError as e:
 print(f"[STARTUP] MVC_SUPPORT_AVAILABLE = {MVC_SUPPORT_AVAILABLE}")
 print(f"[STARTUP] SYNC_TRACER_AVAILABLE = {SYNC_TRACER_AVAILABLE}")
 print(f"[STARTUP] PGS_SUBTITLE_AVAILABLE = {PGS_SUBTITLE_AVAILABLE if 'PGS_SUBTITLE_AVAILABLE' in dir() else False}")
+
+# Containers edge264 can decode H.264 from. The native C++ demuxer handles
+# MKV/M2TS/TS/SSIF; the libavformat-backed demuxer (lavf_h264_demuxer, task #391)
+# adds MP4/AVI/MOV/FLV/WebM/raw when the bundled ffmpeg DLLs are present. Any
+# edge264 failure on these degrades to mpv via _fallback_from_edge264 (#388).
+try:
+    import lavf_h264_demuxer as _lavf
+    _LAVF_AVAILABLE = _lavf.is_available()
+except Exception:
+    _LAVF_AVAILABLE = False
+EDGE264_CONTAINERS = ('.mkv', '.mk3d', '.m2ts', '.ts')
+if _LAVF_AVAILABLE:
+    EDGE264_CONTAINERS = EDGE264_CONTAINERS + ('.mp4', '.m4v', '.mov', '.avi', '.flv',
+                                               '.wmv', '.webm', '.mpg', '.mpeg',
+                                               '.h264', '.264', '.avc')
+print(f"[STARTUP] LAVF (MP4/AVI/raw via edge264) = {_LAVF_AVAILABLE}")
+
+# Native C++ D3D11 renderer availability — the SOLE video render path since the
+# Directive 2 cutover (Qt RHI removed). edge264 routing requires it; without it,
+# mpv handles everything.
+try:
+    import mvc_demuxer_cpp as _mdc_native
+    NATIVE_RENDER_AVAILABLE = bool(getattr(_mdc_native, 'NATIVE_RENDERER_AVAILABLE', False))
+except Exception:
+    NATIVE_RENDER_AVAILABLE = False
+print(f"[STARTUP] NATIVE_RENDER_AVAILABLE = {NATIVE_RENDER_AVAILABLE}")
 
 
 # =============================================================================
@@ -2168,6 +2186,11 @@ class PlayerWindow(QMainWindow):
         self._playback_timer = QTimer(self)
         self._playback_timer.setInterval(100)  # V7b: 100ms refresh for smoother timeline progression
         self._playback_timer.timeout.connect(self._update_playback_position)
+
+        # Audio VU meter: poll mpv's real audio levels (astats af-metadata) at ~30 Hz
+        self._vu_timer = QTimer(self)
+        self._vu_timer.setInterval(33)
+        self._vu_timer.timeout.connect(self._poll_audio_levels)
         self._last_mvc_timestamp = 0.0  # V7b: Store last MVC frame timestamp for timeline updates
         self._last_timeline_update_time = 0.0 # V7b: Store real time of last update for interpolation
         self._current_precise_time = 0.0 # V7b: High-precision float tracker for timeline
@@ -2243,7 +2266,9 @@ class PlayerWindow(QMainWindow):
         The user requested to remove 3D Vision verification entirely.
         """
         self.is_3d_capable = True
-        self.controls_overlay.mode_3d_button.setEnabled(True)
+        # The 3D button starts disabled (no media yet); _update_3d_button_state() enables
+        # it only when genuine 3D content (MVC / SBS / TAB) is loaded.
+        self.controls_overlay.mode_3d_button.setEnabled(False)
         logger.info("[3D] 3D capabilities forced ENABLED (Validation removed).")
 
     def show_3d_notification(self, message, success=True, permanent=False):
@@ -2347,6 +2372,7 @@ class PlayerWindow(QMainWindow):
             self.player = mpv.MPV(**mpv_config)
             self.player['msg-level'] = 'all=info'
             logger.info("MPV instance created successfully.")
+            self._vu_timer.start()   # begin polling audio levels for the VU meter
 
             # FIX: Delay property observers to let MPV event thread fully initialize
             # This prevents the "Windows fatal exception: code 0xe24c4a02" error
@@ -3242,6 +3268,8 @@ class PlayerWindow(QMainWindow):
                 logger.warning(f"[MPV] Error stopping player: {e}")
 
         self.has_media = False
+        self._update_3d_button_state()   # no media → lock the 3D button off
+        self.controls_overlay.clear_format_badge()   # drop the 3D-format badge
         self.update_ui_state()
         self.controls_overlay.set_status_info("Ready")
         self.controls_overlay.set_time(0)
@@ -3624,6 +3652,18 @@ class PlayerWindow(QMainWindow):
 
     def toggle_3d_mode(self, enabled):
         """Enables or disables 3D mode."""
+        if enabled and not self._content_is_3d():
+            # 2D content: refuse 3D — toggling it mis-drives the MVC pipeline on a
+            # plain 2D stream (runaway speed + audio desync). Keep the button off.
+            try:
+                btn = self.controls_overlay.mode_3d_button
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.blockSignals(False)
+            except Exception:
+                pass
+            self.show_3d_notification("2D video — 3D mode unavailable", success=False)
+            return
         self.is_3d_enabled = enabled
         if self.has_media:
             self.configure_3d_output(enabled, self.current_stereo_mode)
@@ -3650,6 +3690,51 @@ class PlayerWindow(QMainWindow):
         self.current_stereo_mode = mode
         if self.has_media and self.is_3d_enabled:
             self.configure_3d_output(True, mode)
+
+    def _content_is_3d(self):
+        """True iff the loaded media is genuinely stereoscopic (MVC / SBS / TAB),
+        not a plain 2D file. Drives the 3D button's availability."""
+        info = getattr(self, 'video_3d_info', None)
+        if not info:
+            return False
+        return bool(info.get('is_3d')) or info.get('stereo_mode') not in (None, 'none')
+
+    def _update_3d_button_state(self):
+        """Enable the 3D button only for real 3D content with media loaded; lock it off
+        for 2D files so 3D can't be toggled on a 2D video (which mis-drives the MVC
+        pipeline → runaway speed + audio desync)."""
+        try:
+            btn = self.controls_overlay.mode_3d_button
+        except Exception:
+            return
+        capable = self._content_is_3d() and getattr(self, 'has_media', False)
+        if capable:
+            btn.setEnabled(True)
+            btn.setToolTip("Toggle 3D mode")
+        else:
+            if btn.isChecked():
+                btn.blockSignals(True)
+                btn.setChecked(False)
+                btn.blockSignals(False)
+            btn.setEnabled(False)
+            btn.setToolTip("2D video — 3D unavailable")
+
+    def _format_badge_label(self):
+        """Adaptive 3D-format label for the controls badge, or None for 2D content.
+        Width/height tell full vs half packing (Full-SBS at 3840 vs SBS at 1920)."""
+        info = getattr(self, 'video_3d_info', None)
+        if not info:
+            return None
+        sm = info.get('stereo_mode')
+        w = info.get('width') or 0
+        h = info.get('height') or 0
+        if sm == 'mvc' or info.get('has_mvc_track'):
+            return "MVC 3D"
+        if sm == 'sbs':
+            return "Full-SBS 3D" if w >= 2560 else "SBS 3D"
+        if sm == 'tab':
+            return "Full-TAB 3D" if h >= 1600 else "TAB 3D"
+        return None
 
     def change_audio_track(self, track_id):
         if not (self.has_media and self.player):
@@ -4226,6 +4311,57 @@ class PlayerWindow(QMainWindow):
         self._update_archive_button_state()
         logger.info("[ARCHIVE] playback lock released")
 
+    # ===================== Audio VU meter =====================
+    def _ensure_vu_af(self):
+        """Attach the astats audio filter to mpv (label 'vu') if absent, so
+        af-metadata/vu exposes per-channel RMS/peak. Idempotent + self-healing."""
+        try:
+            chain = self.player._get_property('af') or []
+            if not any(isinstance(f, dict) and f.get('label') == 'vu' for f in chain):
+                self.player.command('af', 'add', '@vu:lavfi=[astats=metadata=1:reset=1]')
+        except Exception:
+            pass
+
+    @staticmethod
+    def _db_to_unit(s, floor=-50.0):
+        """Map a dBFS reading (e.g. '-21.0', '-inf') to a 0..1 meter level."""
+        try:
+            db = float(s)
+        except (TypeError, ValueError):
+            return 0.0
+        if db != db or db <= floor:            # NaN / -inf / below floor
+            return 0.0
+        return max(0.0, min(1.0, (db - floor) / (0.0 - floor)))
+
+    def _poll_audio_levels(self):
+        """Drive the VU meter from mpv's real-time audio levels (~30 Hz)."""
+        vu = getattr(getattr(self, 'controls_overlay', None), 'vu_meter', None)
+        if vu is None:
+            return
+        p = self.player
+        if p is None or not getattr(self, 'has_media', False) or getattr(self, '_archiving', False):
+            vu.set_levels(0.0, 0.0)
+            return
+        try:
+            if p.pause:                         # paused → let the bars fall to silence
+                vu.set_levels(0.0, 0.0)
+                return
+        except Exception:
+            pass
+        try:
+            md = p._get_property('af-metadata/vu')
+        except Exception:
+            md = None
+            self._ensure_vu_af()                # filter missing (new file / new mpv) → (re)attach
+        if not md:
+            vu.set_levels(0.0, 0.0)
+            return
+        rl = self._db_to_unit(md.get('lavfi.astats.1.RMS_level'))
+        rr = self._db_to_unit(md.get('lavfi.astats.2.RMS_level', md.get('lavfi.astats.1.RMS_level')))
+        pl = self._db_to_unit(md.get('lavfi.astats.1.Peak_level'))
+        pr = self._db_to_unit(md.get('lavfi.astats.2.Peak_level', md.get('lavfi.astats.1.Peak_level')))
+        vu.set_levels(max(rl, rr), max(pl, pr))   # overall level (+ transient peak)
+
     def dragEnterEvent(self, event):
         """Accept drag of files/folders (including a Blu-ray drive or BDMV folder)."""
         try:
@@ -4613,6 +4749,7 @@ class PlayerWindow(QMainWindow):
     def _continue_play_file(self, file_path):
         """Continue loading file after cleanup delay."""
         self.current_file_path = file_path
+        self._edge264_consecutive_crashes = 0  # fresh source: reset edge264 crash streak
         self._update_archive_button_state()  # archive button lights up only for a Blu-ray disc
 
         # V7b CRITICAL FIX: Reset timeline IMMEDIATELY to prevent stale duration from previous video
@@ -4751,6 +4888,7 @@ class PlayerWindow(QMainWindow):
             logger.info("[LOAD] analyze_and_configure_3d completed")
 
             self.has_media = True
+            self._update_3d_button_state()   # 3D button enabled only for genuine 3D content
             # self.metrics_overlay.show() # Disabled to remove top-left artifact
             self.player.play(file_path)
             self.player.pause = True
@@ -4867,11 +5005,18 @@ class PlayerWindow(QMainWindow):
             self.video_3d_info = Video3DAnalyzer.analyze_file(file_path)
 
         # SOL 1A: Set MVC flag IMMEDIATELY (before _start_mvc_decoder)
-        # Allows the timer to stay active as soon as player.pause = True
-        if self.video_3d_info.get('stereo_mode') == 'mvc':
-            self._mvc_file_detected = True
-        else:
-            self._mvc_file_detected = False
+        # Allows the timer to stay active as soon as player.pause = True.
+        # Packed-stereo H.264 (SBS/TAB) is also edge264-decoded, so it keeps the
+        # flag set too (timeline timer / pause / 3D-button gating treat it alike).
+        _sm = self.video_3d_info.get('stereo_mode')
+        _cn = (self.video_3d_info.get('codec_name') or '').lower()
+        _cx = (self.video_3d_info.get('container_ext') or '').lower()
+        self._mvc_file_detected = (
+            _sm == 'mvc'
+            or (_sm in ('sbs', 'tab') and _cn == 'h264'
+                and _cx in EDGE264_CONTAINERS)
+        )
+        self._update_3d_button_state()
 
         # V7b CRITICAL FIX: DO NOT update the timeline with the ffprobe duration
         # The timeline will be updated ONLY by _update_timeline_and_start_playback with MPV
@@ -4907,7 +5052,13 @@ class PlayerWindow(QMainWindow):
                 # V7b CRITICAL FIX: Force decoder to start at 0s, not at current MPV time
                 # This prevents the "21.955s drift" bug where decoder starts at wrong timestamp
                 if MVC_SUPPORT_AVAILABLE:
-                    self._start_mvc_decoder(start_time=0.0)
+                    try:
+                        self._start_mvc_decoder(start_time=0.0)
+                    except Exception as e:
+                        # edge264 first, mpv only on failure: don't crash the load —
+                        # degrade to mpv and stop configuring the 3D window.
+                        self._fallback_from_edge264(reason=f"MVC decoder init failed: {e}")
+                        return
                 else:
                     logger.warning("[MVC] MVC content detected but decoder support is unavailable; using mpv fallback.")
                     self._fallback_to_mpv_mvc()
@@ -4915,11 +5066,45 @@ class PlayerWindow(QMainWindow):
                 # It's specifically designed for 1920x2205 framepack output!
                 if self.framepacking_window:
                     self.framepacking_window.display_widget.set_stereo_mode('framepack')
+                # Reassure the user: edge264 recognised & adapted to this 3D stream.
+                self.controls_overlay.set_format_badge(self._format_badge_label())
 
                 # 3D button starts OFF - user must manually enable 3D mode
                 # (Previously auto-enabled if Nvidia 3D Vision was active)
+            elif stereo_mode in ('sbs', 'tab'):
+                # Packed-stereo H.264 (Full-SBS / Full-TAB): edge264 decodes EVERY
+                # H.264 stream. The decoded frame carries BOTH eyes;
+                # _on_mvc_frame_yuv_ready splits it into L (base eye) + R, so the
+                # player drives it EXACTLY like MVC:
+                #   - main window default = the BASE view (left/top eye), '2d' mode
+                #   - SBS/TAB combo       = the main view's layout (L|R or L/R)
+                #   - FramePack window    = the two views stacked at full resolution
+                # Same containers as the 2D edge264 path; mpv fallback only on failure.
+                codec = (self.video_3d_info.get('codec_name') or '').lower()
+                ext = (self.video_3d_info.get('container_ext') or '').lower()
+                if (MVC_SUPPORT_AVAILABLE and codec == 'h264'
+                        and ext in EDGE264_CONTAINERS
+                        and NATIVE_RENDER_AVAILABLE):
+                    logger.info(f"[PACKED-3D] {stereo_mode.upper()} H.264 ({ext}) via edge264 (split L/R, like MVC)")
+                    try:
+                        self._start_mvc_decoder(start_time=0.0)
+                        # Main window shows the BASE view (left/top eye) by default.
+                        if hasattr(self, 'mvc_embedded_widget') and self.mvc_embedded_widget:
+                            self.mvc_embedded_widget.set_stereo_mode('2d')
+                        # FramePack window ready to stack BOTH views (shown on 3D toggle).
+                        if self.framepacking_window:
+                            self.framepacking_window.display_widget.set_stereo_mode('framepack')
+                        # Reassure the user: edge264 recognised & adapted to this stream.
+                        self.controls_overlay.set_format_badge(self._format_badge_label())
+                    except Exception as e:
+                        self._fallback_from_edge264(reason=f"{stereo_mode} edge264 init failed: {e}")
+                        return
+                else:
+                    # Non-h264 packed stereo, or unsupported container -> mpv (original).
+                    self._present_via_mpv_native()
         else:
             # 2D content detected
+            self.controls_overlay.clear_format_badge()  # no 3D badge for 2D content
             self.show_3d_notification("2D content detected", success=True, permanent=True)
 
             # === 2D-via-edge264 path ===
@@ -4932,12 +5117,15 @@ class PlayerWindow(QMainWindow):
             # MPV stays audio-only (no more MPV vo glitches on 2D files).
             codec = (self.video_3d_info.get('codec_name') or '').lower()
             ext = (self.video_3d_info.get('container_ext') or '').lower()
+            # Containers edge264 can demux: MKV/M2TS/TS via the C++ demuxer; MP4/AVI/
+            # MOV/FLV/WebM/raw via lavf_h264_demuxer (task #391). Any edge264 failure
+            # degrades to mpv via _fallback_from_edge264 (the 2D try/except below).
             eligible_2d = (MVC_SUPPORT_AVAILABLE
                            and codec == 'h264'
-                           and ext == '.mkv'
-                           and 'FramepackingDisplayWidget' in globals())
+                           and ext in EDGE264_CONTAINERS
+                           and NATIVE_RENDER_AVAILABLE)
             if eligible_2d:
-                logger.info(f"[2D-EDGE264] Routing 2D H.264 MKV through edge264 decoder")
+                logger.info(f"[2D-EDGE264] Routing 2D H.264 ({ext}) through edge264 decoder")
                 try:
                     self._start_mvc_decoder(start_time=0.0)
                     # Force every render target to 2D mode (left eye only,
@@ -4948,8 +5136,8 @@ class PlayerWindow(QMainWindow):
                         self.framepacking_window.display_widget.set_stereo_mode('2d')
                     self.show_3d_notification("2D edge264 decoder active", success=True, permanent=True)
                 except Exception as e:
-                    logger.error(f"[2D-EDGE264] Failed to start edge264 for 2D: {e}")
-                    self._present_via_mpv_native()  # edge264 failed -> MPV plays natively
+                    # edge264 first, mpv only on failure (unified fallback path).
+                    self._fallback_from_edge264(reason=f"2D edge264 init failed: {e}")
             else:
                 # 2D not edge264-eligible (non-h264, or non-.mkv: .mp4/.avi/.m2ts/VC-1…):
                 # MPV plays it natively. If a 3D/MVC file was loaded before, MPV video was
@@ -5007,11 +5195,19 @@ class PlayerWindow(QMainWindow):
         is_sbs = stereo_mode == 'sbs'
         is_tab = stereo_mode == 'tab'
 
-        # Determine if we should use the MVC decoder
-        # We use it if the CONTENT is MVC, regardless of the desired output mode (FramePack, SBS, TAB)
+        # Packed-stereo H.264 (SBS/TAB) is edge264-decoded but DISPLAYED as the full
+        # anamorphic frame in the MAIN window (never framepack — that is MVC only).
+        _detected_in = (self.video_3d_info.get('stereo_mode') if self.video_3d_info else None)
+        _pcodec = (self.video_3d_info.get('codec_name') or '').lower() if self.video_3d_info else ''
+        _pext = (self.video_3d_info.get('container_ext') or '').lower() if self.video_3d_info else ''
+        packed_input = (_detected_in in ('sbs', 'tab') and _pcodec == 'h264'
+                        and _pext in EDGE264_CONTAINERS)
+
+        # Use the edge264 decoder for MVC content (any output) AND packed-stereo H.264.
         use_mvc_decoder = (MVC_SUPPORT_AVAILABLE and self.current_file_path and
                            (self.video_3d_info.get('stereo_mode') == 'mvc' or
-                            self.video_3d_info.get('has_mvc_track')))
+                            self.video_3d_info.get('has_mvc_track') or
+                            packed_input))
 
         if use_mvc_decoder:
             try:
@@ -5050,6 +5246,9 @@ class PlayerWindow(QMainWindow):
 
                 elif stereo_mode in ('sbs', 'tab'):
                     # --- SBS/TAB Mode in MAIN WINDOW ---
+                    # Packed-stereo (FSBS) reaches here too: edge264 split gives L/R,
+                    # so the embedded 'sbs'/'tab' shader lays the base+right eye out
+                    # as the requested main-view layout. (combo 'mvc' -> FramePack above.)
                     # User preference: SBS/TAB displays in main window, only MVC uses detached window
                     if hasattr(self, 'mvc_embedded_widget'):
                         # Hide framepacking window if visible
@@ -5086,6 +5285,15 @@ class PlayerWindow(QMainWindow):
             else:
                 self._fallback_to_mpv_mvc()
 
+    def _make_display_widget(self):
+        """Create the video display widget — the native C++ D3D11 renderer, the SOLE
+        render path since the Directive 2 cutover (Qt RHI removed). It self-queries
+        the display SDR white level for HDR. If it can't be created, the caller's
+        try/except degrades to mpv (#388)."""
+        from native_renderer.native_framepack_widget import NativeFramepackWidget
+        logger.info("[RENDER] display widget = NativeFramepackWidget (C++ D3D11)")
+        return NativeFramepackWidget()
+
     def _start_mvc_decoder(self, start_time=None):
         if getattr(self, "_mvc_restarting", False):
             logger.info("[MVC INIT] Skipped: _mvc_restarting is True (init in progress)")
@@ -5096,7 +5304,7 @@ class PlayerWindow(QMainWindow):
             return
         self._mvc_restarting = True
         print(f"[MVC INIT] V33j: Starting decoder (start_time={start_time})")
-        if not MVC_SUPPORT_AVAILABLE or 'FramepackingDisplayWidget' not in globals():
+        if not MVC_SUPPORT_AVAILABLE or not NATIVE_RENDER_AVAILABLE:
             logger.warning("[MVC] Decoder start requested but MVC support is unavailable. Falling back to mpv.")
             self._mvc_restarting = False
             self._fallback_to_mpv_mvc()
@@ -5164,7 +5372,7 @@ class PlayerWindow(QMainWindow):
         try:
             # 1. Prepare Embedded Widget (for 2D)
             if not hasattr(self, 'mvc_embedded_widget'):
-                self.mvc_embedded_widget = FramepackingDisplayWidget()
+                self.mvc_embedded_widget = self._make_display_widget()
 
             # Ensure it's in the stack
             if self.video_stack.indexOf(self.mvc_embedded_widget) == -1:
@@ -5172,24 +5380,15 @@ class PlayerWindow(QMainWindow):
 
             # 2. Prepare Detached Window (for 3D FramePack)
             if not self.framepacking_window:
-                # S5a cutover: when SYLC_NATIVE_RENDER=1, the detached 3D window is
-                # rendered by the native C++ D3D11 renderer instead of Qt RHI. Opt-in
-                # and revertible; the Qt path stays the default.
-                _native_dw = None
-                if os.environ.get("SYLC_NATIVE_RENDER") == "1":
-                    try:
-                        from native_renderer.native_framepack_widget import NativeFramepackWidget
-                        _sdrw = getattr(self.mvc_embedded_widget, '_sdr_white_level', 1.0)
-                        _native_dw = NativeFramepackWidget(sdr_white=_sdrw)
-                        _native_dw.set_stereo_mode('framepack')
-                        logger.info("[NATIVE-RENDER] Detached 3D window uses NativeFramepackWidget")
-                    except Exception as _e:
-                        logger.warning(f"[NATIVE-RENDER] native widget unavailable, using Qt: {_e}")
-                        _native_dw = None
+                # Directive 2: the detached 3D window is rendered by the native C++
+                # D3D11 renderer (sole render path; the Qt RHI widget was removed).
+                # The widget self-queries the display SDR white level (HDR).
+                _dw = self._make_display_widget()
+                _dw.set_stereo_mode('framepack')
                 self.framepacking_window = Framepacking3DWindow(
                     parent=None,
                     use_yuv_shader=USE_GPU_YUV_CONVERSION,
-                    display_widget=_native_dw
+                    display_widget=_dw
                 )
                 self.framepacking_window.visibilityChanged.connect(self._on_framepacking_visibility_changed)
 
@@ -5350,19 +5549,35 @@ class PlayerWindow(QMainWindow):
             pass
 
     def _on_mvc_decoder_crashed(self):
-        """Slot triggered when the decoder thread signals an unrecoverable crash."""
+        """Slot triggered when the decoder thread signals an unrecoverable crash.
+
+        edge264 restart-on-crash is *intentional* resilience against transient
+        source corruption (historical root cause = a flaky optical drive). We
+        keep that recovery, but cap consecutive crashes that produce no good
+        frame in between: a persistently unusable stream then degrades to mpv
+        instead of looping forever.
+        """
         if not self.mvc_mode_active:
             return  # Avoid restart loops if we already exited MVC mode
 
-        logger.warning("[PLAYER] MVC decoder reported an unrecoverable error. Attempting to restart...")
-
         # Get the current audio/video time from the main player to resume from that point
         resume_time = self._current_mpv_time()
+
+        self._edge264_consecutive_crashes = getattr(self, '_edge264_consecutive_crashes', 0) + 1
+        cap = getattr(self, '_EDGE264_CRASH_CAP', 3)
+        if self._edge264_consecutive_crashes > cap:
+            logger.error(f"[PLAYER] edge264 crashed {self._edge264_consecutive_crashes}x "
+                         f"consecutively (cap {cap}) with no recovery — degrading to mpv.")
+            self._fallback_from_edge264(
+                reason=f"{self._edge264_consecutive_crashes} consecutive crashes")
+            return
 
         # The _start_mvc_decoder method already handles stopping the old thread.
         # We call it again to create a fresh decoder instance.
         # A short delay is added to prevent rapid-fire crash loops if the source is persistently corrupt.
         # Increased to 500ms to allow MPV internals to stabilize (fixes 0xe24c4a02 exception).
+        logger.warning(f"[PLAYER] MVC decoder crash {self._edge264_consecutive_crashes}/{cap}; "
+                       f"restarting for transient-corruption recovery...")
         self.show_3d_notification("Decoder recovering...", success=False)
         QTimer.singleShot(500, lambda: self._start_mvc_decoder(start_time=resume_time))
 
@@ -5453,6 +5668,58 @@ class PlayerWindow(QMainWindow):
             logger.info("[2D-MPV] Restored MPV native video output + switched to video_widget")
         except Exception as e:
             logger.warning(f"[2D-MPV] present-via-mpv failed: {e}")
+
+    def _fallback_from_edge264(self, reason=""):
+        """edge264 could not handle this H.264 stream -> degrade gracefully to mpv.
+
+        Implements the architecture rule "edge264 first, mpv only on failure":
+        tear down the edge264 pipeline and hand the source to mpv's own video
+        output. We do NOT assume mpv can decode it -- a raw .ssif, for instance,
+        may have no mpv-demuxable video -- so _confirm_mpv_fallback_video() checks
+        for a real decoded video track afterwards and reports honestly (2D
+        playback vs audio-only) instead of silently showing a black frame.
+        """
+        if reason:
+            logger.warning(f"[EDGE264-FALLBACK] {reason}")
+        self.mvc_mode_active = False
+        try:
+            self.controls_overlay.clear_format_badge()  # edge264 didn't adapt → drop the badge
+        except Exception:
+            pass
+        try:
+            self._stop_mvc_decoder()
+        except Exception:
+            pass
+        # Degrading to 2D: the framepack 3D window must not linger on a frozen frame.
+        fp = getattr(self, 'framepacking_window', None)
+        if fp is not None:
+            try:
+                if fp.isVisible():
+                    fp.hide()
+            except Exception:
+                pass
+        # Hand the file to mpv's native video output (idempotent). mpv has been
+        # decoding audio all along, so its position is already correct -- no seek.
+        self._present_via_mpv_native()
+        # mpv reconfigures its video chain asynchronously; verify before claiming.
+        QTimer.singleShot(700, self._confirm_mpv_fallback_video)
+
+    def _confirm_mpv_fallback_video(self, attempt=0):
+        """Honest post-fallback status: did mpv actually land a decoded video track?"""
+        try:
+            has_video = bool(self.player and self.player.video_params)
+        except Exception:
+            has_video = False
+        if has_video:
+            self.show_3d_notification(
+                "edge264 couldn't decode this stream — playing via mpv.", success=False)
+        elif attempt < 1:
+            # video chain may still be reconfiguring; re-check once before concluding.
+            QTimer.singleShot(700, lambda: self._confirm_mpv_fallback_video(attempt + 1))
+        else:
+            self.show_3d_notification(
+                "edge264 failed and mpv has no video for this source — audio only.",
+                success=False)
 
     def _restore_mpv_video_output(self):
         """Restore mpv video output after MVC playback failures/stop."""
@@ -5777,6 +6044,31 @@ class PlayerWindow(QMainWindow):
         self.framepacking_window.display_widget.set_frame_fast(frame_array)
         self._record_display_frame_stats()
 
+    @staticmethod
+    def _split_packed_stereo(planes, mode):
+        """Split one packed-stereo YUV420 frame (Full-SBS / Full-TAB) into (L, R).
+
+        edge264 decodes a packed-stereo H.264 stream as a single view, so both
+        eyes live in one frame. SBS = left|right halves (split on width) → L is the
+        LEFT (base) eye; TAB = top/bottom halves (split on height) → L is the TOP
+        (base) eye. Chroma is half-resolution, so it splits at half the luma
+        boundary. Returns two (Y, U, V) tuples, each made contiguous for upload.
+        With this split the player drives the FSBS exactly like MVC: base view in
+        the main window, SBS/TAB combo = main-view layout, FramePack = L+R stacked.
+        """
+        y, u, v = planes
+        if mode == 'sbs':
+            wy, wc = y.shape[1] // 2, u.shape[1] // 2
+            left = (y[:, :wy], u[:, :wc], v[:, :wc])
+            right = (y[:, wy:wy * 2], u[:, wc:wc * 2], v[:, wc:wc * 2])
+        else:  # 'tab'
+            hy, hc = y.shape[0] // 2, u.shape[0] // 2
+            left = (y[:hy], u[:hc], v[:hc])
+            right = (y[hy:hy * 2], u[hc:hc * 2], v[hc:hc * 2])
+        L = tuple(np.ascontiguousarray(p) for p in left)
+        R = tuple(np.ascontiguousarray(p) for p in right)
+        return L, R
+
     @Slot(object, object)
     def _on_mvc_frame_yuv_ready(self, left_planes, right_planes):
         """Dispatch one decoded MVC frame to every visible render target.
@@ -5791,6 +6083,23 @@ class PlayerWindow(QMainWindow):
             return
         for plane in (*left_planes, *right_planes):
             if plane is None or not isinstance(plane, np.ndarray):
+                return
+
+        # A valid frame means edge264 is healthy again — clear the crash streak so
+        # transient (recoverable) crashes never accumulate toward the fallback cap.
+        if getattr(self, '_edge264_consecutive_crashes', 0):
+            self._edge264_consecutive_crashes = 0
+
+        # Packed-stereo (Full-SBS / Full-TAB): edge264 delivered both eyes in ONE
+        # frame. Split into separate L (base) / R views so every target renders it
+        # like MVC — embedded '2d' shows the base eye, '2d'/'sbs'/'tab' set the main
+        # layout, and the framepack window stacks L+R.
+        _sm = self.video_3d_info.get('stereo_mode') if isinstance(self.video_3d_info, dict) else None
+        if _sm in ('sbs', 'tab'):
+            try:
+                left_planes, right_planes = self._split_packed_stereo(left_planes, _sm)
+            except Exception as e:
+                logger.error(f"[PACKED-3D] frame split failed: {e}")
                 return
 
         # Enumerate currently visible targets, deduplicated by identity
@@ -5856,16 +6165,10 @@ class PlayerWindow(QMainWindow):
         # CRITICAL: Disable MVC mode immediately to prevent the watchdog from restarting
         self.mvc_mode_active = False
 
-        # Full cleanup of the MVC decoder (but watchdog already stopped)
-        self._stop_mvc_decoder()
-
-        # Inform the user - ANY fatal decoder error
-        self.show_3d_notification(
-            "Fatal MVC decoder error — audio-only playback.\n"
-            "edge264 bug detected.",
-            success=False
-        )
-        logger.info("[MVC ERROR] Fallback to audio-only playback")
+        # edge264 first, mpv only on failure: hand the source to mpv's native
+        # video output rather than going dark. The helper stops the decoder,
+        # restores mpv video, and reports honestly (2D playback vs audio-only).
+        self._fallback_from_edge264(reason=f"fatal decoder error: {error_msg}")
 
     @Slot(float)
     def _on_mvc_fps_update(self, fps):

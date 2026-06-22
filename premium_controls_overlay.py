@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import shutil
 import logging
+import math
 from concurrent.futures import ThreadPoolExecutor
 import time
 
@@ -1178,6 +1179,103 @@ class PremiumSeparator(QWidget):
 # PREMIUM CONTROLS OVERLAY - MAIN WIDGET
 # =============================================================================
 
+class PremiumSpectrumMeter(QWidget):
+    """Audio-reactive spectrum-style visualiser fed by the player's real mpv level.
+
+    A wide row of slim cyan bars with a pleasant spectral arch + lively per-band
+    motion, so it dances with the music and fills the transport gap. Sober and
+    on-theme. (mpv exposes overall level, not true FFT bands, so the per-band
+    motion is a level-driven envelope rather than literal frequency content.)
+    """
+    BANDS = 22
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(180, 40)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setToolTip("Audio spectrum")
+        n = self.BANDS
+        self._h = [0.0] * n          # smoothed bar heights 0..1
+        self._level = 0.0            # latest overall level 0..1
+        self._peak = 0.0             # latest transient peak 0..1
+        self._phase = 0.0
+        self._env = []               # fixed spectral arch (fuller mids, taper highs)
+        self._rate = []              # varied per-band wiggle speeds
+        for i in range(n):
+            x = i / (n - 1)
+            env = 0.40 + 0.60 * max(0.0, math.sin(math.pi * (0.12 + 0.76 * x)))
+            env *= (1.0 - 0.30 * x)
+            self._env.append(env)
+            self._rate.append(0.6 + 1.6 * ((i * 0.37 + 0.13) % 1.0))
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.setInterval(33)  # ~30 fps, only runs while there's signal
+
+    def set_levels(self, level, peak=None):
+        """Feed the overall normalized level (0..1); peak adds a transient kick."""
+        self._level = max(0.0, min(1.0, float(level)))
+        if peak is not None:
+            self._peak = max(self._peak, max(0.0, min(1.0, float(peak))))
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def _tick(self):
+        self._phase += 0.16
+        lvl = self._level
+        n = self.BANDS
+        active = lvl > 0.003
+        for i in range(n):
+            wig = 0.5 + 0.5 * math.sin(self._phase * self._rate[i] + i * 1.7)
+            wig2 = 0.5 + 0.5 * math.sin(self._phase * self._rate[i] * 0.6 + i * 0.7 + 2.1)
+            tg = lvl * self._env[i] * (0.5 + 0.7 * wig * wig2)
+            tg = min(1.0, tg + self._peak * 0.18 * wig)
+            cur = self._h[i]
+            cur += (tg - cur) * (0.60 if tg > cur else 0.22)   # fast attack, slow release
+            if cur < 0.001 and tg < 0.001:
+                cur = 0.0
+            self._h[i] = cur
+            if cur > 0.003:
+                active = True
+        self._peak *= 0.90            # transient bleeds away between polls
+        self.update()
+        if not active:
+            self._timer.stop()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        if not p.isActive():
+            return
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        n = self.BANDS
+        top, bot = 6.0, h - 6.0
+        span = bot - top
+        gap = 2.5
+        bar_w = max(2.0, (w - gap * (n + 1)) / n)
+        rad = min(2.0, bar_w / 2.0)
+        grad = QLinearGradient(0, top, 0, bot)
+        grad.setColorAt(0.0, QColor(150, 233, 255))
+        grad.setColorAt(0.4, QColor(40, 196, 255))
+        grad.setColorAt(1.0, QColor(8, 90, 130))
+        x = gap
+        for i in range(n):
+            # unlit track
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(255, 255, 255, 12))
+            p.drawRoundedRect(QRectF(x, top, bar_w, span), rad, rad)
+            v = self._h[i]
+            if v > 0.003:
+                lit_top = bot - v * span
+                p.save()
+                clip = QPainterPath()
+                clip.addRoundedRect(QRectF(x, top, bar_w, span), rad, rad)
+                p.setClipPath(clip)
+                p.setBrush(QBrush(grad))
+                p.drawRect(QRectF(x, lit_top, bar_w, bot - lit_top))
+                p.restore()
+            x += bar_w + gap
+
+
 class PremiumControlsOverlay(QWidget):
     """
     Ultra-modern premium controls bar for SyLC 3D player.
@@ -1326,6 +1424,23 @@ class PremiumControlsOverlay(QWidget):
         self.mode_3d_button.setCheckable(True)
         self.mode_3d_button.setToolTip("Toggle 3D mode")
 
+        # 3D format badge — a contextual cyan pill shown ONLY when a stereoscopic
+        # stream is detected & adapted by edge264, so the user sees the player
+        # recognised the stream. Hidden by default; the player sets the adaptive
+        # label (Full-SBS 3D / SBS 3D / Full-TAB 3D / TAB 3D / MVC 3D).
+        self.format_badge = QLabel()
+        self.format_badge.setObjectName("formatBadge")
+        self.format_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.format_badge.setStyleSheet(
+            "#formatBadge {"
+            " color: #7FEBFF;"
+            " background-color: rgba(45, 212, 255, 0.13);"
+            " border: 1px solid rgba(45, 212, 255, 0.55);"
+            " border-radius: 9px; padding: 2px 10px;"
+            " font-size: 11px; font-weight: 700; letter-spacing: 0.4px; }"
+        )
+        self.format_badge.hide()
+
         # Stereo mode combo
         self.stereo_mode_combo = QComboBox()
         self.stereo_mode_combo.addItems(["MVC", "Side-by-Side", "Top-Bottom"])
@@ -1349,6 +1464,12 @@ class PremiumControlsOverlay(QWidget):
         # right_group.addWidget(sep1)
 
 
+        # Audio spectrum visualiser — fills the gap between the transport and the 3D controls
+        self.vu_meter = PremiumSpectrumMeter()
+        right_group.addWidget(self.vu_meter)
+        right_group.addSpacing(12)
+        right_group.addWidget(self.format_badge)
+        right_group.addSpacing(6)
         right_group.addWidget(self.mode_3d_button)
         right_group.addWidget(self.stereo_mode_combo)
         right_group.addWidget(sep2)
@@ -1468,6 +1589,19 @@ class PremiumControlsOverlay(QWidget):
         """Updates the status badge. (NO-OP: Badge removed)"""
         # self.status_badge.set_status(text, status_type, active)
         pass
+
+    def set_format_badge(self, text, tooltip="Decoded by edge264"):
+        """Show the contextual 3D-format badge (only for detected stereo streams)."""
+        if not text:
+            self.clear_format_badge()
+            return
+        self.format_badge.setText(text)
+        self.format_badge.setToolTip(tooltip)
+        self.format_badge.show()
+
+    def clear_format_badge(self):
+        """Hide the 3D-format badge (2D content / stopped / mpv fallback)."""
+        self.format_badge.hide()
 
     def set_tech_info(self, resolution="", fps="", codec=""):
         """Updates the technical info."""
