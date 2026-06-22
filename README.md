@@ -9,7 +9,7 @@
 
 *Stereoscopic 3D Blu-ray (MVC) playback, decoded from scratch, rendered in native HDR — given to the community, no strings attached.*
 
-![Version](https://img.shields.io/badge/version-4.0.0-1f6feb?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-4.1.0-1f6feb?style=for-the-badge)
 ![Platform](https://img.shields.io/badge/Windows-x64%20%7C%20ARM64-0078D6?style=for-the-badge&logo=windows&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.14-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/license-free%20%26%20open--source-2ea44f?style=for-the-badge)
@@ -38,6 +38,7 @@ As far as we know, it is **the only actively-developed, open-source player that 
 ## What makes it unique
 
 - 🧬 **It doesn't lean on FFmpeg for the hard part.** The 3D is decoded by a custom in-house H.264/**MVC** decoder that reconstructs *both* views — the thing mainstream players can't do.
+- 🎞️ **Every H.264 runs on the in-house decoder.** Not just MVC — plain 2D, **Full-SBS (FSBS)**, and H.264 in **MP4 / AVI / MOV / raw** all decode through edge264 and its pipeline; mpv is only a fallback for other codecs.
 - 🌈 **True HDR, not a tone-mapped fake.** Frames land in a 16-bit-float **scRGB** Direct3D 11 swapchain; a GPU shader does YUV→RGB and the stereo frame-packing in one pass. HDR10/PQ is preserved end to end.
 - 🥽 **Real 3D output.** Frame-packed stereo to a detached window for 3D TVs, projectors and HMDs — plus an embedded 2D preview.
 - 🎯 **Pixel-exact.** The decoder's luma output has been verified byte-for-byte against FFmpeg's base view. It's not "close enough" — it's correct.
@@ -58,8 +59,8 @@ This project extends it into a real **MVC (Annex H)** decoder: a second *depende
 ### 2. The demuxer — pulling two eyes out of one container
 A dedicated **C++ demuxer** (pybind11, on top of **libmatroska/libebml**) opens the MKV, finds the MVC track, and de-interleaves the base and dependent NAL units into the exact order the decoder expects — feeding a zero-copy ring buffer so decode never waits on I/O.
 
-### 3. The renderer — HDR all the way to the panel
-Decoded YUV planes are uploaded straight to the GPU. A **Direct3D 11** shader converts colour and assembles the stereo frame inside an **RGBA16F (scRGB)** HDR surface — the format Windows uses for native HDR — so there is no SDR round-trip and no OpenGL→DXGI copy tax. **4.0.0 adds a second, ground-up _native C++ D3D11 engine_** (code-named *Tokyo #3*) that takes decoded planes **straight into D3D11 textures** with no per-frame Python/Qt copy — lower latency and less memory churn. It runs the *byte-for-byte same shader* as the Qt path and is **opt-in during rollout** (`SYLC_NATIVE_RENDER=1`), with a live A/B tap to compare the two on real discs; the Qt renderer stays the default/fallback while the native engine is validated across displays.
+### 3. The renderer — HDR all the way to the panel, in native C++ D3D11
+Decoded YUV planes are uploaded straight to the GPU. A **Direct3D 11** shader converts colour and assembles the stereo frame inside an **RGBA16F (scRGB)** HDR surface — the format Windows uses for native HDR — so there is no SDR round-trip and no OpenGL→DXGI copy tax. As of **4.1.0 the renderer is a ground-up _native C++ D3D11 engine_** (code-named *Tokyo #3*) that takes decoded planes **straight into D3D11 textures** with no per-frame Python/Qt copy — lower latency and less memory churn. It was pixel-validated byte-for-byte against the previous Qt renderer on real 3D hardware, and now **fully replaces it** — the Qt/RHI path is gone. For **Full-SBS** content each eye is **letterboxed into its frame-pack slot, never stretched**, so per-eye resolution is preserved.
 
 ### 4. The real-time problem — and the Python GIL
 Audio rides on **libmpv**; video is slaved to mpv's clock so the two stay locked. But MVC decode is **single-threaded** (the multiview decoder isn't thread-safe), which makes timing brutal: decoding a single key frame can take ~100 ms, and on a naïve loop that froze the picture once per GOP — a visible hitch every second. The fix was to **decouple presentation from decoding** (a dedicated presenter thread with back-pressure so the buffer absorbs the spikes) and then to wrestle the **CPython GIL** itself — `sys.setswitchinterval(0.0005)` was the decisive change that stopped the decode thread from starving the presenter. Result on a dense scene: **16 fps with 33 % dropped frames → a steady 24 fps with zero drops.**
@@ -82,13 +83,15 @@ This is the kind of work that doesn't show up in a feature list — but it's the
 ## Features
 
 - **3D MVC playback** — H.264 Stereo High (profile 128), both views decoded in-house.
-- **Direct3D 11 rendering** with **HDR (PQ)** preservation and high-quality scaling — Qt/RHI by default, plus an **opt-in native C++ D3D11 engine** (`SYLC_NATIVE_RENDER=1`).
+- **All H.264 through edge264** — MVC, plain 2D, and **Full-SBS (FSBS)** all decode in-house; **mpv is only a fallback** for non-H.264 codecs or if edge264 can't handle a stream.
+- **Full-SBS (FSBS) 3D** — one H.264 stream carrying both eyes is detected, split, and frame-packed (each eye **letterboxed, not stretched**); a contextual on-screen badge confirms the detected format.
+- **Native C++ Direct3D 11 rendering** with **HDR (PQ)** preservation and high-quality scaling — the sole render path (the legacy Qt/RHI engine was removed in 4.1.0).
 - **Frame-packed 3D output** (detached window) + embedded 2D view.
-- **Matroska (MKV)** input with an MVC track, via the native demuxer.
+- **Broad container support** — **MKV / MP4 / AVI / MOV / FLV / WebM / raw `.h264`** (the native C++ demuxer + a libavformat-backed demuxer), all decoded by edge264.
 - **Raw Blu-ray streams** — plays **SSIF** (3D) and **M2TS** (2D) directly, *no remux*, with frame-accurate seeking.
 - **Open a whole Blu-ray** — point SyLC at a **disc/drive, a BDMV folder, or an `.iso`**; the feature film is auto-detected by **duration-based main-title detection** (3D SSIF preferred, 2D otherwise). ISO images are **auto-mounted without admin rights** and released on exit.
 - **Archive a Blu-ray to ISO** — image the disc you're playing to a **byte-perfect `.iso`** from inside the player (no admin, no external tool); resilient to a flaky drive, with optional **SHA-256** verification.
-- **Broad 2D compatibility** — any 2D video plays through libmpv (H.264 / VC-1 / MPEG-2…), including **2D Blu-rays**, at the correct aspect.
+- **Non-H.264 compatibility** — VC-1 / MPEG-2 / HEVC… (incl. **2D Blu-rays**) play through libmpv at the correct aspect.
 - **PGS (Blu-ray) subtitles** — streamed in real time, **labelled by language** (from the disc's CLPI), and shown on **both the 3D and the 2D** views.
 - **Live A/V sync trim** to cancel your system's audio-output latency — nudge it by ear with `[` and `]`.
 - **Instant, smooth seeking** — no post-seek lag.
@@ -107,8 +110,8 @@ This is the kind of work that doesn't show up in a feature list — but it's the
 
 | Platform | Asset | Notes |
 |---|---|---|
-| **Windows x64** | `SyLC_3D_Player_v4.0.0_win-x64.exe` | Single self-contained file. Built for the **x86-64-v3 (AVX2)** baseline — runs natively on any AVX2 CPU (Haswell 2013+ / Zen 1+). |
-| **Windows on ARM** | `SyLC_3D_Player_v4.0.0_win-arm64.zip` | Portable folder, **100 % native ARM64** (Snapdragon / Adreno) — every binary cross-compiled to aarch64, zero x64 emulation. |
+| **Windows x64** | `SyLC_3D_Player_v4.1.0_win-x64.exe` | Single self-contained file. Built for the **x86-64-v3 (AVX2)** baseline — runs natively on any AVX2 CPU (Haswell 2013+ / Zen 1+). |
+| **Windows on ARM** | `SyLC_3D_Player_v4.1.0_win-arm64.zip` | Portable folder, **100 % native ARM64** (Snapdragon / Adreno) — every binary cross-compiled to aarch64, zero x64 emulation. |
 
 The decoder's SIMD hot loop is compiled for each architecture's vector unit (AVX2 / NEON), so you get the real silicon, not a translation layer.
 
@@ -128,7 +131,7 @@ The decoder's SIMD hot loop is compiled for each architecture's vector unit (AVX
 ## Get started
 
 1. Download the asset for your platform from **Releases**.
-2. **x64:** run `SyLC_3D_Player_v4.0.0_win-x64.exe`. **ARM64:** unzip and run `SyLC_3D_Player.exe`.
+2. **x64:** run `SyLC_3D_Player_v4.1.0_win-x64.exe`. **ARM64:** unzip and run `SyLC_3D_Player.exe`.
 3. Open your 3D content — a **MKV**, a raw **`.ssif` / `.m2ts`**, a **BDMV folder**, or a Blu-ray **`.iso`** (drag-and-drop, the **Open file** button, or the **disc** button). Send the frame-packed window to your 3D display and enjoy.
 
 Nothing to install. Everything — decoder, demuxer, audio, codecs, Python runtime — is bundled.
@@ -172,13 +175,13 @@ Prerequisites: **Python 3.14**, `pip install -r requirements.txt` + `nuitka` + `
       │ YUV planes
       ▼
  ┌──────────────┐   YUV→RGB + stereo frame-packing in one GPU pass
- │  D3D11 / RHI │   RGBA16F (scRGB) HDR swapchain
+ │ Native D3D11 │   RGBA16F (scRGB) HDR swapchain
  │  HDR shader  │ ──────────────►  3D display / projector / HMD
  └──────────────┘
                     audio ── libmpv ──► clock that video is slaved to
 ```
 
-*4.0.0 adds an opt-in **native C++ D3D11** renderer alongside the Qt/RHI path above (`SYLC_NATIVE_RENDER=1`), feeding decoded planes straight into D3D11 textures with no per-frame Python/Qt copy.*
+*As of 4.1.0 the **native C++ D3D11** renderer above is the sole render path (the Qt/RHI engine was removed); decoded planes go straight into D3D11 textures with no per-frame Python/Qt copy. Full-SBS eyes are letterboxed into the frame-pack slot, not stretched.*
 
 ---
 
@@ -202,5 +205,4 @@ Prerequisites: **Python 3.14**, `pip install -r requirements.txt` + `nuitka` + `
 *If SyLC brought one of your discs back to life, that's the whole reward. Long live open source. 🥂*
 
 </div>
-
 
