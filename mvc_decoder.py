@@ -537,6 +537,175 @@ def find_nal_units(data: bytes):
         start = next_start
 
 # -----------------------------------------------------------------------------
+def _apply_bd_seek_tables(demuxer, filepath):
+    """Load Blu-ray frame-accurate seek tables (CLPI EP_map + SSIF exact extent map)
+    onto `demuxer` for the clip at `filepath`. Best-effort — the dual-file PTS
+    binary-search seek works without it. Shared by the single-clip path and by
+    SequenceDemuxer (which calls it for each segment at a junction)."""
+    try:
+        clpi = _find_clpi_for_media(filepath) if hasattr(demuxer, "set_base_seek_table") else None
+        if clpi:
+            pts_ms, byte_off = _parse_clpi_epmap(clpi)
+            if pts_ms:
+                demuxer.set_base_seek_table(pts_ms, byte_off)
+                logger.info(f"[BD-SEEK] EP_map seek table: {len(pts_ms)} entries from {os.path.basename(clpi)}")
+            # BD3D EXACT seek map: combine the EP_map with the CLPI Extent Start Point
+            # tables to land on the precise interleaved-unit boundary in the .ssif (clean
+            # RAPI, both views present). Preferred over the EP_map size-ratio estimate;
+            # falls back to it silently when the extent tables aren't on disc.
+            if hasattr(demuxer, "set_ssif_seek_table"):
+                dep_clpi, base_m2ts, dep_m2ts = _derive_bd_companion_paths(clpi)
+                s_pts, s_byte = _build_ssif_seek_table(clpi, dep_clpi, base_m2ts, dep_m2ts)
+                if s_pts:
+                    demuxer.set_ssif_seek_table(s_pts, s_byte)
+                    logger.info(f"[BD-SEEK] SSIF exact seek map: {len(s_pts)} IDR->unit entries (byte-exact)")
+                else:
+                    logger.info("[BD-SEEK] SSIF exact map unavailable (no extent tables) — EP_map ratio fallback in use")
+    except Exception as e:
+        logger.warning(f"[BD-SEEK] EP_map/SSIF seek-map load skipped: {e}")
+
+
+class SequenceDemuxer:
+    """Plays a Blu-ray feature split into several seamless-branching segments
+    (e.g. 00016->00020->00022->00026->00028) as ONE continuous MVC stream, so the
+    decoder/player can treat a multi-clip feature exactly like a single clip.
+
+    Wraps one MVCSSIFDemuxer at a time (the 'current' segment) and:
+      - read_next_frame_pair() delegates to the current segment; at that segment's EOS
+        it transparently opens the NEXT segment and continues, returning success=False
+        only after the LAST segment. Every returned timestamp is shifted by the
+        segment's global start so the decoder sees one global timeline (matching the
+        mpv EDL audio clock).
+      - seek(global_ms) maps the global time to (segment, local) and switches segments.
+      - get_external_duration / cues are made sequence-safe; any other attribute is
+        delegated to the current segment's demuxer.
+    Each segment gets its own CLPI EP_map / SSIF exact seek table and its own clip
+    duration, so frame-accurate seeking keeps working per clip.
+    """
+
+    def __init__(self, segments, make_demuxer):
+        # segments: ordered [{'path': ssif, 'duration_s': float, ...}]
+        self._segments = list(segments)
+        self._make = make_demuxer                 # callable () -> a fresh MVCSSIFDemuxer
+        self._offsets_ms = []                     # cumulative global start (ms) per segment
+        acc = 0
+        for s in self._segments:
+            self._offsets_ms.append(acc)
+            acc += int(round(float(s.get('duration_s', 0.0)) * 1000))
+        self._total_ms = acc
+        self._idx = 0
+        self._inner = None
+        self._offset_ms = 0
+        self._primed = False                      # current inner has read >=1 frame (seek-ready)
+        self.clip_changed = False                 # True right after an auto-advance (junction hook)
+
+    def _open_segment(self, i):
+        seg = self._segments[i]
+        inner = self._make()
+        if not inner.open(seg['path']):
+            logger.error(f"[SEQ-DEMUX] failed to open segment {i+1}: {seg['path']}")
+            return False
+        try:
+            if hasattr(inner, 'set_external_duration_ms') and seg.get('duration_s'):
+                inner.set_external_duration_ms(int(round(float(seg['duration_s']) * 1000)))
+        except Exception:
+            pass
+        _apply_bd_seek_tables(inner, seg['path'])
+        if self._inner is not None and self._inner is not inner:
+            try: self._inner.close()
+            except Exception: pass
+        self._inner = inner
+        self._idx = i
+        self._offset_ms = self._offsets_ms[i]
+        self._primed = False                      # fresh demuxer: must read >=1 frame before seek
+        logger.info(f"[SEQ-DEMUX] Segment {i+1}/{len(self._segments)}: {os.path.basename(seg['path'])} "
+                    f"@ global {self._offset_ms/1000.0:.1f}s")
+        return True
+
+    def _shift(self, d):
+        """Shift a frame dict's timestamp into the global timeline."""
+        if d is not None:
+            try:
+                ts = d.get('timestamp')
+                if ts is not None:
+                    d['timestamp'] = ts + self._offset_ms
+            except Exception:
+                pass
+        return d
+
+    # ---- demuxer interface the decoder thread relies on ----
+    def open(self, _path=None):
+        return self._open_segment(0)
+
+    def read_next_frame_pair(self):
+        while True:
+            success, base, dep = self._inner.read_next_frame_pair()
+            if success:
+                self._primed = True               # this inner is now seek-ready
+                return True, self._shift(base), self._shift(dep)
+            if self._idx + 1 < len(self._segments):
+                logger.info(f"[SEQ-DEMUX] junction: segment {self._idx+1} EOS -> next")
+                if self._open_segment(self._idx + 1):
+                    self.clip_changed = True
+                    continue
+            return False, None, None  # true end-of-feature
+
+    def seek(self, global_ms):
+        global_ms = max(0, int(global_ms))
+        i = 0
+        for k in range(len(self._segments)):
+            if self._offsets_ms[k] <= global_ms:
+                i = k
+            else:
+                break
+        local_ms = global_ms - self._offsets_ms[i]
+        if i != self._idx or self._inner is None:
+            if not self._open_segment(i):
+                return False
+        # A freshly-(re)opened SSIF demuxer only seeks correctly after reading >=1 frame
+        # (the first read initialises its interleaved-stream / PTS state); otherwise seek()
+        # snaps back to the clip start. Prime it once — the frame is discarded since we seek
+        # away immediately. (Junctions don't hit this: they read from the start sequentially.)
+        if not self._primed:
+            try:
+                self._inner.read_next_frame_pair()
+            except Exception:
+                pass
+            self._primed = True
+        try:
+            return bool(self._inner.seek(int(local_ms))) if hasattr(self._inner, 'seek') else True
+        except Exception as e:
+            logger.warning(f"[SEQ-DEMUX] inner seek error: {e}")
+            return False
+
+    def set_external_duration_ms(self, _ms):
+        # per-clip durations are applied when each segment opens; ignore the global value
+        return None
+
+    def getCuesTimestamps(self):
+        # force the robust exact-table + linear-scan seek path per clip (per-clip cues
+        # would be local, mismatching the global seek target)
+        return []
+
+    def getLastCueTimestamp(self):
+        # disable the cue-based base_timestamp path: the wrapper returns GLOBAL timestamps,
+        # so the seek handler must anchor on the (global) target, not a per-clip local cue.
+        return -1
+
+    def close(self):
+        if self._inner is not None:
+            try: self._inner.close()
+            except Exception: pass
+            self._inner = None
+
+    def __getattr__(self, name):
+        # delegate anything not overridden to the current segment's demuxer
+        inner = self.__dict__.get('_inner')
+        if inner is None:
+            raise AttributeError(name)
+        return getattr(inner, name)
+
+
 # MVC Decoding Thread
 # -----------------------------------------------------------------------------
 class MVCDecoderThread(QThread):
@@ -561,10 +730,14 @@ class MVCDecoderThread(QThread):
 
     def __init__(self, filepath, shared_buffer, parent=None,
                  use_gpu_yuv_conversion=True, store_frame_struct_for_gpu=True,
-                 start_position=0.0, threads=4, media_duration=None):
+                 start_position=0.0, threads=4, media_duration=None,
+                 feature_segments=None):
         super().__init__(parent)
         self.filepath = filepath
         self.demuxer = None  # Lazy init in run()
+        # Multi-segment (seamless-branching) Blu-ray feature: ordered
+        # [{'path','m2ts','duration_s'}]. None or a single segment => normal single clip.
+        self._feature_segments = feature_segments if (feature_segments and len(feature_segments) > 1) else None
         self.shared_buffer = shared_buffer
         self._media_duration = media_duration  # seconds (float) or None
         
@@ -999,6 +1172,11 @@ class MVCDecoderThread(QThread):
         # Extrapolate based on time elapsed since the value last changed
         return base_clock + elapsed
 
+    def _setup_seek_tables(self):
+        """Load the Blu-ray frame-accurate seek tables for the current single clip.
+        (Multi-segment features set their tables per clip inside SequenceDemuxer.)"""
+        _apply_bd_seek_tables(self.demuxer, self.filepath)
+
     def _init_demuxer(self):
         """Initializes the appropriate demuxer based on file extension."""
         if self.demuxer: return True
@@ -1009,7 +1187,14 @@ class MVCDecoderThread(QThread):
 
             logger.info(f"[MVC-THREAD] Initializing demuxer for {ext}...")
 
-            if ext == '.ssif':
+            if self._feature_segments and ext == '.ssif':
+                # Seamless-branching feature: play the ordered SSIF segments as one
+                # continuous stream (timestamps shifted to a global timeline matching
+                # the mpv EDL). The decoder loop sees a normal demuxer.
+                logger.info(f"[MVC-THREAD] Multi-segment feature: {len(self._feature_segments)} SSIF "
+                            f"segments -> SequenceDemuxer (seamless branching)")
+                self.demuxer = SequenceDemuxer(self._feature_segments, mvc_demuxer_cpp.MVCSSIFDemuxer)
+            elif ext == '.ssif':
                 # SSIF = Blu-ray 3D metadata file pointing to 2 separate M2TS streams
                 # Requires MVCSSIFDemuxer which parses extent table and opens both streams
                 logger.info("[MVC-THREAD] Using MVCSSIFDemuxer (Blu-ray 3D SSIF)")
@@ -1065,30 +1250,10 @@ class MVCDecoderThread(QThread):
             except Exception as e:
                 logger.warning(f"[MVC-THREAD] Could not set external duration hint: {e}")
 
-            # Frame-accurate SSIF/M2TS seeking: feed the base-view EP_map (PTS->byte) from the
-            # Blu-ray .clpi so the demuxer lands exactly on an IDR instead of binary-searching.
-            # Best-effort — the dual-file PTS binary-search seek works fine without it.
-            try:
-                clpi = _find_clpi_for_media(self.filepath) if hasattr(self.demuxer, "set_base_seek_table") else None
-                if clpi:
-                    pts_ms, byte_off = _parse_clpi_epmap(clpi)
-                    if pts_ms:
-                        self.demuxer.set_base_seek_table(pts_ms, byte_off)
-                        logger.info(f"[MVC-THREAD] EP_map seek table: {len(pts_ms)} entries from {os.path.basename(clpi)}")
-                    # BD3D EXACT seek map: combine the EP_map with the CLPI Extent Start Point
-                    # tables to land on the precise interleaved-unit boundary in the .ssif (clean
-                    # RAPI, both views present). Preferred over the EP_map size-ratio estimate;
-                    # falls back to it silently when the extent tables aren't on disc.
-                    if hasattr(self.demuxer, "set_ssif_seek_table"):
-                        dep_clpi, base_m2ts, dep_m2ts = _derive_bd_companion_paths(clpi)
-                        s_pts, s_byte = _build_ssif_seek_table(clpi, dep_clpi, base_m2ts, dep_m2ts)
-                        if s_pts:
-                            self.demuxer.set_ssif_seek_table(s_pts, s_byte)
-                            logger.info(f"[MVC-THREAD] SSIF exact seek map: {len(s_pts)} IDR->unit entries (byte-exact)")
-                        else:
-                            logger.info("[MVC-THREAD] SSIF exact map unavailable (no extent tables) — EP_map ratio fallback in use")
-            except Exception as e:
-                logger.warning(f"[MVC-THREAD] EP_map/SSIF seek-map load skipped: {e}")
+            # Frame-accurate seeking: a single clip loads its EP_map/SSIF map here; a
+            # multi-segment SequenceDemuxer sets each clip's tables itself per segment.
+            if not isinstance(self.demuxer, SequenceDemuxer):
+                self._setup_seek_tables()
 
             logger.info("[MVC-THREAD] Demuxer opened successfully")
 

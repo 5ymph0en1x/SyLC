@@ -3060,8 +3060,13 @@ class PlayerWindow(QMainWindow):
         try:
             new_time = None
             
-            # 1. Try MVC Timestamp (Most accurate for video)
-            if self.mvc_mode_active and hasattr(self, '_last_mvc_timestamp') and self._last_mvc_timestamp > 0.1:
+            # 1. Try MVC Timestamp (most accurate for SINGLE-clip video). For a multi-segment
+            # (seamless-branching) feature the decoder's frame timestamp is per-clip and snaps
+            # back at each segment junction, so we use mpv's continuous GLOBAL edl:// clock
+            # instead (step 2 below) — proven continuous across junctions.
+            _multi_segment = bool(getattr(self, '_pending_feature_segments', None))
+            if (self.mvc_mode_active and not _multi_segment
+                    and hasattr(self, '_last_mvc_timestamp') and self._last_mvc_timestamp > 0.1):
                  # Check if it actually moved
                 if not hasattr(self, '_prev_mvc_ts') or self._last_mvc_timestamp > self._prev_mvc_ts:
                     new_time = self._last_mvc_timestamp
@@ -4629,6 +4634,10 @@ class PlayerWindow(QMainWindow):
         if getattr(self, '_archiving', False):
             self.show_3d_notification("ISO copy in progress — playback unavailable", success=False)
             return
+        # Reset multi-segment (seamless-branching) feature state for every load; set below
+        # only when a disc feature spans several SSIF segments (an edl:// URI, no temp file).
+        self._pending_feature_segments = None
+        self._feature_edl_uri = None
         try:
             import bluray_disc
             from PySide6.QtWidgets import QApplication
@@ -4668,6 +4677,21 @@ class PlayerWindow(QMainWindow):
                     label = "3D feature" if kind == 'ssif' else "2D feature"
                     self.show_3d_notification(f"{label}: {os.path.basename(feat)} ({mins:.0f} min)", success=True)
                     file_path = feat
+                    # Seamless-branching 3D feature spanning several SSIF segments: build a
+                    # matching mpv EDL (continuous audio on one timeline) + remember the
+                    # ordered segment sequence so the decoder plays them as one film.
+                    _segs = info.get('segments') or []
+                    if kind == 'ssif' and len(_segs) > 1:
+                        try:
+                            _uri = bluray_disc.build_feature_edl(_segs)
+                            if _uri:
+                                self._pending_feature_segments = _segs
+                                self._feature_edl_uri = _uri
+                                logger.info(f"[DISC] Multi-segment feature: {len(_segs)} SSIF segments via edl:// ({mins:.0f} min)")
+                        except Exception as _e:
+                            logger.warning(f"[DISC] Multi-segment EDL build failed ({_e}); first segment only")
+                            self._pending_feature_segments = None
+                            self._feature_edl_uri = None
                 else:
                     logger.info(f"[DISC] No feature found under: {file_path}")
                     self.show_3d_notification("No playable feature found on this disc/folder", success=False)
@@ -4890,7 +4914,10 @@ class PlayerWindow(QMainWindow):
             self.has_media = True
             self._update_3d_button_state()   # 3D button enabled only for genuine 3D content
             # self.metrics_overlay.show() # Disabled to remove top-left artifact
-            self.player.play(file_path)
+            # Multi-segment feature: mpv plays the EDL (continuous audio across all segments
+            # on one timeline); the decoder plays the matching SSIF sequence (SequenceDemuxer).
+            _mpv_src = getattr(self, '_feature_edl_uri', None) or file_path
+            self.player.play(_mpv_src)
             self.player.pause = True
             # V7b FIX: FORCE the timer to stay active even when paused for MVC mode
             # This lets the slider progress immediately
@@ -5432,7 +5459,8 @@ class PlayerWindow(QMainWindow):
                 store_frame_struct_for_gpu=STORE_FRAME_STRUCT_FOR_GPU,
                 start_position=actual_start_time,
                 threads=4,  # V7b FIX: Reduced to 4 to prevent edge264 deadlock (starvation)
-                media_duration=(self.player.duration or self.video_3d_info.get('duration') if self.video_3d_info else None)
+                media_duration=(self.player.duration or self.video_3d_info.get('duration') if self.video_3d_info else None),
+                feature_segments=getattr(self, '_pending_feature_segments', None)
             )
             self.mvc_decoder_thread.set_target_fps(self._get_effective_video_fps())
             # Push initial clock

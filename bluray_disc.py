@@ -67,20 +67,28 @@ def is_bluray_path(path):
     return resolve_bdmv_root(path) is not None
 
 
-def parse_mpls(path):
-    """Parse a .mpls PlayList. Returns (duration_seconds, [clip_names]) or (0.0, [])."""
+# A real feature — even a seamless-branched one — is built from DISTINCT segments, so
+# its "replay ratio" (total runtime / runtime of the distinct segments) is ~1. An anti-rip
+# "loop" decoy inflates its runtime by replaying the SAME (clip,in,out) segment many times
+# (e.g. an 81 s clip x200 = a fake 4.5 h playlist), so its ratio is large. That is the
+# signal used to discard decoys before ranking playlists by duration.
+_DECOY_REPLAY_RATIO = 1.5
+
+
+def _parse_mpls_full(path):
+    """Parse a .mpls PlayList. Returns a dict with 'duration_s', the ordered 'segments'
+    [(clip, in_45k, out_45k), ...] (repeats preserved) and 'clips' [names], or None."""
     try:
         with open(path, "rb") as f:
             data = f.read()
         if data[0:4] != b"MPLS":
-            return 0.0, []
+            return None
         playlist_start = struct.unpack(">I", data[8:12])[0]
         p = playlist_start
         # PlayList(): length(4), reserved(2), number_of_PlayItems(2), number_of_SubPaths(2)
         num_items = struct.unpack(">H", data[p + 6:p + 8])[0]
         q = p + 10
-        total_45k = 0
-        clips = []
+        segments = []
         for _ in range(num_items):
             item_len = struct.unpack(">H", data[q:q + 2])[0]
             body = data[q + 2:q + 2 + item_len]
@@ -89,12 +97,31 @@ def parse_mpls(path):
                 in_t = struct.unpack(">I", body[12:16])[0]
                 out_t = struct.unpack(">I", body[16:20])[0]
                 if out_t > in_t:
-                    total_45k += (out_t - in_t)
-                    clips.append(clip)
+                    segments.append((clip, in_t, out_t))
             q += 2 + item_len
-        return total_45k / 45000.0, clips
+        total_45k = sum(o - i for _, i, o in segments)
+        return {"duration_s": total_45k / 45000.0,
+                "segments": segments,
+                "clips": [c for c, _, _ in segments]}
     except Exception:
-        return 0.0, []
+        return None
+
+
+def parse_mpls(path):
+    """Parse a .mpls PlayList. Returns (duration_seconds, [clip_names]) or (0.0, [])."""
+    r = _parse_mpls_full(path)
+    return (r["duration_s"], r["clips"]) if r else (0.0, [])
+
+
+def _is_decoy_playlist(segments):
+    """True if a playlist looks like an anti-rip 'loop' decoy: its runtime is mostly
+    REPEATED footage (the same (clip,in,out) segment replayed). Real features — including
+    seamless-branched ones — are built from distinct segments, so they are never flagged."""
+    if len(segments) <= 1:
+        return False
+    total = sum(o - i for _, i, o in segments)
+    unique = sum(o - i for (_, i, o) in set(segments))
+    return unique > 0 and total > unique * _DECOY_REPLAY_RATIO
 
 
 def _safe_size(p):
@@ -127,11 +154,14 @@ def find_feature(path):
     has no SSIF (a plain 2D Blu-ray). Returns (feature_path, info); info['kind'] is
     'ssif' (3D) or 'm2ts' (2D), or (None, info) when nothing playable is found.
 
-    Main-title detection is duration-based (sum of PlayItem OUT-IN across each .mpls),
-    which is robust against the decoy/obfuscated playlists many discs ship.
+    Main-title detection ranks playlists by duration (sum of PlayItem OUT-IN) but first
+    discards anti-rip "loop" decoys (playlists whose runtime is mostly replayed footage),
+    so the obfuscated/decoy playlists many discs ship don't win over the real feature.
     """
     info = {"bdmv": None, "method": None, "duration_s": 0.0, "playlist": None,
-            "clip": None, "kind": None, "candidates_ssif": 0, "candidates_m2ts": 0}
+            "clip": None, "kind": None, "candidates_ssif": 0, "candidates_m2ts": 0,
+            "candidates_playlists": 0, "decoys_filtered": 0, "feature_clips": [],
+            "segments": []}
     bdmv = resolve_bdmv_root(path)
     info["bdmv"] = bdmv
     if not bdmv:
@@ -148,39 +178,73 @@ def find_feature(path):
     if not ssif_set and not m2ts_set:
         return None, info  # not a Blu-ray STREAM layout
 
-    # Parse every playlist once; consider the longest first.
-    playlists = []
+    # Parse every playlist once. We rank by duration but FIRST drop anti-rip "loop"
+    # decoys (playlists whose runtime is mostly replayed footage) — many discs ship a
+    # giant decoy (e.g. an 81 s clip looped x200 = a fake 4.5 h playlist) that a naive
+    # "longest playlist" pick mistakes for the feature. Non-decoys are tried first
+    # (longest-first); decoys are kept only as a last resort so detection never fails.
+    parsed = []  # (duration_s, segments, name)
+    seen_names = set()
     if os.path.isdir(playlist_dir):
         for mpls in glob.glob(os.path.join(playlist_dir, "*.mpls")) + \
                     glob.glob(os.path.join(playlist_dir, "*.MPLS")):
-            dur, clips = parse_mpls(mpls)
-            if dur > 0 and clips:
-                playlists.append((dur, clips, os.path.basename(mpls)))
-    playlists.sort(key=lambda t: t[0], reverse=True)
+            key = os.path.basename(mpls).lower()
+            if key in seen_names:
+                continue  # case-insensitive FS: *.mpls and *.MPLS match the same file
+            seen_names.add(key)
+            r = _parse_mpls_full(mpls)
+            if r and r["duration_s"] > 0 and r["segments"]:
+                parsed.append((r["duration_s"], r["segments"], os.path.basename(mpls)))
+    parsed.sort(key=lambda t: t[0], reverse=True)
 
-    # Phase 1 (3D): longest playlist whose clip resolves to an SSIF.
-    for dur, clips, name in playlists:
-        for c in clips:
-            if c in ssif_set:
-                info.update(method="mpls", duration_s=dur, playlist=name, clip=c, kind="ssif")
-                return ssif_set[c], info
-    # Phase 2 (2D): longest playlist whose clip resolves to an M2TS.
-    for dur, clips, name in playlists:
-        for c in clips:
-            if c in m2ts_set:
-                info.update(method="mpls", duration_s=dur, playlist=name, clip=c, kind="m2ts")
-                return m2ts_set[c], info
+    real = [pl for pl in parsed if not _is_decoy_playlist(pl[1])]
+    decoys = [pl for pl in parsed if _is_decoy_playlist(pl[1])]
+    info["candidates_playlists"] = len(parsed)
+    info["decoys_filtered"] = len(decoys)
+    ranked = real + decoys  # prefer non-decoys; both groups stay longest-first
 
-    # Phase 3: no usable playlist -> largest SSIF, else largest M2TS.
+    def _resolvable_sequence(segments, clip_set):
+        """The feature's playable segment sequence: the playlist's PlayItems (IN ORDER)
+        whose clip resolves in clip_set, as [{'clip','path','m2ts','duration_s'}, ...].
+        This is what multi-segment (seamless-branching) playback walks; the base .m2ts
+        carries the audio (for an mpv EDL), the resolved path carries the video. Empty
+        if nothing resolves."""
+        seq = []
+        for clip, in_t, out_t in segments:
+            if clip in clip_set:
+                seq.append({"clip": clip, "path": clip_set[clip],
+                            "m2ts": m2ts_set.get(clip),
+                            "duration_s": (out_t - in_t) / 45000.0})
+        return seq
+
+    # Phase 1 (3D): longest non-decoy playlist whose clips resolve to SSIF.
+    for dur, segments, name in ranked:
+        seq = _resolvable_sequence(segments, ssif_set)
+        if seq:
+            info.update(method="mpls", duration_s=dur, playlist=name, clip=seq[0]["clip"],
+                        kind="ssif", feature_clips=[s["clip"] for s in seq], segments=seq)
+            return seq[0]["path"], info
+    # Phase 2 (2D): longest non-decoy playlist whose clips resolve to M2TS.
+    for dur, segments, name in ranked:
+        seq = _resolvable_sequence(segments, m2ts_set)
+        if seq:
+            info.update(method="mpls", duration_s=dur, playlist=name, clip=seq[0]["clip"],
+                        kind="m2ts", feature_clips=[s["clip"] for s in seq], segments=seq)
+            return seq[0]["path"], info
+
+    # Phase 3: no usable playlist -> largest SSIF, else largest M2TS (single segment).
     if ssif_set:
         p = max(ssif_set.values(), key=_safe_size)
-        info.update(method="largest", kind="ssif",
-                    clip=os.path.splitext(os.path.basename(p))[0])
+        stem = os.path.splitext(os.path.basename(p))[0]
+        info.update(method="largest", kind="ssif", clip=stem, feature_clips=[stem],
+                    segments=[{"clip": stem, "path": p, "m2ts": m2ts_set.get(stem),
+                               "duration_s": 0.0}])
         return p, info
     if m2ts_set:
         p = max(m2ts_set.values(), key=_safe_size)
-        info.update(method="largest", kind="m2ts",
-                    clip=os.path.splitext(os.path.basename(p))[0])
+        stem = os.path.splitext(os.path.basename(p))[0]
+        info.update(method="largest", kind="m2ts", clip=stem, feature_clips=[stem],
+                    segments=[{"clip": stem, "path": p, "m2ts": p, "duration_s": 0.0}])
         return p, info
     return None, info
 
@@ -191,6 +255,32 @@ def find_feature_3d_ssif(path):
     if feat and info.get("kind") == "ssif":
         return feat, info
     return None, info
+
+
+def build_feature_edl(segments):
+    """Build an mpv `edl://` URI concatenating the base .m2ts of each feature segment into
+    ONE continuous, SEEKABLE timeline (the whole film's audio + master clock), while
+    edge264 renders the matching .ssif sequence. Returns "" for a single segment (no EDL
+    needed) — the caller then plays the clip directly.
+
+    Uses the edl:// PROTOCOL, not a `.edl` file: the bundled mpv does not recognise the
+    `.edl` extension ("Failed to recognize file format"), but the protocol works. Each
+    segment is length-prefixed (`%<bytes>%<path>`, safely quoting any path) with an
+    explicit `length=` so the total duration is known up front and seeking is reliable.
+    Validated against the bundled mpv: duration = sum of segments, absolute seek lands
+    across segment boundaries."""
+    segs = [s for s in (segments or []) if s.get("m2ts")]
+    if len(segs) < 2:
+        return ""  # single segment (or none): no EDL needed
+    parts = []
+    for s in segs:
+        p = s["m2ts"].replace("\\", "/")          # mpv accepts forward slashes on Windows
+        seg = f"%{len(p.encode('utf-8'))}%{p}"    # %<bytelen>% quotes paths with any char
+        dur = float(s.get("duration_s") or 0.0)
+        if dur > 0:
+            seg += f",length={dur:.3f}"
+        parts.append(seg)
+    return "edl://" + ";".join(parts)
 
 
 # ============================================================================
