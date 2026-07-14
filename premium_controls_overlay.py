@@ -27,10 +27,11 @@ from PySide6.QtWidgets import (
     QWidget, QSlider, QPushButton, QHBoxLayout, QVBoxLayout, QLabel,
     QComboBox, QSizePolicy, QGraphicsDropShadowEffect, QFrame
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QRectF, QPointF, QPropertyAnimation, QEasingCurve, Property, Slot
+from PySide6.QtCore import Qt, Signal, QTimer, QRectF, QPointF, QPoint, QPropertyAnimation, QEasingCurve, Property, Slot
 from PySide6.QtGui import (
     QPainter, QColor, QFont, QFontMetrics, QPen, QBrush,
-    QPainterPath, QLinearGradient, QRadialGradient, QConicalGradient, QPixmap
+    QPainterPath, QLinearGradient, QRadialGradient, QConicalGradient, QPixmap,
+    QImage, QGuiApplication
 )
 
 # (license/subscription system removed - freeware build)
@@ -78,7 +79,7 @@ def _extract_thumbnail_ffmpeg(video_file, time_pos):
             '-ss', str(time_pos),
             '-i', video_file,
             '-frames:v', '1',
-            '-vf', 'scale=160:-1',  # Slightly larger than old version
+            '-vf', 'scale=320:-1',  # XL tooltip (320x180)
             '-q:v', '5',
             '-y',
             temp_file
@@ -103,23 +104,80 @@ def _extract_thumbnail_ffmpeg(video_file, time_pos):
         return None
 
 
-class PreviewTooltip(QLabel):
-    """Widget to display the frame preview."""
+class PreviewTooltip(QWidget):
+    """XL hover preview: 320x180 thumbnail + hh:mm:ss pill, screen-clamped.
+
+    The tooltip follows the mouse on EVERY move (position + time pill update
+    immediately); only the image swaps asynchronously as thumbnails arrive."""
+    THUMB_W, THUMB_H, PILL_H, GAP, PAD = 320, 180, 26, 6, 2
 
     def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        super().__init__(parent, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedSize(160, 90)  # 16:9 aspect ratio
-        self.setStyleSheet("""
-            QLabel {
-                background: #1a1a1a;
-                border: 2px solid #00C8FF;
-                border-radius: 6px;
-            }
-        """)
-        self.setScaledContents(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setFixedSize(self.THUMB_W + 2 * self.PAD,
+                          self.THUMB_H + self.GAP + self.PILL_H + 2 * self.PAD)
+        self._pixmap = None
+        self._time_text = "00:00:00"
         self.hide()
+
+    def set_thumbnail(self, pixmap):
+        self._pixmap = pixmap
+        self.update()
+
+    def set_time_text(self, text):
+        if text != self._time_text:
+            self._time_text = text
+            self.update()
+
+    def clear(self):
+        self._pixmap = None
+        self.update()
+
+    # Back-compat shim: legacy ffmpeg path called setPixmap() on the QLabel version
+    def setPixmap(self, pixmap):
+        self.set_thumbnail(pixmap)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        if not p.isActive():
+            return
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        thumb = QRectF(self.PAD, self.PAD, self.THUMB_W, self.THUMB_H)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(16, 16, 20)))
+        p.drawRoundedRect(thumb, 8, 8)
+        if self._pixmap and not self._pixmap.isNull():
+            path = QPainterPath()
+            path.addRoundedRect(thumb, 8, 8)
+            p.setClipPath(path)
+            p.drawPixmap(thumb.toRect(), self._pixmap)
+            p.setClipping(False)
+        p.setPen(QPen(PremiumColors.ACCENT_PRIMARY, 2))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(thumb, 8, 8)
+        # time pill
+        fm = p.fontMetrics()
+        tw = fm.horizontalAdvance(self._time_text) + 24
+        pill = QRectF((self.width() - tw) / 2, self.PAD + self.THUMB_H + self.GAP,
+                      tw, self.PILL_H)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(PremiumColors.BG_GLASS))
+        p.drawRoundedRect(pill, self.PILL_H / 2, self.PILL_H / 2)
+        p.setPen(QPen(PremiumColors.TEXT_PRIMARY))
+        p.drawText(pill, Qt.AlignmentFlag.AlignCenter, self._time_text)
+
+    def show_at(self, global_x, global_y_top):
+        scr = QGuiApplication.screenAt(QPoint(int(global_x), int(global_y_top)))
+        scr = scr or QGuiApplication.primaryScreen()
+        geo = scr.availableGeometry()
+        x = int(global_x) - self.width() // 2
+        x = max(geo.left(), min(x, geo.right() - self.width()))
+        y = max(geo.top(), int(global_y_top) - self.height() - 12)
+        self.move(x, y)
+        if not self.isVisible():
+            self.show()
+        self.raise_()
 
 
 # =============================================================================
@@ -710,9 +768,12 @@ class PremiumTimelineSlider(QSlider):
         # Preview machinery
         self._player = None
         self._video_file = None
+        self._thumbs_allowed = True
+        self._thumb_service = None      # edge264 ThumbnailService (None = ffmpeg legacy)
         self._preview_widget = PreviewTooltip(self)
         self._last_preview_time = -99
         self._preview_cache = {}
+        self._displayed_exact = None    # (t_s, idr_s) of the exact vignette on screen
         self._extraction_timer = QTimer(self)
         self._extraction_timer.setSingleShot(True)
         self._extraction_timer.timeout.connect(self._do_extraction)
@@ -746,6 +807,88 @@ class PremiumTimelineSlider(QSlider):
     def set_player(self, player):
         self._player = player
 
+    def set_thumbnail_provider(self, service):
+        """edge264 ThumbnailService, or None to use the legacy ffmpeg path."""
+        self._thumb_service = service
+
+    @staticmethod
+    def _fmt_time(seconds):
+        s = int(max(0, seconds))
+        h, s = divmod(s, 3600)
+        m, s = divmod(s, 60)
+        return f"{h:02}:{m:02}:{s:02}"
+
+    def _insert_cache(self, key, pixmap, exact=True, idr_s=None):
+        """Two-tier cache: entries are (pixmap, exact, idr_s). 'exact' thumbnails
+        are seek-aligned (decoded from the IDR a click at this key lands on) and
+        carry that IDR's PTS so the click can SNAP to it; 'approx' ones are
+        mid-GOP harvest frames — displayable, but they never overwrite an exact
+        entry and never suppress an exact request."""
+        cur = self._preview_cache.get(key)
+        if cur is not None and cur[1] and not exact:
+            return                                # never downgrade exact -> approx
+        if key in self._preview_cache:
+            del self._preview_cache[key]          # refresh LRU order
+        elif len(self._preview_cache) >= 150:
+            del self._preview_cache[next(iter(self._preview_cache))]
+        self._preview_cache[key] = (pixmap, exact, idr_s)
+
+    def _has_exact(self, key):
+        ent = self._preview_cache.get(key)
+        return bool(ent and ent[1])
+
+    def _nearest_cached(self, key, radius=30):
+        ent = self._preview_cache.get(key)
+        if ent:
+            return ent[0]
+        best, best_d = None, radius + 1
+        for k, (pm, _exact, _idr) in self._preview_cache.items():
+            d = abs(k - key)
+            if d < best_d:
+                best, best_d = pm, d
+        return best if best_d <= radius else None
+
+    @Slot(float, float, QImage)
+    def _on_service_thumbnail(self, t, idr_s, image):
+        """Exact (seek-aligned) thumbnails from the ThumbnailService."""
+        self._store_thumbnail(t, image, exact=True, idr_s=idr_s)
+
+    @Slot(float, QImage)
+    def _on_harvest_thumbnail(self, t, image):
+        """Approximate mid-GOP thumbnails harvested from playback frames."""
+        self._store_thumbnail(t, image, exact=False)
+
+    def _store_thumbnail(self, t, image, exact, idr_s=None):
+        pm = QPixmap.fromImage(image)
+        if pm.isNull():
+            return
+        self._insert_cache(round(t), pm, exact=exact, idr_s=idr_s)
+        # Swap the visible tooltip image if still relevant — but an approx frame
+        # never replaces an already-displayed exact one for the same key.
+        if self._hover_pos >= 0 and abs(t - self._hover_time) <= 2.0:
+            if exact:
+                self._preview_widget.set_thumbnail(pm)
+                self._displayed_exact = (float(t), idr_s)   # WYSIWYG identity
+            elif not self._has_exact(round(self._hover_time)):
+                self._preview_widget.set_thumbnail(pm)
+                self._displayed_exact = None
+
+    def set_thumbnails_allowed(self, allowed):
+        """Enable/disable hover thumbnails for the current source.
+
+        The player turns this off when the source sits on ANY optical-class
+        volume (DRIVE_CDROM) — physical disc OR mounted ISO. Physical: mpv
+        (audio) and the video demuxer already share the single optical head,
+        and a third ffmpeg reader causes measured 45-120s head thrash.
+        Mounted ISO: a concurrent ffmpeg probe made the virtual UDF volume's
+        reads fail during demuxer init (measured 2026-07-14, Avatar BD3D).
+        Regular files (MKV on HDD/SSD) keep thumbnails on.
+        """
+        self._thumbs_allowed = bool(allowed)
+        if not allowed:
+            self._extraction_timer.stop()
+            self._preview_widget.hide()
+
     def set_video_file(self, video_path, duration):
         """Configures the video file and duration for the slider."""
         import os
@@ -759,9 +902,11 @@ class PremiumTimelineSlider(QSlider):
         if self._video_file != norm_path:
             self._video_file = norm_path
             self._preview_cache.clear()
-            
-            # Trigger initial thumbnail extraction immediately
-            self._request_on_demand_preview(0.0, 0)
+            self._displayed_exact = None
+            # NO t=0 pre-warm extraction here: it raced the demuxer's open/probe
+            # window (measured 2026-07-14, Avatar BD3D ISO: the concurrent ffmpeg
+            # probe made the mounted UDF volume's reads return nothing → MVC init
+            # aborted). Thumbnails are extracted on hover only.
 
         if duration and duration > 0:
             # Use milliseconds for better precision
@@ -794,6 +939,11 @@ class PremiumTimelineSlider(QSlider):
     def leaveEvent(self, event):
         self._hover_pos = -1
         self._preview_widget.hide()
+        self._preview_widget.clear()
+        self._displayed_exact = None
+        # Reset so re-entering at the same spot re-shows the tooltip instantly
+        # (otherwise the 0.5s hover-delta gate swallows the first request)
+        self._last_preview_time = -99
         self.update()
         super().leaveEvent(event)
 
@@ -823,13 +973,44 @@ class PremiumTimelineSlider(QSlider):
             if not self._is_mvc_active:
                 self.preview_requested.emit(self._hover_time)
 
-            # Preview Request
-            if (not self._is_mvc_active and self._video_file
-                    and abs(self._hover_time - self._last_preview_time) > 0.5):
+            # Tooltip follows the mouse IMMEDIATELY (position + time pill);
+            # only the image updates asynchronously.
+            if self._video_file:
+                gp = self.mapToGlobal(QPointF(pos, 0).toPoint())
+                self._preview_widget.set_time_text(self._fmt_time(self._hover_time))
+                key = round(self._hover_time)
+                ent = self._preview_cache.get(key)
+                if ent is not None:
+                    self._preview_widget.set_thumbnail(ent[0])
+                    # WYSIWYG identity: remember which exact vignette is on screen
+                    self._displayed_exact = (float(key), ent[2]) if ent[1] else None
+                else:
+                    pm = self._nearest_cached(key)
+                    if pm is not None:
+                        self._preview_widget.set_thumbnail(pm)
+                        self._displayed_exact = None
+                self._preview_widget.show_at(gp.x(), gp.y())
+
+            # Thumbnail request (0.3s hover-delta gate) — also active during MVC
+            # playback; optical sources are governed by set_thumbnails_allowed
+            if (self._thumbs_allowed and self._video_file
+                    and abs(self._hover_time - self._last_preview_time) > 0.3):
                 self._last_preview_time = self._hover_time
-                self._request_on_demand_preview(self._hover_time, pos)
+                if self._thumb_service is not None:
+                    # Request unless an EXACT (seek-aligned) thumb exists for
+                    # this key — approx harvest frames don't match the click
+                    # landing frame, so they must not suppress the request.
+                    if not self._has_exact(round(self._hover_time)):
+                        self._thumb_service.request(self._hover_time)
+                else:
+                    self._request_on_demand_preview(self._hover_time, pos)
 
         self.update()
+        if self._is_scrubbing:
+            # OWN THE GESTURE (see mousePressEvent): QSlider's drag would rewrite
+            # the value with its full-width mapping on every move.
+            event.accept()
+            return
         super().mouseMoveEvent(event)
 
     def mousePressEvent(self, event):
@@ -837,7 +1018,7 @@ class PremiumTimelineSlider(QSlider):
 
         if event.button() == Qt.MouseButton.LeftButton and self.maximum() > 0:
             pos = event.position().x() if hasattr(event, 'position') else event.pos().x()
-            
+
             # Margin correction
             margin = 16
             usable_width = self.width() - 2 * margin
@@ -847,17 +1028,24 @@ class PremiumTimelineSlider(QSlider):
                 value = int(normalized_pos * self.maximum())
             else:
                 value = 0
-                
+
             self.setValue(max(0, min(value, self.maximum())))
 
             # Start scrubbing
             self._is_scrubbing = True
             self._scrub_start_value = value
+            # OWN THE GESTURE: emits sliderPressed for the player, WITHOUT
+            # forwarding to QSlider — its stylesheet absolute-jump would rewrite
+            # the value with a FULL-WIDTH pixel mapping (no 16px margin), landing
+            # the playhead right of the click and desyncing seek vs tooltip.
+            self.setSliderDown(True)
 
             # Immediate emission for click
             self.sliderMoved.emit(self.value())
             self._pending_scrub_value = value
             self._scrub_debounce_timer.stop()
+            event.accept()
+            return
 
         super().mousePressEvent(event)
 
@@ -870,35 +1058,58 @@ class PremiumTimelineSlider(QSlider):
             # Emit final seek via debounce
             self._pending_scrub_value = final_value
             self._scrub_debounce_timer.start()
+            # Emits sliderReleased (the player's seek hook) AFTER our final
+            # value is set — never forwarded to QSlider (see mousePressEvent).
+            self.setSliderDown(False)
+            event.accept()
+            return
 
         super().mouseReleaseEvent(event)
+
+    def snap_to_vignette(self, target_s):
+        """PERFECT-SYNC SNAP (WYSIWYG): the user clicks on what they SEE. If an
+        exact vignette is DISPLAYED and the click is near it (slow sources make
+        the displayed thumb trail the cursor), seek to ITS IDR — the landing
+        frame is then the tooltip image, by construction. Fallback: the exact
+        cache entry at the clicked second. Allows a small FORWARD snap (click
+        marginally before the vignette's IDR, key-rounding artifact) but never
+        jumps more than 1s ahead. Returns target_s unchanged otherwise."""
+        try:
+            disp = self._displayed_exact
+            if (disp is not None and disp[1] is not None
+                    and abs(target_s - disp[0]) <= 5.0
+                    and -1.0 <= target_s - disp[1] < 15.0):
+                return float(disp[1])
+            ent = self._preview_cache.get(round(target_s))
+            if (ent is not None and ent[1] and ent[2] is not None
+                    and -1.0 <= target_s - ent[2] < 15.0):
+                return float(ent[2])
+        except Exception:
+            pass
+        return float(target_s)
 
     def _on_scrub_debounce_expired(self):
         """Called after debounce - emits scrub_finished signal."""
         if self._pending_scrub_value is not None:
-            # Convert ms to seconds for the signal
-            self.scrub_finished.emit(float(self._pending_scrub_value) / 1000.0)
+            target_s = self.snap_to_vignette(float(self._pending_scrub_value) / 1000.0)
+            self.scrub_finished.emit(target_s)
             self._pending_scrub_value = None
 
-    # --- Preview methods remain unchanged ---
+    # --- Legacy ffmpeg preview path (non-H.264 sources only) ---
     def _request_on_demand_preview(self, time_pos, mouse_x):
-        # Thumbnail extraction is now allowed in MVC mode
-        cache_key = round(time_pos)
-        if cache_key in self._preview_cache:
-            pixmap = self._preview_cache[cache_key]
-            if not pixmap.isNull():
-                self._preview_widget.setPixmap(pixmap)
-                self._show_preview_at(mouse_x)
-                return
-
+        if round(time_pos) in self._preview_cache:
+            return   # already displayed by the hover handler
         self._pending_time = time_pos
         self._pending_mouse_x = mouse_x
         self._extraction_timer.start(150)
 
     def _do_extraction(self):
-        # V13 FIX: Disable thumbnail extraction during MVC playback
-        # The ThreadPoolExecutor causes Windows 0xe24c4a02 exceptions during MVC decoding
-        if self._is_mvc_active:
+        # Extraction runs during MVC playback too: the old V13 blanket ban
+        # (0xe24c4a02) predates the targeted ctypes/mpv guards, and this path
+        # only spawns ffmpeg out-of-process — it touches no decoder/mpv state.
+        # Physical optical sources stay excluded via set_thumbnails_allowed
+        # (third reader on the single optical head = measured 45-120s thrash).
+        if not self._thumbs_allowed or not self._video_file:
             return
 
         time_pos = self._pending_time
@@ -917,31 +1128,17 @@ class PremiumTimelineSlider(QSlider):
     @Slot(float, str)
     def _on_extraction_done(self, time_pos, temp_file):
         try:
-            cache_key = round(time_pos)
             pixmap = QPixmap(temp_file)
             if not pixmap.isNull():
-                if len(self._preview_cache) > 120:
-                    oldest = next(iter(self._preview_cache))
-                    del self._preview_cache[oldest]
-                self._preview_cache[cache_key] = pixmap
-
-                if self._hover_pos >= 0 and abs(time_pos - self._hover_time) < 5:
-                    self._preview_widget.setPixmap(pixmap)
-                    self._show_preview_at(self._pending_mouse_x)
+                self._insert_cache(round(time_pos), pixmap)
+                if self._hover_pos >= 0 and abs(time_pos - self._hover_time) <= 2.0:
+                    self._preview_widget.set_thumbnail(pixmap)
             try:
                 os.remove(temp_file)
             except:
                 pass
         except Exception:
             pass
-
-    def _show_preview_at(self, mouse_x):
-        global_pos = self.mapToGlobal(QPointF(int(mouse_x), 0))
-        tooltip_x = global_pos.x() - self._preview_widget.width() // 2
-        tooltip_y = global_pos.y() - self._preview_widget.height() - 15
-        self._preview_widget.move(tooltip_x, tooltip_y)
-        self._preview_widget.show()
-        self._preview_widget.raise_()
 
     def paintEvent(self, event):
         try:

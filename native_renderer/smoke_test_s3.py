@@ -78,16 +78,13 @@ def render_loop():
     off = 0
     while not stop.is_set():
         c = off // 2
-        yl = np.ascontiguousarray(np.roll(BASE["yl"], off, axis=0))
-        h, w = yl.shape[:2]
         ok = r.set_yuv_frame(
-            yl,
+            np.ascontiguousarray(np.roll(BASE["yl"], off, axis=0)),
             np.ascontiguousarray(np.roll(BASE["ul"], c, axis=0)),
             np.ascontiguousarray(np.roll(BASE["vl"], c, axis=0)),
             np.ascontiguousarray(np.roll(BASE["yr"], off, axis=0)),
             np.ascontiguousarray(np.roll(BASE["ur"], c, axis=0)),
             np.ascontiguousarray(np.roll(BASE["vr"], c, axis=0)),
-            int(w), int(h),
         )
         if not ok:
             errors[0] += 1

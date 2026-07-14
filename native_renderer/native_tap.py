@@ -108,8 +108,7 @@ class NativeRendererTap:
             else:
                 sw = self._sdr
             self._r.set_uniforms(int(stereo_mode), 0, 0.0, 0.0, 1.0, 1.0, sw, self._gamma)
-            h, w = yl.shape[:2]
-            if not self._r.set_yuv_frame(yl, ul, vl, yr, ur, vr, int(w), int(h)):
+            if not self._r.set_yuv_frame(yl, ul, vl, yr, ur, vr):
                 if not self._fail_logged:
                     logger.warning(f"[NATIVE-TAP] set_yuv_frame: {self._r.last_error()}")
                     self._fail_logged = True

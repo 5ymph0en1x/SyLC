@@ -155,6 +155,7 @@ Edge264Decoder *edge264_alloc(int n_threads, Edge264LogCb log_cb, void *log_arg,
 	dec->log_base_us = get_relative_time_us();
 	dec->currPic = dec->basePic = -1;
 	dec->PrevRefFrameNum[0] = dec->PrevRefFrameNum[1] = dec->prevFrameId = -1;
+	dec->maxFieldOrderCnt[0] = dec->maxFieldOrderCnt[1] = INT32_MIN;
 	dec->taskPics_v = dec->get_frame_queue_v[0] = dec->get_frame_queue_v[1] = set8(-1);
 	dec->n_threads = n_threads;
 	dec->alloc_cb = alloc_cb && free_cb ? alloc_cb : internal_alloc;
@@ -282,8 +283,17 @@ void edge264_free(Edge264Decoder **pdec) {
 	if (pdec != NULL && (dec = *pdec) != NULL) {
 		*pdec = NULL;
 		if (dec->n_threads) {
+			// Cooperative shutdown. pthread_cancel is a no-op on a winpthread
+			// thread parked in pthread_cond_wait, and pthread_cond_destroy
+			// then blocks forever on the un-cancelled waiters (this hung
+			// every teardown with workers). Raise the flag, wake everyone,
+			// join, THEN destroy.
+			pthread_mutex_lock(&dec->lock);
+			dec->shutting_down = 1;
+			pthread_cond_broadcast(&dec->task_ready);
+			pthread_mutex_unlock(&dec->lock);
 			for (int i = 0; i < dec->n_threads; i++)
-				pthread_cancel(dec->threads[i]);
+				pthread_join(dec->threads[i], NULL);
 			pthread_mutex_destroy(&dec->lock);
 			pthread_cond_destroy(&dec->task_ready);
 			pthread_cond_destroy(&dec->task_progress);

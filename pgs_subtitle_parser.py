@@ -75,6 +75,12 @@ class PGSDisplaySet:
     rendered_image: Optional[np.ndarray] = None  # Final RGBA image
     render_x: int = 0
     render_y: int = 0
+    # Stereoscopic depth recovered from per-eye duplicated compositions
+    # (normalized to eye width, > 0 = crossed = in front of the screen).
+    disparity: float = 0.0
+    # True for the '3D MVC' WDS-bitmap flavor whose coordinate semantics are
+    # unverified — keep the historical center-bottom placement for it.
+    legacy_center: bool = False
 
 
 def decode_rle(rle_data: bytes, width: int, height: int) -> Optional[np.ndarray]:
@@ -528,6 +534,7 @@ class PGSSubtitleParser:
 
         # Store in current display set
         if self._current_ds:
+            self._current_ds.legacy_center = True
             self._current_ds.objects[object_id] = obj
 
             # For 3D format, fix video dimensions if they're invalid (0x0)
@@ -683,6 +690,44 @@ class PGSSubtitleParser:
         self._pending_palette = None
         self._pending_ods_list = []
 
+    def _fold_stereo_duplicate(self, ds: PGSDisplaySet):
+        """Detect per-eye duplicated compositions (3D SBS authoring) and fold them.
+
+        SBS releases author PGS like text: the SAME bitmap placed twice, once in
+        each horizontal half of the canvas, the in-eye offset difference encoding
+        the parallax. SyLC's renderer draws the overlay once per eye itself, so:
+        keep only the left-eye copy (canvas becomes the EYE canvas) and record
+        the authored disparity (normalized to eye width, > 0 = in front).
+        """
+        comps = [c for c in ds.compositions
+                 if ds.objects.get(c.object_id) is not None
+                 and ds.objects[c.object_id].decoded is not None]
+        if len(comps) != 2 or ds.width < 2:
+            return
+        o0, o1 = ds.objects[comps[0].object_id], ds.objects[comps[1].object_id]
+        if (abs(o0.width - o1.width) > 2 or abs(o0.height - o1.height) > 2
+                or abs(comps[0].y - comps[1].y) > 4):
+            return
+        # Same bitmap: same object, or two objects with identical pixels
+        if comps[0].object_id != comps[1].object_id:
+            if o0.decoded.shape != o1.decoded.shape or not np.array_equal(o0.decoded, o1.decoded):
+                return
+        half = ds.width / 2.0
+        left = [c for c in comps if c.x + ds.objects[c.object_id].width / 2.0 < half]
+        right = [c for c in comps if c.x + ds.objects[c.object_id].width / 2.0 >= half]
+        if len(left) != 1 or len(right) != 1:
+            return
+        disparity = (left[0].x - (right[0].x - half)) / half
+        if abs(disparity) > 0.15:
+            return  # implausible depth -> not a stereo pair
+        ds.disparity = float(disparity)
+        ds.width = int(half)
+        ds.compositions = left
+        if not getattr(self, '_stereo_fold_logged', False):
+            self._stereo_fold_logged = True
+            logger.info(f"[PGS-3D] Per-eye duplicated PGS detected: folding to left eye, "
+                        f"authored disparity {disparity:+.4f} of eye width")
+
     def _render_display_set(self, ds: PGSDisplaySet):
         """Render a display set to RGBA image."""
         if not ds.palette or not ds.compositions:
@@ -690,6 +735,9 @@ class PGSSubtitleParser:
             if not ds.palette:
                 logger.debug(f"[PGS-RENDER] Skipping DS at {ds.pts:.2f}s: no palette")
             return
+
+        # 3D SBS: fold per-eye duplicated compositions before layout
+        self._fold_stereo_duplicate(ds)
 
         # Calculate bounding box of all compositions
         min_x, min_y = ds.width, ds.height
@@ -771,17 +819,22 @@ class PGSSubtitleParser:
         cropped_rgba = rgba[crop_top:crop_bottom, crop_left:crop_right]
         cropped_h, cropped_w = cropped_rgba.shape[:2]
 
-
-        # ALWAYS use 1080p for positioning calculation (matches video output dimensions)
-        # Some PGS tracks have different dimensions (e.g., 720x480 for French subtitles)
-        # but the final render target is always 1920x1080 for MVC video
-        video_w = 1920
-        video_h = 1080
-
-        # Center horizontally and position at bottom with margin
-        bottom_margin = 50
-        render_x = (video_w - cropped_w) // 2
-        render_y = video_h - cropped_h - bottom_margin
+        if ds.legacy_center:
+            # '3D MVC' WDS-bitmap flavor: no trustworthy authored coordinates —
+            # keep the historical center-bottom placement on a 1080p canvas.
+            video_w, video_h = 1920, 1080
+            bottom_margin = 50
+            render_x = (video_w - cropped_w) // 2
+            render_y = video_h - cropped_h - bottom_margin
+            ds.width, ds.height = video_w, video_h
+        else:
+            # AUTHORED positioning: honor the PCS composition coordinates (plus
+            # the transparent-border crop) on the composition canvas. The display
+            # side normalizes against ds.width/ds.height, so off-1080 canvases
+            # (e.g. 720x480 tracks) land exactly where the author placed them —
+            # top captions stay on top, speaker-positioned dialog stays put.
+            render_x = min_x + crop_left
+            render_y = min_y + crop_top
 
         ds.rendered_image = cropped_rgba
         ds.render_x = max(0, render_x)

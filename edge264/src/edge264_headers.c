@@ -1,4 +1,10 @@
 #include "edge264_internal.h"
+#ifdef SYLC_MT_TRACE
+#define MTTRACE(...) do { fprintf(stderr, "[MT] " __VA_ARGS__); fputc(10, stderr); fflush(stderr); } while (0)
+#else
+#define MTTRACE(...)
+#endif
+
 
 #include "edge264_bitstream.c"
 #include "edge264_deblock.c"
@@ -70,11 +76,35 @@ static void unset_currPic(Edge264Decoder *dec) {
 	// to a DPB-saturation deadlock (Gravity 3D / other BD3D discs freeze at ~frame 25).
 	// Mark it complete so it can be output; the undecoded macroblocks keep their
 	// (concealed/stale) buffer content — a transient artifact on one frame beats a freeze.
-	if (dec->next_deblock_addr[dec->currPic] != INT_MAX) {
+	// MT GUARD: with worker threads, "slices have been fed" does NOT mean
+	// "decoded" — at a picture boundary the workers may not even have started
+	// this frame, and next_deblock_addr != INT_MAX is its NORMAL in-flight
+	// state. Force-completing here zeroed remaining_mbs before the worker's
+	// atomic_sub ran (driving it to -mb_count so the ==0 frame-complete
+	// machinery never fired -> every dependent task wedged), and could output
+	// frames still being written. Only rescue frames with NO in-flight task —
+	// which is exactly the original single-thread CABAC-desync case (Gravity).
+	bool still_decoding = false;
+	for (unsigned b = dec->busy_tasks; b; b &= b - 1) {
+		if (dec->taskPics[__builtin_ctz(b)] == dec->currPic) {
+			still_decoding = true;
+			break;
+		}
+	}
+	if (!still_decoding && dec->next_deblock_addr[dec->currPic] != INT_MAX) {
 		dec->remaining_mbs[dec->currPic] = 0;
 		dec->next_deblock_addr[dec->currPic] = INT_MAX;
 	}
 	int non_base_view = dec->non_base_frames >> dec->currPic & 1;
+	// MONOTONE-POC: track the max POC per view over completed pictures (ref or
+	// not — the display max is often a non-ref B). Consumed by the IDR floor in
+	// parse_slice_layer. Updated only here, at picture completion, so every
+	// slice of a given IDR computes the same shift.
+	int foc_top = dec->FieldOrderCnt[0][dec->currPic];
+	int foc_bot = dec->FieldOrderCnt[1][dec->currPic];
+	int foc_max = foc_top > foc_bot ? foc_top : foc_bot;
+	if (foc_max > dec->maxFieldOrderCnt[non_base_view])
+		dec->maxFieldOrderCnt[non_base_view] = foc_max;
 	if ((dec->short_term_frames | dec->long_term_frames) & 1 << dec->currPic) {
 		unsigned same_views = non_base_view ? dec->non_base_frames : ~dec->non_base_frames;
 		dec->PrevRefFrameNum[non_base_view] = dec->FrameNums[dec->currPic];
@@ -153,6 +183,7 @@ static void clear_decoder(Edge264Decoder *dec) {
 	memset((void *)dec + offsetof(Edge264Decoder, nal_ref_idc), 0, offsetof(Edge264Decoder, log_base_us) - offsetof(Edge264Decoder, nal_ref_idc));
 	dec->currPic = dec->basePic = -1;
 	dec->PrevRefFrameNum[0] = dec->PrevRefFrameNum[1] = -1;
+	dec->maxFieldOrderCnt[0] = dec->maxFieldOrderCnt[1] = INT32_MIN;
 	dec->taskPics_v = dec->get_frame_queue_v[0] = dec->get_frame_queue_v[1] = set8(-1);
 }
 
@@ -460,8 +491,16 @@ void *ADD_VARIANT(worker_loop)(void *arg) {
 		pthread_mutex_lock(&c.d->lock);
 	while (1) {
 		// wait until a task becomes available and reserve it
-		while (c.thread_id >= 0 && !c.d->ready_tasks)
+		while (c.thread_id >= 0 && !c.d->ready_tasks) {
+			// clean shutdown: edge264_free raises the flag and broadcasts
+			// task_ready (winpthread's pthread_cancel does NOT wake a thread
+			// blocked in cond_wait, and cond_destroy then hangs on waiters)
+			if (c.d->shutting_down) {
+				pthread_mutex_unlock(&c.d->lock);
+				return NULL;
+			}
 			pthread_cond_wait(&c.d->task_ready, &c.d->lock);
+		}
 		if (c.thread_id < 0 && !c.d->ready_tasks) {
 			// Single-threaded MVC: force the pending task ready since all prior work is complete
 			c.d->ready_tasks = c.d->pending_tasks;
@@ -469,6 +508,7 @@ void *ADD_VARIANT(worker_loop)(void *arg) {
 		assert((unsigned)c.d->ready_tasks - 1 < 65535); // 0 < ready_tasks < 65536
 		int task_id = __builtin_ctz(c.d->ready_tasks); // FIXME arbitrary selection for now
 		int currPic = c.d->taskPics[task_id];
+		MTTRACE("worker%d PICK task=%d pic=%d busy=%04x pending=%04x ready=%04x", c.thread_id, task_id, currPic, c.d->busy_tasks, c.d->pending_tasks, c.d->ready_tasks);
 		c.d->pending_tasks &= ~(1 << task_id);
 		c.d->ready_tasks &= ~(1 << task_id);
 		if (c.thread_id >= 0)
@@ -596,6 +636,7 @@ void *ADD_VARIANT(worker_loop)(void *arg) {
 		// if multi-threaded, check if we are the last task to touch this frame and ensure it is complete
 		if (c.thread_id >= 0) {
 			pthread_mutex_lock(&c.d->lock);
+			MTTRACE("worker%d DONE task=%d ret=%d remaining_mbs=%d busy=%04x", c.thread_id, task_id, ret, remaining_mbs, c.d->busy_tasks);
 			pthread_cond_signal(&c.d->task_complete);
 			if (remaining_mbs == 0) {
 				pthread_cond_broadcast(&c.d->task_progress);
@@ -990,8 +1031,10 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 	
 	// find and reserve an empty task to fill
 	unsigned avail_tasks;
-	while (!(avail_tasks = 0xffff & ~dec->busy_tasks))
+	while (!(avail_tasks = 0xffff & ~dec->busy_tasks)) {
+		MTTRACE("feeder WAIT taskpool busy=%04x pending=%04x ready=%04x", dec->busy_tasks, dec->pending_tasks, dec->ready_tasks);
 		pthread_cond_wait(&dec->task_complete, &dec->lock);
+	}
 	Edge264Task *t = dec->tasks + __builtin_ctz(avail_tasks);
 	t->unref_cb = unref_cb;
 	t->unref_arg = unref_arg;
@@ -1075,6 +1118,29 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 		int prevPicOrderCnt = dec->prevPicOrderCnt[non_base_view];
 		int inc = (pic_order_cnt_lsb - prevPicOrderCnt) << shift >> shift;
 		BottomFieldOrderCnt = TopFieldOrderCnt = prevPicOrderCnt + inc;
+		// SYLC MONOTONE-POC FIX: edge264 derives POC continuously across IDRs
+		// (relative lsb chaining above) instead of resetting to 0 per spec. The
+		// anchor is the last DECODED picture's POC, so when a GOP ends mid-B-
+		// reorder the next GOP's POC range can start BELOW the previous GOP's
+		// display max (measured -2..-28 on BD3D scene cuts), interleaving both
+		// GOPs in POC-ordered output (bump_frame) and in the player's reorder
+		// sort — a visible backward frame jump at scene cuts under MT decode
+		// (single-thread hid it: the DPB was fully drained before the IDR).
+		// Floor an IDR's POC strictly above its view's max completed POC,
+		// rounding the shift to a multiple of MaxPicOrderCntLsb so the lsb
+		// congruence survives (same-picture detection above and the
+		// prevPicOrderCnt chaining both compare lsb windows). Subsequent
+		// pictures chain from the IDR's stored (shifted) POC and inherit it.
+		if (dec->IdrPicFlag) {
+			int maxPoc = dec->maxFieldOrderCnt[non_base_view];
+			log_dec(dec, "  SYLC_IDR_FLOOR: {view: %d, maxPoc: %d, poc: %d}\n", non_base_view, maxPoc, TopFieldOrderCnt);
+			if (maxPoc != INT32_MIN && TopFieldOrderCnt <= maxPoc) {
+				int MaxLsb = 1 << sps->log2_max_pic_order_cnt_lsb;
+				int shift_poc = (maxPoc + 1 - TopFieldOrderCnt + MaxLsb - 1) & -MaxLsb;
+				TopFieldOrderCnt += shift_poc;
+				BottomFieldOrderCnt += shift_poc;
+			}
+		}
 		log_dec(dec, "  pic_order_cnt: {type: 0, bits: %u, absolute: %d",
 			sps->log2_max_pic_order_cnt_lsb, TopFieldOrderCnt);
 		if (t->pps.bottom_field_pic_order_in_frame_present_flag && !t->field_pic_flag) {
@@ -1167,8 +1233,10 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 			return ENOBUFS; // exit here if we must wait for get_frame to consume and return enough frames
 		// wait until enough empty slots are undepended
 		unsigned unavail;
-		while (non_existing + __builtin_popcount(unavail = reference_frames | dec->to_get_frames | dec->output_frames | depended_frames(dec)) > 32)
+		while (non_existing + __builtin_popcount(unavail = reference_frames | dec->to_get_frames | dec->output_frames | depended_frames(dec)) > 32) {
+			MTTRACE("feeder WAIT gapslots ref=%08x toget=%08x out=%08x dep=%08x busy=%04x", reference_frames, dec->to_get_frames, dec->output_frames, depended_frames(dec), dec->busy_tasks);
 			pthread_cond_wait(&dec->task_complete, &dec->lock);
+		}
 		// finally insert the last non-existing frames one by one
 		for (unsigned FrameNum = dec->FrameNum - non_existing; FrameNum < dec->FrameNum; FrameNum++) {
 			int i = __builtin_ctz(~unavail);
@@ -1202,8 +1270,10 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 			return ENOBUFS; // exit here if we must wait for get_frame to consume and return a frame slot
 		// wait until at least one empty slot is undepended (or returned in the meantime)
 		unsigned unavail;
-		while (__builtin_popcount(unavail = reference_frames | dec->to_get_frames | dec->output_frames | depended_frames(dec)) >= 32)
+		while (__builtin_popcount(unavail = reference_frames | dec->to_get_frames | dec->output_frames | depended_frames(dec)) >= 32) {
+			MTTRACE("feeder WAIT currslot ref=%08x toget=%08x out=%08x dep=%08x busy=%04x", reference_frames, dec->to_get_frames, dec->output_frames, depended_frames(dec), dec->busy_tasks);
 			pthread_cond_wait(&dec->task_complete, &dec->lock);
+		}
 		int currPic = __builtin_ctz(~unavail);
 		if (dec->samples_buffers[currPic] == NULL &&
 			(ret = alloc_frame(dec, currPic, currPic <= sps->max_dec_frame_buffering ? ENOMEM : ENOBUFS)))
@@ -1329,10 +1399,15 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 		unsigned long_term_frames = dec->prev_long_term_frames & ~same_views | dec->long_term_frames;
 		unsigned reference_frames = short_term_frames | long_term_frames;
 		assert(__builtin_popcount(reference_frames & same_views) <= sps->max_num_ref_frames);
-		// MVC FIX: For MVC streams, max_dec_frame_buffering applies per-view
-		// Only assert for same-view frames to avoid false failures
-		int same_view_total = __builtin_popcount((reference_frames | dec->to_get_frames & ~dec->output_frames) & same_views);
-		assert(same_view_total <= sps->max_dec_frame_buffering);
+		// MVC FIX: For MVC streams, max_dec_frame_buffering applies per-view.
+		// NOTE (multithread): this used to assert same_view_total <=
+		// max_dec_frame_buffering, an invariant that only holds when frames
+		// are drained synchronously (n_threads == 0). With worker threads,
+		// frames linger in to_get_frames while still deblocking, so the
+		// count legitimately exceeds the cap for a moment — and the OVERFLOW
+		// FIX below already handles exactly that by bumping dynamically.
+		// The assert aborted a worker thread (then decode_NAL blocked
+		// forever on its never-completing tasks); do not reinstate it.
 		// MVC OVERFLOW FIX: Calculate max_bump dynamically to handle DPB overflow
 		unsigned other_views = ~same_views;
 		int current_total = __builtin_popcount(reference_frames | dec->to_get_frames & ~dec->output_frames & other_views);
@@ -1374,6 +1449,7 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 	// prepare the task and signal it
 	initialize_task(dec, sps, t);
 	int task_id = t - dec->tasks;
+	MTTRACE("feeder SUBMIT task=%d pic=%d deps=%08x readyfr=%08x", task_id, dec->currPic, dec->task_dependencies[task_id], ready_frames(dec));
 	dec->busy_tasks |= 1 << task_id;
 	dec->pending_tasks |= 1 << task_id;
 	dec->task_dependencies[task_id] = refs_to_mask(t);

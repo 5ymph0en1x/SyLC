@@ -22,8 +22,11 @@ class SubtitleManager(QObject):
     to OpenGL widgets at the correct times.
     """
 
-    # Emitted when subtitle should be displayed (rgba_array, x, y, w, h, video_w, video_h)
-    subtitle_changed = Signal(object, int, int, int, int, int, int)
+    # Emitted when subtitle should be displayed
+    # (rgba_array, x, y, w, h, video_w, video_h, disparity) — disparity is the
+    # authored stereoscopic depth (normalized eye-width, > 0 = in front of the
+    # screen), recovered from per-eye duplicated compositions (3D SBS tracks).
+    subtitle_changed = Signal(object, int, int, int, int, int, int, float)
     # Emitted when subtitle should be cleared
     subtitle_cleared = Signal()
 
@@ -198,7 +201,8 @@ class SubtitleManager(QObject):
                     self.subtitle_changed.emit(
                         img,
                         x, y, w, h,
-                        ref_w, ref_h
+                        ref_w, ref_h,
+                        float(getattr(display_set, 'disparity', 0.0))
                     )
 
     @Slot()

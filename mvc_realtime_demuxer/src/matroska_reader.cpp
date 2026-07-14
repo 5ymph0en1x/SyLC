@@ -52,6 +52,11 @@
             if (!m_file) {
                 // Handle error or throw
                 std::cerr << "[LargeFileIOCallback] Failed to open file: " << path << std::endl;
+            } else {
+                // libebml issues many tiny reads; the default CRT buffer (~4 KB)
+                // turns them into syscall storms. 1 MB matches the M2TS reader's
+                // buffered-I/O philosophy (which uses an explicit 16 MB buffer).
+                setvbuf(m_file, nullptr, _IOFBF, 1 << 20);
             }
         }
 

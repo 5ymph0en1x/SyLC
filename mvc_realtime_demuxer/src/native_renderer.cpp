@@ -53,17 +53,18 @@ struct NativeRenderer::Impl {
 };
 
 // cbuffer 'buf' (register b0) — layout must match the HLSL packoffsets:
-//   c0.x int stereo_mode, c0.y int subtitle_enabled, c1 float4 subtitle_rect,
-//   c2.x float sdr_white_level. 48 bytes total (3 x 16).
+//   c0.x int stereo_mode, c0.y int subtitle_enabled, c0.z float subtitle_disparity,
+//   c1 float4 subtitle_rect, c2.x float sdr_white_level. 48 bytes total (3 x 16).
 struct FrameCB {
-    int   stereo_mode;       // c0.x (offset 0)
-    int   subtitle_enabled;  // c0.y (offset 4)
-    int   _pad0[2];          // c0.z/.w
-    float subtitle_rect[4];  // c1   (offset 16)
-    float sdr_white_level;   // c2.x (offset 32)
-    float output_gamma;      // c2.y (offset 36)  EOTF exponent; <=0 disables
-    float fp_vfill;          // c2.z (offset 40)  FramePack: eye vertical fill of a 1080 slot
-    float fp_hfill;          // c2.w (offset 44)  FramePack: eye horizontal fill
+    int   stereo_mode;        // c0.x (offset 0)
+    int   subtitle_enabled;   // c0.y (offset 4)
+    float subtitle_disparity; // c0.z (offset 8)   normalized eye-width; >0 = pop-out
+    int   _pad0;              // c0.w
+    float subtitle_rect[4];   // c1   (offset 16)
+    float sdr_white_level;    // c2.x (offset 32)
+    float output_gamma;       // c2.y (offset 36)  EOTF exponent; <=0 disables
+    float fp_vfill;           // c2.z (offset 40)  FramePack: eye vertical fill of a 1080 slot
+    float fp_hfill;           // c2.w (offset 44)  FramePack: eye horizontal fill
 };
 static_assert(sizeof(FrameCB) == 48, "cbuffer must be 48 bytes");
 
@@ -363,13 +364,15 @@ bool NativeRenderer::upload_subtitle(const uint8_t* data, uint32_t width, uint32
 
 void NativeRenderer::set_uniforms(int stereo_mode, int subtitle_enabled,
                                   float rx, float ry, float rw, float rh,
-                                  float sdr_white, float output_gamma) {
+                                  float sdr_white, float output_gamma,
+                                  float subtitle_disparity) {
     if (!impl_ || !impl_->cbuffer || !impl_->context) { stereo_mode_ = stereo_mode; return; }
     std::lock_guard<std::mutex> lk(impl_->mtx);
     stereo_mode_ = stereo_mode;
     FrameCB cb = {};
-    cb.stereo_mode      = stereo_mode;
-    cb.subtitle_enabled = subtitle_enabled;
+    cb.stereo_mode        = stereo_mode;
+    cb.subtitle_enabled   = subtitle_enabled;
+    cb.subtitle_disparity = subtitle_disparity;
     cb.subtitle_rect[0] = rx; cb.subtitle_rect[1] = ry;
     cb.subtitle_rect[2] = rw; cb.subtitle_rect[3] = rh;
     cb.sdr_white_level  = sdr_white;

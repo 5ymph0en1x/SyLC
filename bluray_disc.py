@@ -335,8 +335,14 @@ def get_iso_mount_drive(iso_path):
     return None
 
 
-def _wait_volume_ready(drive, timeout_s=8.0):
+def _wait_volume_ready(drive, timeout_s=20.0):
     """Poll until the mounted volume's BDMV/PLAYLIST is listable.
+
+    Timeout raised 8s -> 20s: a large UDF image was MEASURED taking 8.2s to
+    become browsable after mount churn — the old deadline lost that race by a
+    hair, the feature scan saw an empty drive and the ISO was dismounted as
+    featureless. The poll returns as soon as the volume is ready, so the
+    higher ceiling costs nothing on the happy path.
 
     A UDF volume's drive letter appears a moment before the filesystem is actually
     ready for I/O; querying too early yields WinError 87 (invalid parameter) or empty
@@ -377,7 +383,9 @@ def mount_iso(iso_path):
             # The volume may not be ready in time — re-query once.
             drv = get_iso_mount_drive(iso_path)
     if drv:
-        _wait_volume_ready(drv)
+        if not _wait_volume_ready(drv):
+            print(f"[bluray_disc] WARNING: {drv} still not browsable after wait — "
+                  "feature detection may scan an empty drive")
     return drv
 
 

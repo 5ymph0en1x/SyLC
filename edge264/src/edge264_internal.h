@@ -358,6 +358,7 @@ typedef struct Edge264Decoder {
 	Edge264Macroblock *mb_buffers[32];
 	Parser parse_nal_unit[32];
 	pthread_t threads[16];
+	int shutting_down; // set under lock by edge264_free; workers exit their wait loop
 	pthread_mutex_t lock;
 	pthread_cond_t task_ready;
 	pthread_cond_t task_progress; // signals next_deblock_addr has been updated
@@ -377,6 +378,7 @@ typedef struct Edge264Decoder {
 	int32_t idr_pic_id; // value for the last slice, used for detecting new frames
 	int32_t delta_pic_order_cnt0; // value for the last slice, used for detecting new frames
 	int32_t prevPicOrderCnt[2]; // one per view
+	int32_t maxFieldOrderCnt[2]; // one per view: max POC of completed pictures, INT32_MIN sentinel (monotone-POC IDR floor)
 	int32_t TopFieldOrderCnt; // value for the current incomplete frame, unaffected by mmco5
 	int32_t BottomFieldOrderCnt;
 	Edge264SeqParameterSet sps;

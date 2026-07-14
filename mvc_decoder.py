@@ -14,10 +14,12 @@ import sys
 import os
 import struct
 import bisect
+import heapq
 import time
 import logging
 import threading
 import gc
+import weakref
 import numpy as np
 try:
     import velvet_probe  # read-only timing probe; no-op unless SYLC_VELVET_PROBE=1
@@ -32,6 +34,7 @@ except Exception:  # pragma: no cover - keep player runnable if probe is absent
     velvet_probe = _VelvetNoop()
 from collections import deque
 from PySide6.QtCore import QThread, Signal, QMutex, QWaitCondition
+from PySide6.QtGui import QImage
 
 
 # -----------------------------------------------------------------------------
@@ -451,6 +454,54 @@ def is_mvc_idr_nal(nal_data: bytes, sc_len: int) -> bool:
     non_idr_flag = (ext_byte >> 6) & 1
     return non_idr_flag == 0  # IDR if non_idr_flag is 0
 
+class _PlanePool:
+    """Recycles the DPB-exit plane copies (6 large numpy allocs per frame,
+    ~144/s at 24fps stereo) through per-size freelists. Buffers return to the
+    pool automatically when the LAST numpy reference dies (weakref.finalize;
+    numpy views keep their base alive), so frames sitting in the reorder or
+    presentation queues can never be overwritten. Thread-safe (deque)."""
+
+    def __init__(self, max_per_size=96):
+        self._free = {}          # nbytes -> deque of bytearray
+        self._max = max_per_size
+
+    def copy(self, src):
+        """Pooled equivalent of src.copy() for a 2-D uint8 array/view."""
+        n = src.nbytes
+        lst = self._free.get(n)
+        try:
+            buf = lst.pop() if lst else bytearray(n)
+        except IndexError:
+            buf = bytearray(n)
+        # Finalize the frombuffer array itself: numpy view-collapsing makes ALL
+        # downstream views point at it as their base (not at the reshape below),
+        # so it is the last ndarray to die — recycling can never race a view.
+        flat = np.frombuffer(buf, dtype=np.uint8, count=n)
+        weakref.finalize(flat, self._recycle, n, buf)
+        arr = flat.reshape(src.shape)
+        np.copyto(arr, src)
+        return arr
+
+    def _recycle(self, n, buf):
+        lst = self._free.get(n)
+        if lst is None:
+            lst = self._free.setdefault(n, deque())
+        if len(lst) < self._max:
+            lst.append(buf)
+
+
+_PLANE_POOL = _PlanePool()
+
+
+# EDGE264 SESSION LOCK (2026-07-14, watchdog stall at post-seek decode_NAL):
+# two edge264 sessions now coexist (playback + ThumbnailService). Steady-state
+# concurrent DECODING is fine (measured), but alloc/free racing a decode in the
+# other session wedges the DLL. Rule: every edge264_alloc/edge264_free takes
+# this lock, and the ThumbnailService holds it across each of its edge264 call
+# sections. The playback per-NAL hot path stays UNLOCKED (zero fluidity cost).
+edge264_session_lock = threading.RLock()
+
+
 class Edge264Frame(ctypes.Structure):
     _fields_ = [
         ("samples", ctypes.POINTER(ctypes.c_uint8) * 3),
@@ -563,6 +614,47 @@ def _apply_bd_seek_tables(demuxer, filepath):
                     logger.info("[BD-SEEK] SSIF exact map unavailable (no extent tables) — EP_map ratio fallback in use")
     except Exception as e:
         logger.warning(f"[BD-SEEK] EP_map/SSIF seek-map load skipped: {e}")
+
+
+def create_demuxer(filepath):
+    """Demuxer selection shared by MVCDecoderThread and ThumbnailService.
+    Returns (unopened_demuxer, effective_path). effective_path differs from
+    filepath only for .m2ts files with an SSIF companion (BD3D layout)."""
+    _, ext = os.path.splitext(filepath)
+    ext = ext.lower()
+    if ext == '.ssif':
+        return mvc_demuxer_cpp.MVCSSIFDemuxer(), filepath
+    if ext in ('.m2ts', '.ts'):
+        try:
+            if hasattr(mvc_demuxer_cpp, 'SSIFParser') and mvc_demuxer_cpp.SSIFParser.has_ssif(filepath):
+                ssif_path = mvc_demuxer_cpp.SSIFParser.detect_ssif_path(filepath)
+                if ssif_path:
+                    return mvc_demuxer_cpp.MVCSSIFDemuxer(), ssif_path
+        except Exception:
+            pass
+        return mvc_demuxer_cpp.MVCM2TSDemuxer(), filepath
+    if ext in ('.mkv', '.mk3d'):
+        return mvc_demuxer_cpp.MVCMatroskaDemuxer(), filepath
+    try:
+        import lavf_h264_demuxer
+        if lavf_h264_demuxer.is_available():
+            return lavf_h264_demuxer.LavfH264Demuxer(), filepath
+    except Exception:
+        pass
+    return mvc_demuxer_cpp.MVCMatroskaDemuxer(), filepath
+
+
+def convert_avcc_to_annexb(codec_private):
+    """Annex-B passthrough; avcC (MKV CodecPrivate) converted to Annex-B NALs.
+    Delegates to MVCDecoderThread._convert_avcc_to_annexb, whose body is
+    self-free (verified) — behavior is byte-identical to the playback path."""
+    if not codec_private:
+        return b''
+    codec_private = bytes(codec_private)
+    if codec_private[:4] == b'\x00\x00\x00\x01' or codec_private[:3] == b'\x00\x00\x01':
+        return codec_private
+    out = MVCDecoderThread._convert_avcc_to_annexb(None, codec_private)
+    return out or b''
 
 
 class SequenceDemuxer:
@@ -721,10 +813,14 @@ class MVCDecoderThread(QThread):
     # V7b+ SYNC FIX: Signal emitted with the EXACT timestamp of the IDR found after seek
     # The GUI must seek MPV to this timestamp to guarantee audio/video synchronization
     seekIDRFound = Signal(float)  # (idr_timestamp_seconds)
+    thumbnailHarvested = Signal(float, QImage)  # (pts_seconds, 320x180 RGB) — zero-I/O preview harvest
     # New signal for audio synchronization based on the decoder's markers
     frameTimestampReady = Signal(int, float, int)  # (frame_id, timestamp_seconds, poc)
     # PGS subtitle streaming - emits raw PGS data for real-time parsing
     pgsDataReady = Signal(bytes, float)  # (pgs_data, pts_seconds)
+    # BD3D authored graphics depth: emitted when the OFMD offset metadata (SEI of
+    # the dependent view, per GOP) changes the active PG plane disparity.
+    pgDepthChanged = Signal(float)  # normalized eye-width disparity (>0 = in front)
     # Subtitle tracks detected - emits list of available subtitle tracks
     subtitleTracksDetected = Signal(list)  # [{trackNumber, codecId, language, name, isPGS}, ...]
 
@@ -743,6 +839,14 @@ class MVCDecoderThread(QThread):
         
         # THREAD SAFETY FIX: Remove direct player access
         # self.player = player  <-- REMOVED to prevent 0xe24c4a02 crashes
+        # THUMB HARVEST throttle: anchored at init time so the FIRST harvest
+        # fires ~10s into playback — never inside the first-frame/native-init
+        # window (keep the critical startup path free of extra work).
+        self._last_thumb_harvest = time.time()
+        # Packed-stereo layout for thumbnails ('sbs'|'tab'|None): a thumbnail is
+        # a single eye, so packed frames are cropped before downscale. Set by
+        # the player right after thread creation (video_3d_info stereo_mode).
+        self._thumb_layout = None
         
         self.decoder = None
         self._stop_requested = False
@@ -790,12 +894,15 @@ class MVCDecoderThread(QThread):
         self._liquid_pacing = os.environ.get('SYLC_LIQUID', '1') not in ('0', 'false', 'False', 'no', 'off')
         self._liquid_stretch = 0.0
         self._enable_audio_sync = True
-        # V58: A/V sync offset — DELAY the video by this many seconds to compensate the
-        # audio OUTPUT latency (Windows WASAPI mixer / Bluetooth / HDMI) that MPV's
-        # time-pos does NOT account for, so the picture matches the actually-HEARD audio.
-        # Tunable live from the GUI with the [ and ] keys. 0.0 = no compensation.
-        # 0.75s tuned by ear for this setup (wired / WASAPI shared-mode latency).
-        self._av_sync_offset_s = 0.75
+        # V58/V60: A/V sync trim in seconds. Positive = delay the video (audio chain
+        # slower than mpv reports: BT/eARC/soundbar); negative = advance the video
+        # (display chain slower: projector/TV processing latency). mpv's time-pos
+        # ALREADY subtracts the WASAPI output-buffer delay, so the correct default
+        # is 0.0 — the old 0.75 was tuned by ear against the pre-V53/V59c
+        # half-frozen audio clock and became a pure 0.75s picture lag once the
+        # clock was fixed. Tunable live with [ and ]; the GUI persists the value
+        # per install (~/.sylc3d_player.json) and re-applies it on every load.
+        self._av_sync_offset_s = 0.0
 
         self.decoder_ready = False
         self._fatal_error = False
@@ -807,6 +914,22 @@ class MVCDecoderThread(QThread):
         self._priming_in_progress = False  # V16 FIX: Flag for increased ENOBUFS tolerance during priming
         self._needs_full_reset = False
         self.frame_buffer = []
+
+        # V60 SYNC-PTS: TRUE container PTS routed to presentation. Every fed frame
+        # pair pushes its demuxer timestamp here (a min-heap); every frame that
+        # enters the presentation queue (display order — exact since the
+        # monotone-POC fix) pops the smallest one. Frames drained-and-DISCARDED
+        # during priming consumed the earliest display slots, so their count
+        # (_pts_discard_credit) is burned off the heap first. Replaces the
+        # arrival-order synthetic base+n*frametime stamps whose bias (priming
+        # discards = whole missing slots) parked a constant lip-sync error.
+        self._pts_pending = []
+        self._pts_discard_credit = 0
+        self._pts_last_emit_ts = None
+        self._emit_seq = 0
+        # V60 SYNC-METER: rolling A/V diff samples for the periodic report
+        self._sync_meter = deque(maxlen=512)
+        self._sync_meter_count = 0
 
         # V10 SSIF FIX: Flag to emit seekIDRFound after priming when IDR is not at start
         self._emit_ssif_sync_after_priming = False
@@ -835,7 +958,11 @@ class MVCDecoderThread(QThread):
 
         # V43 FIX: V12 sync startup grace period and hold timeout
         self._v12_frames_emitted = 0  # Skip V12 sync for first 30 frames
-        self._v12_hold_start = None  # Track hold duration for 2s timeout
+        self._v12_hold_start = None  # Track hold duration for hold timeout
+        self._v12_audio_stale_freerun = False  # V59: emit wall-clock paced while audio clock is stale
+        self._v12_freerun_audio0 = None        # V59: audio clock value when free-run engaged
+        self._v12_freerun_from_seek = False    # V61: free-run entered at seek (vs mid-play stall)
+        self._audio_gate_near_since = None     # V61: audio-gate settle tracker
 
         # MEMORY LEAK FIX V5.7: Add maxlen to presentation_queue
         # Limit to ~3 seconds of frames at 24fps = 72 frames
@@ -959,10 +1086,11 @@ class MVCDecoderThread(QThread):
         # Show first frame, then wait for audio to catch up.
         self.mutex.unlock()
         self._audio_mutex.lock()
-        self._audio_gate_locked = False 
+        self._audio_gate_locked = False
         self._waiting_for_audio_edge = True # Enable "Show & Hold"
         self._audio_gate_timeout_start = time.time()
-        self._sync_pending = True       
+        self._audio_gate_near_since = None  # V61: settle tracker for the release test
+        self._sync_pending = True
         self._audio_mutex.unlock()
         return
 
@@ -1092,20 +1220,18 @@ class MVCDecoderThread(QThread):
             # MKV: Use has_subtitle_data() and read_subtitle_block()
             if hasattr(self.demuxer, 'has_subtitle_data'):
                 has_data = self.demuxer.has_subtitle_data()
-                if has_data:
-                    logger.info(f"[POLL-SUBS] has_subtitle_data() = True!")
 
                 while has_data:
                     success, block = self.demuxer.read_subtitle_block()
-                    logger.debug(f"[POLL-SUBS] read_subtitle_block() -> success={success}, block_type={type(block)}")
                     if not success or block is None:
-                        logger.debug(f"[POLL-SUBS] Breaking loop: success={success}, block is None={block is None}")
                         break
 
                     pts_seconds = block['timestampMs'] / 1000.0
                     data = bytes(block['data'])
 
-                    logger.info(f"[POLL-SUBS] Got subtitle block: PTS={pts_seconds:.3f}s, size={len(data)} bytes")
+                    # DEBUG level: this runs in the decode hot loop — INFO here
+                    # spams the log at every PGS cue during playback.
+                    logger.debug(f"[POLL-SUBS] Got subtitle block: PTS={pts_seconds:.3f}s, size={len(data)} bytes")
 
                     # Emit PGS data for real-time parsing by SubtitleManager
                     self.pgsDataReady.emit(data, pts_seconds)
@@ -1134,10 +1260,73 @@ class MVCDecoderThread(QThread):
         self.seek(timestamp_seconds)
 
     def adjust_av_offset(self, delta):
-        """V58: change the A/V sync offset (how much the video is delayed to match the
-        heard audio). Positive = more video delay (for more audio lag). Returns new value."""
-        self._av_sync_offset_s = max(0.0, min(2.0, self._av_sync_offset_s + delta))
+        """V58/V60: change the A/V sync trim. Positive = delay the video (audio chain
+        latency); negative = advance the video (display chain latency). Returns new value."""
+        self._av_sync_offset_s = max(-1.0, min(2.0, self._av_sync_offset_s + delta))
         return self._av_sync_offset_s
+
+    def _push_pair_pts(self, base, dep):
+        """V60 SYNC-PTS: register the container PTS (display time, ms in the demuxer
+        dicts) of a frame pair that was actually FED to the decoder."""
+        try:
+            ts = None
+            if base and 'timestamp' in base:
+                ts = float(base['timestamp']) / 1000.0
+            elif dep and 'timestamp' in dep:
+                ts = float(dep['timestamp']) / 1000.0
+            if ts is not None:
+                heapq.heappush(self._pts_pending, ts)
+        except Exception:
+            pass
+
+    def _push_pts_value(self, ts_seconds):
+        """V60 SYNC-PTS: register an already-known PTS (seconds)."""
+        try:
+            if ts_seconds is not None:
+                heapq.heappush(self._pts_pending, float(ts_seconds))
+        except Exception:
+            pass
+
+    def _assign_emit_pts(self, data):
+        """V60 SYNC-PTS: stamp a frame entering the presentation queue with its TRUE
+        container PTS. Emission happens in display order (monotone-POC), and PTS
+        sorted ascending IS display order, so popping the smallest pending PTS per
+        emitted frame pairs them exactly. Self-healing: entries whose frames never
+        delivered (corrupt, seek edges) are dropped once stale; if the heap is
+        empty or implausible, fall back to the last stamp + one frame time."""
+        ft = self.target_frame_time
+        last = self._pts_last_emit_ts
+        # First frame after (re)start: anchor on base_timestamp with a wide window
+        # (recovery-point seeks land up to ~2-3s from the requested target).
+        expected = self.base_timestamp if last is None else last + ft
+        window = 3.0 if last is None else 0.5
+        ts = None
+        try:
+            # Frames drained-and-discarded during priming consumed the earliest
+            # display slots: burn their PTS entries first.
+            while self._pts_discard_credit > 0 and self._pts_pending:
+                heapq.heappop(self._pts_pending)
+                self._pts_discard_credit -= 1
+            # Drop stale entries (their frame will never be presented).
+            while self._pts_pending and self._pts_pending[0] < expected - window:
+                heapq.heappop(self._pts_pending)
+            if self._pts_pending and self._pts_pending[0] <= expected + window:
+                ts = heapq.heappop(self._pts_pending)
+        except Exception:
+            ts = None
+        if ts is None:
+            ts = expected
+        data['timestamp'] = ts
+        self._pts_last_emit_ts = ts
+        self._emit_seq += 1
+        return ts
+
+    def _reset_pts_pipeline(self):
+        """V60 SYNC-PTS: clear PTS state (seek / full reset)."""
+        self._pts_pending.clear()
+        self._pts_discard_credit = 0
+        self._pts_last_emit_ts = None
+        self._emit_seq = 0
 
     def _get_audio_clock(self):
         """Returns the extrapolated audio clock."""
@@ -1194,53 +1383,37 @@ class MVCDecoderThread(QThread):
                 logger.info(f"[MVC-THREAD] Multi-segment feature: {len(self._feature_segments)} SSIF "
                             f"segments -> SequenceDemuxer (seamless branching)")
                 self.demuxer = SequenceDemuxer(self._feature_segments, mvc_demuxer_cpp.MVCSSIFDemuxer)
-            elif ext == '.ssif':
-                # SSIF = Blu-ray 3D metadata file pointing to 2 separate M2TS streams
-                # Requires MVCSSIFDemuxer which parses extent table and opens both streams
-                logger.info("[MVC-THREAD] Using MVCSSIFDemuxer (Blu-ray 3D SSIF)")
-                self.demuxer = mvc_demuxer_cpp.MVCSSIFDemuxer()
-            elif ext in ['.m2ts', '.ts']:
-                # Check if this M2TS has a companion SSIF file (Blu-ray 3D structure)
-                try:
-                    if hasattr(mvc_demuxer_cpp, 'SSIFParser') and mvc_demuxer_cpp.SSIFParser.has_ssif(self.filepath):
-                        ssif_path = mvc_demuxer_cpp.SSIFParser.detect_ssif_path(self.filepath)
-                        if ssif_path:
-                            logger.info(f"[MVC-THREAD] SSIF companion detected: {ssif_path}")
-                            logger.info("[MVC-THREAD] Using MVCSSIFDemuxer (Blu-ray 3D via M2TS)")
-                            self.demuxer = mvc_demuxer_cpp.MVCSSIFDemuxer()
-                            self.filepath = ssif_path  # Use SSIF path for demuxer
-                        else:
-                            logger.info("[MVC-THREAD] Using MVCM2TSDemuxer (Dual-PID M2TS)")
-                            self.demuxer = mvc_demuxer_cpp.MVCM2TSDemuxer()
-                    else:
-                        logger.info("[MVC-THREAD] Using MVCM2TSDemuxer (Dual-PID M2TS)")
-                        self.demuxer = mvc_demuxer_cpp.MVCM2TSDemuxer()
-                except Exception as e:
-                    logger.warning(f"[MVC-THREAD] SSIF detection failed: {e}, using MVCM2TSDemuxer")
-                    self.demuxer = mvc_demuxer_cpp.MVCM2TSDemuxer()
-            elif ext in ('.mkv', '.mk3d'):
-                logger.info("[MVC-THREAD] Using MVCMatroskaDemuxer")
-                self.demuxer = mvc_demuxer_cpp.MVCMatroskaDemuxer()
             else:
-                # mp4/avi/mov/flv/webm/raw… : the C++ Matroska demuxer can't open
-                # these, so use the libavformat-backed demuxer (task #391). On any
-                # problem we fall back to the Matroska demuxer, whose open() will
-                # fail → error signal → the player's bulletproof mpv fallback (#388).
-                self.demuxer = None
-                try:
-                    import lavf_h264_demuxer
-                    if lavf_h264_demuxer.is_available():
-                        logger.info(f"[MVC-THREAD] Using LavfH264Demuxer (libavformat) for {ext}")
-                        self.demuxer = lavf_h264_demuxer.LavfH264Demuxer()
-                except Exception as _e:
-                    logger.warning(f"[MVC-THREAD] lavf demuxer unavailable ({_e})")
-                if self.demuxer is None:
-                    logger.info("[MVC-THREAD] Falling back to MVCMatroskaDemuxer")
-                    self.demuxer = mvc_demuxer_cpp.MVCMatroskaDemuxer()
+                # Selection factored into create_demuxer() — shared with the
+                # ThumbnailService (spec 2026-07-14). Same demuxers as before.
+                self.demuxer, _eff = create_demuxer(self.filepath)
+                if _eff != self.filepath:
+                    logger.info(f"[MVC-THREAD] SSIF companion detected: {_eff}")
+                    self.filepath = _eff  # Use SSIF path for demuxer
+                logger.info(f"[MVC-THREAD] Using {type(self.demuxer).__name__} (create_demuxer)")
 
             if not self.demuxer.open(self.filepath):
-                self.error.emit(f"Unable to open file: {self.filepath}")
-                return False
+                # FRESH-MOUNT SETTLE RETRY (2026-07-14, Avatar ISO): right after
+                # an ISO mount, reads can transiently return nothing — the
+                # codec-private extraction failed at T+0 while the IDENTICAL
+                # open succeeded 2s later. One retry with a fresh instance.
+                logger.warning("[MVC-THREAD] Demuxer open failed — fresh-mount settle retry in 1.5s...")
+                for _ in range(15):
+                    if self._stop_requested:
+                        return False
+                    time.sleep(0.1)
+                try:
+                    if self._feature_segments and ext == '.ssif':
+                        self.demuxer = SequenceDemuxer(self._feature_segments, mvc_demuxer_cpp.MVCSSIFDemuxer)
+                    else:
+                        self.demuxer, _eff_r = create_demuxer(self.filepath)
+                        self.filepath = _eff_r
+                except Exception as e:
+                    logger.warning(f"[MVC-THREAD] Settle-retry re-create failed: {e}")
+                if not self.demuxer.open(self.filepath):
+                    self.error.emit(f"Unable to open file: {self.filepath}")
+                    return False
+                logger.info("[MVC-THREAD] Settle retry succeeded — demuxer open on 2nd attempt")
 
             # Provide duration hint when available (helps seek positioning when MKV header lacks Duration)
             try:
@@ -1690,10 +1863,24 @@ class MVCDecoderThread(QThread):
             # With n_threads=0, each NAL is processed inline and frames are immediately
             # available for draining, preventing DPB saturation. Verified: 2000 AUs,
             # 2000 MVC frames, 0 errors with n_threads=0.
-            alloc_threads = 0  # Synchronous decode (no worker thread, no DPB overflow)
+            # MULTITHREADED DECODE (2026-07-13): enabled after fixing the three MT
+            # bugs in edge264 (MT-fatal DPB assert; unset_currPic force-complete
+            # racing the workers' remaining_mbs accounting; edge264_free teardown
+            # deadlock on winpthread). Validated on real content: bit-exact output
+            # (per-POC sha over 192 frames), 80 -> 146 fps at 4 threads. Workers
+            # deliver frames with POC-order jitter — absorbed by the sorted
+            # frame_buffer reorder (sort_key, REORDER_DEPTH). The existing
+            # predrain/ENOBUFS machinery matches the MT drain-in-feeder contract.
+            # 0 = legacy synchronous decode (env override to compare/rollback).
+            try:
+                alloc_threads = int(os.environ.get('SYLC_EDGE264_THREADS', '4'))
+            except ValueError:
+                alloc_threads = 4
+            alloc_threads = max(0, min(16, alloc_threads))
             self._alloc_threads = alloc_threads  # V51: remember threading mode to skip pointless async drain-retries
-            logger.info(f"[MVC-THREAD] Alloc with {alloc_threads} thread")
-            ptr = edge264.edge264_alloc(alloc_threads, None, None, 0, None, None, None)
+            logger.info(f"[MVC-THREAD] Alloc with {alloc_threads} thread(s)")
+            with edge264_session_lock:
+                ptr = edge264.edge264_alloc(alloc_threads, None, None, 0, None, None, None)
             if not ptr:
                 raise MemoryError("Alloc failed")
             self.decoder = ctypes.c_void_p(ptr)
@@ -1809,6 +1996,8 @@ class MVCDecoderThread(QThread):
             logger.info(f"[MVC-THREAD] Priming decoder with {PRIME_AU_COUNT} AUs...")
             self._priming_in_progress = True  # V16 FIX: Mark priming phase - increased ENOBUFS tolerance
             prime_aus = [idr_au_data]
+            # V60 SYNC-PTS: the scan-returned IDR AU is the first fed display frame
+            self._push_pts_value(idr_timestamp if idr_timestamp is not None else self.base_timestamp)
             for _ in range(PRIME_AU_COUNT - 1):
                 if self._stop_requested: return
                 success, base, dep = self.demuxer.read_next_frame_pair()
@@ -1819,7 +2008,9 @@ class MVCDecoderThread(QThread):
                 logger.debug(f"[MVC-DIAG] Frame pair: base={base_size} bytes, dep={dep_size} bytes")
                 if base and 'data' in base: au_data.extend(bytes(base['data']))
                 if dep and 'data' in dep: au_data.extend(bytes(dep['data']))
-                if au_data: prime_aus.append(au_data)
+                if au_data:
+                    prime_aus.append(au_data)
+                    self._push_pair_pts(base, dep)  # V60 SYNC-PTS
 
             priming_drain_total = 0
             for i, au_data in enumerate(prime_aus):
@@ -1850,6 +2041,9 @@ class MVCDecoderThread(QThread):
                         logger.warning(f"[MVC-THREAD] V33k: Priming drain error (ignored): {e}")
 
             logger.info(f"[MVC-THREAD] Priming complete: {len(prime_aus)} AUs processed, {priming_drain_total} frames drained")
+            # V60 SYNC-PTS: the drained frames were DISCARDED (never presented) —
+            # they consumed the earliest display slots, so burn their PTS entries.
+            self._pts_discard_credit += priming_drain_total
             self._priming_in_progress = False  # V16 FIX: End priming phase
 
             if self._fatal_error:
@@ -2011,7 +2205,8 @@ class MVCDecoderThread(QThread):
                         try:
                             # V8 FIX: self.decoder is already c_void_p, pass byref directly
                             # edge264_free expects POINTER(c_void_p) which is &decoder
-                            edge264.edge264_free(ctypes.byref(self.decoder))
+                            with edge264_session_lock:
+                                edge264.edge264_free(ctypes.byref(self.decoder))
                             logger.info("[MVC-THREAD] V8: edge264_free successful")
                         except Exception as e:
                             logger.warning(f"[MVC-THREAD] V8: edge264_free warning (ignored): {e}")
@@ -2023,6 +2218,7 @@ class MVCDecoderThread(QThread):
                     self.frame_buffer.clear()
                     self.presentation_queue.clear()
                     self.au_buffers.clear()
+                    self._reset_pts_pipeline()  # V60 SYNC-PTS
 
                     # STEP 3: RESET - Reset the counters
                     self.frame_count = 0
@@ -2034,6 +2230,25 @@ class MVCDecoderThread(QThread):
                     self._startup_frames_emitted = 0  # V7c: Reset startup bypass counter
                     self._v12_frames_emitted = 0  # V43: Reset V12 startup grace period
                     self._v12_hold_start = None  # V43: Reset hold timeout
+                    # V59b: START in free-run — right after a seek the mpv audio
+                    # clock is stale by construction (seek+restart latency); holding
+                    # frames against it froze the picture for the hold duration.
+                    # Free-run emits wall-clock paced immediately.
+                    # V61: mark it as FROM-SEEK — the disengage test is then
+                    # "raw clock landed near base_timestamp", NOT "clock moved
+                    # 200ms" (the V53 extrapolation creeps even on a frozen mpv
+                    # and faked the movement, re-engaging sync against a dead
+                    # clock -> 0.6s hold-timeout churn after every deep seek).
+                    self._v12_audio_stale_freerun = True
+                    self._v12_freerun_audio0 = None
+                    self._v12_freerun_from_seek = True
+                    self._v12_freerun_t0 = time.time()
+                    # V59b: drop pre-seek PLL state — stale drift distorted the
+                    # post-seek pacing (up to ±20% frame time for no reason).
+                    self._timing_adjustment_mutex.lock()
+                    self._timing_drift_ms = 0.0
+                    self._timing_adjustment_mutex.unlock()
+                    self._pll_integral = 0.0
 
                     # ╔═══════════════════════════════════════════════════════════════════╗
                     # ║  V8 SEEK OPTIMIZATION: Use cached IDR positions when available     ║
@@ -2151,8 +2366,13 @@ class MVCDecoderThread(QThread):
                             # ╚═══════════════════════════════════════════════════════════════════╝
                             logger.info("[MVC-THREAD] V8: Allocating fresh decoder...")
                             try:
-                                alloc_threads = 0  # Synchronous decode (no worker thread)
-                                ptr = edge264.edge264_alloc(alloc_threads, None, None, 0, None, None, None)
+                                # SEEK-PERF FIX: this used to hardcode 0 threads, silently
+                                # DOWNGRADING the decoder to synchronous mode after the first
+                                # seek (and priming single-threaded). Recreate with the same
+                                # threading mode as the initial alloc (SYLC_EDGE264_THREADS).
+                                alloc_threads = getattr(self, '_alloc_threads', 0)
+                                with edge264_session_lock:
+                                    ptr = edge264.edge264_alloc(alloc_threads, None, None, 0, None, None, None)
                                 if not ptr:
                                     raise MemoryError("V8: Decoder alloc failed")
                                 self.decoder = ctypes.c_void_p(ptr)
@@ -2202,6 +2422,8 @@ class MVCDecoderThread(QThread):
                                 extra_prime_count = 9   # 9 extra = 10 total (V33q: DPB fill)
 
                             prime_aus = [idr_au_data]
+                            # V60 SYNC-PTS: first fed display frame = the scan-returned IDR AU
+                            self._push_pts_value(idr_timestamp if idr_timestamp is not None else self.base_timestamp)
                             for _ in range(extra_prime_count):
                                 if self._stop_requested: break
                                 try:
@@ -2210,38 +2432,53 @@ class MVCDecoderThread(QThread):
                                     au_data = bytearray()
                                     if base and 'data' in base: au_data.extend(bytes(base['data']))
                                     if dep and 'data' in dep: au_data.extend(bytes(dep['data']))
-                                    if au_data: prime_aus.append(au_data)
+                                    if au_data:
+                                        prime_aus.append(au_data)
+                                        self._push_pair_pts(base, dep)  # V60 SYNC-PTS
                                 except Exception as e:
                                     logger.warning(f"[MVC-THREAD] V8: Priming AU read error: {e}")
                                     break
 
                             logger.info(f"[MVC-THREAD] V8: Priming {len(prime_aus)} AUs...")
+                            # SEEK-PERF FIX: the old drain retried 5x with 1ms sleeps per AU
+                            # (~50-75ms of pure sleep per seek). Feed back-to-back — with
+                            # worker threads the decode overlaps the feeding — and drain
+                            # non-blockingly between AUs (no retry sleeps): DPB pressure is
+                            # already handled by the ENOBUFS machinery in _push_nal_direct.
+                            tmp_frame = Edge264Frame()
+                            _seek_prime_discards = 0  # V60 SYNC-PTS
                             for i, au_data in enumerate(prime_aus):
                                 if self._stop_requested: break
                                 self._process_au_data(bytes(au_data), force=True)
-                                # Drain frames during priming
-                                # V8 CRASH FIX: Add try/except and stop check for safety
-                                # V12 NON-BLOCKING FIX: Add retry loop with yields
                                 if self.decoder:
                                     try:
                                         edge264.edge264_bump_frames(self.decoder)
-                                        tmp_frame = Edge264Frame()
-                                        drain_retry = 0
-                                        max_drain_retry = 5
-                                        while not self._stop_requested:
-                                            ret = edge264.edge264_get_frame(self.decoder, ctypes.byref(tmp_frame), 0)
-                                            if ret == 0:
-                                                drain_retry = 0  # Reset on success
-                                                # else: Just drain, do not present
-                                            else:
-                                                # V12 NON-BLOCKING FIX: Retry with yield
-                                                drain_retry += 1
-                                                if drain_retry >= max_drain_retry:
-                                                    break
-                                                time.sleep(0.001)  # 1ms yield
-                                                edge264.edge264_bump_frames(self.decoder)
+                                        while not self._stop_requested and \
+                                                edge264.edge264_get_frame(self.decoder, ctypes.byref(tmp_frame), 0) == 0:
+                                            _seek_prime_discards += 1  # drain only, do not present
                                     except (OSError, RuntimeError) as e:
                                         logger.warning(f"[MVC-THREAD] V8: Seek priming drain error (ignored): {e}")
+                            # Final settle: give in-flight worker tasks a bounded chance to
+                            # land (two consecutive empty passes or ~30ms, whichever first).
+                            if self.decoder and not self._stop_requested:
+                                try:
+                                    empty_passes = 0
+                                    settle_deadline = time.time() + 0.030
+                                    while empty_passes < 2 and time.time() < settle_deadline:
+                                        edge264.edge264_bump_frames(self.decoder)
+                                        drained_any = False
+                                        while edge264.edge264_get_frame(self.decoder, ctypes.byref(tmp_frame), 0) == 0:
+                                            drained_any = True
+                                            _seek_prime_discards += 1  # V60 SYNC-PTS
+                                        empty_passes = 0 if drained_any else empty_passes + 1
+                                        if not drained_any:
+                                            time.sleep(0.002)
+                                    logger.debug(f"[SEEK-PERF] prime settle done +{time.time() - self._seek_perf_t0:.2f}s")
+                                except (OSError, RuntimeError):
+                                    pass
+                            # V60 SYNC-PTS: drained-and-discarded frames consumed the
+                            # earliest display slots — burn their PTS entries.
+                            self._pts_discard_credit += _seek_prime_discards
 
                             # ╔═══════════════════════════════════════════════════════════════════╗
                             # ║  V8 STEP 9: UPDATE base_timestamp with ACTUAL IDR timestamp      ║
@@ -2384,7 +2621,7 @@ class MVCDecoderThread(QThread):
                                                 return np.zeros((ph, pw), dtype=np.uint8)
                                             if not base_ptr or pw <= 0 or ph <= 0 or ps < pw:
                                                 return np.zeros((ph, pw), dtype=np.uint8)
-                                            return np.ctypeslib.as_array(base_ptr, shape=(ph, ps))[:, :pw].copy()
+                                            return _PLANE_POOL.copy(np.ctypeslib.as_array(base_ptr, shape=(ph, ps))[:, :pw])
 
                                         y_l = get_plane_copy(pause_frame.samples[0], w, h, sy)
 
@@ -2419,6 +2656,15 @@ class MVCDecoderThread(QThread):
                                         frame_data = {'left': (y_l, u_l, v_l), 'right': (y_r, u_r, v_r)}
                                         self._emit_single_frame(frame_data)
                                         logger.info("[MVC-THREAD] V8: Pause frame displayed at new position")
+                                        # THUMB HARVEST at seek landing: free cache
+                                        # fill at the landed IDR (base_timestamp).
+                                        try:
+                                            from thumbnail_service import planes_to_qimage_320
+                                            _timg = planes_to_qimage_320(y_l, u_l, v_l, layout=self._thumb_layout)
+                                            if _timg is not None and self.base_timestamp is not None:
+                                                self.thumbnailHarvested.emit(float(self.base_timestamp), _timg)
+                                        except Exception:
+                                            pass
                                     # CRITICAL: Return frame AFTER all data is copied
                                     if self.decoder and pause_frame.return_arg:
                                         try:
@@ -2709,7 +2955,10 @@ class MVCDecoderThread(QThread):
                         # V7c FIX: Don't emit decodingFinished here - set flag for later
                         # This prevents GUI cleanup racing with our own cleanup
                         self._eos_reached = True
-                        break
+                    # break OUTSIDE the finally: same control flow (the except above
+                    # already handles every Exception), but a break inside finally
+                    # would swallow KeyboardInterrupt/SystemExit (Py3.14 warns).
+                    break
 
                 # 3. Aggressive Keyframe Draining
                 # If new frame is a keyframe, drain DPB aggressively to make space
@@ -2774,6 +3023,7 @@ class MVCDecoderThread(QThread):
                     if not self._seek_requested and not self._seek_in_progress and self.decoder:
                         try:
                             self._process_au_data(bytes(au_data))
+                            self._push_pair_pts(base, dep)  # V60 SYNC-PTS
                         except (OSError, RuntimeError) as e:
                             logger.warning(f"[MVC-THREAD] _process_au_data exception (ignored): {e}")
 
@@ -2962,7 +3212,8 @@ class MVCDecoderThread(QThread):
                             # V7b STABILITY FIX: Extra checks before free
                             if self.decoder and self.decoder.value and not self._cleanup_in_progress:
                                 decoder_ptr = ctypes.c_void_p(self.decoder.value)
-                                edge264.edge264_free(ctypes.byref(decoder_ptr))
+                                with edge264_session_lock:
+                                    edge264.edge264_free(ctypes.byref(decoder_ptr))
                                 logger.info("[MVC-THREAD] edge264_free() completed successfully")
                         except OSError:
                             # Catch Windows fatal exceptions (access violation) safely
@@ -3327,9 +3578,38 @@ class MVCDecoderThread(QThread):
                 except Exception:
                     pass
 
+    def set_pg_offset_sequence(self, seq_id):
+        """Select which BD3D offset sequence drives the PG subtitle depth
+        (from the playlist's STN_table_SS mapping for the chosen PG PID)."""
+        self._pg_offset_seq_id = int(seq_id)
+        self._pg_last_disparity = None   # force re-emit with the new sequence
+        logger.info(f"[BD3D-DEPTH] PG offset sequence -> {seq_id}")
+
+    def _scan_bd3d_offset_metadata(self, au_data):
+        """Extract the authored PG depth from OFMD SEIs (GOP-start dep AUs)."""
+        try:
+            from bd3d_offset_metadata import ofmd_scan, offset_to_disparity
+            res = ofmd_scan(au_data)
+            if res is None:
+                return
+            frames, seqs = res
+            seq_id = getattr(self, '_pg_offset_seq_id', 0)
+            if not (0 <= seq_id < len(seqs)):
+                seq_id = 0
+            row = seqs[seq_id]
+            # offsets are constant within a GOP in practice -> use the median
+            off = sorted(row)[len(row) // 2]
+            disp = offset_to_disparity(off)
+            if disp != getattr(self, '_pg_last_disparity', None):
+                self._pg_last_disparity = disp
+                self.pgDepthChanged.emit(disp)
+        except Exception:
+            pass  # depth is best-effort; never disturb the decode loop
+
     def _process_au_data(self, au_data, force=False):
         """Process Access Unit data. force=True allows processing during seek (for re-priming)."""
         if not au_data: return
+        self._scan_bd3d_offset_metadata(au_data)
 
         # V54: backpressure — wait here (outside the delivery lock) if the presenter
         # hasn't drained the buffer yet, so decode doesn't evict unshown frames.
@@ -3408,9 +3688,9 @@ class MVCDecoderThread(QThread):
                     self._waiting_for_idr = False
 
             if has_idr and self.decoder:
-                # Signal a mandatory Epoch change for the NEXT frame delivered
-                # This ensures frames from this IDR onwards are sorted AFTER any previous frames
-                self.force_next_epoch = True
+                # (MONOTONE-POC: no epoch signalling anymore — the decoder's
+                # IDR-floored POC keeps display order sortable by POC alone,
+                # see _queue_frame_for_display.)
                 # Mimic ultimate_mvc_player.py: Drain aggressive before IDR
                 # This ensures old scene frames are out before new scene starts
                 # V8 CRASH FIX: Check seek flags before ANY edge264 call in drain loop
@@ -3919,8 +4199,10 @@ class MVCDecoderThread(QThread):
 
             # V7b TIMELINE FIX: ALWAYS emit timestamp for timeline progression
             # Timeline needs this signal even when audio sync is disabled
+            # V60: 'timestamp' is now always set (SYNC-PTS stamps at emission), but
+            # 'id' only exists when _enable_audio_sync populated it — use .get().
             if 'timestamp' in frame_data:
-                self.frameTimestampReady.emit(frame_data['id'], frame_data['timestamp'], frame_data['poc'])
+                self.frameTimestampReady.emit(frame_data.get('id', 0), frame_data['timestamp'], frame_data.get('poc', 0))
 
         except Exception as e:
             logger.error(f"[MVC-THREAD] Error emitting frame: {e}")
@@ -3930,47 +4212,26 @@ class MVCDecoderThread(QThread):
         try:
             current_poc = frame_data.get('poc', 0)
 
-            # Epoch detection logic
-            # If POC drops significantly, it's a new scene (Next Epoch).
-            # If POC jumps significantly relative to current scene, it's a straggler (Previous Epoch).
-
-            frame_epoch = self.epoch
-
-            # Explicit Epoch forcing (from IDR detection)
-            if self.force_next_epoch:
-                self.epoch += 1
-                frame_epoch = self.epoch
-                self.last_poc_ordered = current_poc
-                self.force_next_epoch = False
-
-            elif self.last_poc_ordered != -100:
-                diff = current_poc - self.last_poc_ordered
-
-                if diff < -50:
-                    # Scene Reset (e.g., 100 -> 0). New Epoch.
-                    self.epoch += 1
-                    frame_epoch = self.epoch
-                    self.last_poc_ordered = current_poc
-
-                elif diff > 50 and self.epoch > 0:
-                    # Late Old Frame (e.g., 0 -> 100). Belong to Previous Epoch.
-                    # Do NOT update last_poc_ordered (we are still effectively in the new scene)
-                    frame_epoch = self.epoch - 1
-
-                else:
-                    # Normal progression
-                    self.last_poc_ordered = max(self.last_poc_ordered, current_poc)
-            else:
-                self.last_poc_ordered = current_poc
-
-            # Add frame to buffer with sorting key (epoch, poc)
-            # We store 'frame_data' but sort by the tuple key
+            # MONOTONE-POC (2026-07-13): edge264 now floors every IDR's POC
+            # strictly above the previous GOP's max (IDR-floor patch in
+            # edge264_headers.c) on top of its continuous cross-IDR POC
+            # chaining, so POC alone is a globally valid display key for
+            # every stream it decodes. The former epoch heuristics
+            # (force_next_epoch one-shot + ±50 POC-step thresholds) are gone:
+            # under MT delivery the one-shot flag could land on an in-flight
+            # OLD frame (held ~100 emissions = a multi-second-late frame) and
+            # the +50 "straggler" rule mis-tagged whole GOPs after a rebased
+            # IDR jump (the one-frame backward jump at scene cuts). Measured
+            # against the single-thread delivery order on Avatar BD3D
+            # (3000 frames, 18 IDRs, MT=4): epoch logic = 30 inversions with
+            # the old DLL / 2 with the patched one; pure-POC sort = 0
+            # inversions, 0 displacement, at REORDER_DEPTH=4.
             self.frame_buffer.append({
-                'sort_key': (frame_epoch, current_poc),
+                'sort_key': (0, current_poc),
                 'data': frame_data
             })
 
-            # Sort by Epoch then POC
+            # Sort by POC (globally display-monotone, see above)
             self.frame_buffer.sort(key=lambda x: x['sort_key'])
 
             # DIAG: Log frame_buffer state periodically
@@ -3981,8 +4242,14 @@ class MVCDecoderThread(QThread):
             # This establishes visual flow before B-frame reordering kicks in
             startup_bypass = self._startup_frames_emitted < (self.REORDER_DEPTH + 2)
 
-            if startup_bypass and len(self.frame_buffer) >= 1:
-                # During startup, push frames immediately (in arrival order)
+            # V59b MT-ORDER GUARD: with worker threads, frames ARRIVE with POC
+            # jitter; blind arrival-order bypass scrambled the first post-seek
+            # frames (visible strobe). Emit the very first frame immediately
+            # (visual feedback), then require a small sorted lookahead (3) so
+            # bypass frames leave in display order. Costs ~2 frames of decode
+            # time (~15ms at MT speed), not perceptible.
+            _bypass_min = 1 if self._startup_frames_emitted == 0 else 3
+            if startup_bypass and len(self.frame_buffer) >= _bypass_min:
                 item = self.frame_buffer.pop(0)
                 self._repair_and_queue(item['data'])
                 self._startup_frames_emitted += 1
@@ -4034,7 +4301,7 @@ class MVCDecoderThread(QThread):
                         return np.zeros((h, w), dtype=np.uint8)
                     if not base_ptr or w <= 0 or h <= 0 or s < w:
                         return np.zeros((h, w), dtype=np.uint8)
-                    return np.ctypeslib.as_array(base_ptr, shape=(h, s))[:, :w].copy()
+                    return _PLANE_POOL.copy(np.ctypeslib.as_array(base_ptr, shape=(h, s))[:, :w])
                 except Exception:
                     return np.zeros((h, w), dtype=np.uint8)
 
@@ -4086,6 +4353,12 @@ class MVCDecoderThread(QThread):
                 'id': frame.FrameId,
             }
 
+            # V60 SYNC-PTS: stamp with the true container PTS (keeps the PTS heap
+            # accounting consistent even for stabilization-path frames).
+            try:
+                self._assign_emit_pts(frame_data)
+            except Exception:
+                pass
             # Queue directly to presentation queue (skip reordering during stabilization)
             self.presentation_queue.append(frame_data)
             self.frame_count += 1
@@ -4109,6 +4382,35 @@ class MVCDecoderThread(QThread):
                 rep = self._dep_pool.get(bp)
                 if rep is not None:
                     data['right'] = rep
+        except Exception:
+            pass
+        # V60 SYNC-PTS: overwrite the arrival-order synthetic stamp with the true
+        # container PTS matching this frame's display slot.
+        try:
+            self._assign_emit_pts(data)
+        except Exception:
+            pass
+        # THUMB HARVEST: one 320x180 copy every ~10s of playback. Zero disk I/O
+        # (planes are already numpy copies) — works on ALL sources incl. discs.
+        # SYLC_THUMB_HARVEST=0 disables (diagnostic kill-switch).
+        try:
+            if (time.time() - self._last_thumb_harvest >= 10.0 and data.get('left')
+                    and os.environ.get("SYLC_THUMB_HARVEST") != "0"):
+                self._last_thumb_harvest = time.time()
+                if os.environ.get("SYLC_THUMB_DIAG") == "1":
+                    import sys as _sys
+                    _l = data.get('left')
+                    _sys.stderr.write(f"[THUMB-DIAG] harvest firing: types={[type(x).__name__ for x in _l]} "
+                                      f"shapes={[getattr(x, 'shape', None) for x in _l]} "
+                                      f"contig={[getattr(getattr(x, 'flags', None), 'c_contiguous', None) for x in _l]} "
+                                      f"ts={data.get('timestamp')}\n")
+                from thumbnail_service import planes_to_qimage_320
+                _timg = planes_to_qimage_320(*data['left'], layout=self._thumb_layout)
+                if _timg is not None and data.get('timestamp') is not None:
+                    self.thumbnailHarvested.emit(float(data['timestamp']), _timg)
+                    if os.environ.get("SYLC_THUMB_DIAG") == "1":
+                        import sys as _sys
+                        _sys.stderr.write(f"[THUMB-DIAG] harvest emitted ts={data.get('timestamp'):.3f}\n")
         except Exception:
             pass
         self.presentation_queue.append(data)
@@ -4201,7 +4503,7 @@ class MVCDecoderThread(QThread):
                     if self._cleanup_in_progress or self._seek_requested or self._seek_in_progress or self._stop_requested:
                         return np.zeros((h, w), dtype=np.uint8)
 
-                    arr = np.ctypeslib.as_array(base_ptr, shape=(h, s))[:, :w].copy()
+                    arr = _PLANE_POOL.copy(np.ctypeslib.as_array(base_ptr, shape=(h, s))[:, :w])
                     return arr
                 except OSError as e:
                     logger.error(f"[get_plane] Fatal error accessing memory: {e}")
@@ -4616,13 +4918,18 @@ class MVCDecoderThread(QThread):
 
                     # V38 BUG FIX: Calculate timeout FIRST to avoid infinite block
                     # Previous bug: abs(diff) > 5.0 returned without checking timeout
-                    is_timeout = (time.time() - self._audio_gate_timeout_start) > 2.0
-                    
+                    # V61: 2.0 -> 5.0s — a deep seek in a big file can need a few
+                    # seconds of demux/cache work before audio actually flows; a
+                    # premature release marched the video ahead of dead audio and
+                    # V12 then burned the excess in 0.6s hold cycles (the post-seek
+                    # freeze-churn). Held video (first frame shown) is the right UX.
+                    is_timeout = (time.time() - self._audio_gate_timeout_start) > 5.0
+
                     # FILTER STALE TIMESTAMPS (> 5s away from IDR position)
                     # BUT always check timeout first!
                     if abs(diff) > 5.0:
                         if not is_timeout:
-                            self._precise_wait(0.050)
+                            self._precise_wait(0.015)  # SEEK-PERF: finer poll = faster release
                             return
                         else:
                             # V38 FIX: Timeout! Release hold even with stale timestamp
@@ -4635,8 +4942,25 @@ class MVCDecoderThread(QThread):
                     # V7b+ SYNC FIX: Now audio should be at base_timestamp since GUI seeked MPV there
                     has_audio_moved = abs(diff) < 1.0 and audio_raw > 0.1
 
+                    # V61 SETTLE: mpv reports the target position BEFORE audio actually
+                    # flows (and the ATOMIC SYNC pre-pushes it) — position alone is not
+                    # proof of playing audio. Require the clock to sit near base for
+                    # 250ms before releasing; the small backlog this builds is erased
+                    # instantly by the V50 bulk-drop on the first synced frame.
+                    if has_audio_moved and not is_timeout:
+                        _near_since = getattr(self, '_audio_gate_near_since', None)
+                        if _near_since is None:
+                            self._audio_gate_near_since = time.time()
+                            self._precise_wait(0.015)
+                            return
+                        if (time.time() - _near_since) < 0.250:
+                            self._precise_wait(0.015)
+                            return
+                    else:
+                        self._audio_gate_near_since = None
+
                     if not has_audio_moved and not is_timeout:
-                        self._precise_wait(0.050)
+                        self._precise_wait(0.015)  # SEEK-PERF: finer poll = faster release
                         return
 
                     # Audio started OR Timeout! Release the Hold.
@@ -4682,6 +5006,68 @@ class MVCDecoderThread(QThread):
                         frame_ts = self.base_timestamp + (self.frame_count * self.target_frame_time)
 
                     diff = frame_ts - audio_smooth
+
+                    # V59 STALE-AUDIO FREE-RUN: after a seek, mpv's audio clock can
+                    # stay frozen for a while (seek+restart latency). The old behavior
+                    # re-armed a 2s hard hold on EVERY frame against that dead clock —
+                    # a 0.5fps slideshow until audio revived (the post-seek stutter).
+                    # Once a hold times out we stop trusting the clock: emit paced by
+                    # wall time, and re-engage sync only when the clock has MOVED
+                    # substantially (it is live again). Normal sync then reconciles
+                    # (bulk-drop if video is behind, liquid/hold if ahead).
+                    if getattr(self, '_v12_audio_stale_freerun', False):
+                        # V61: judge liveness on the RAW clock — the V53 extrapolation
+                        # inside audio_smooth creeps forward even when mpv is frozen,
+                        # which faked the old "moved 200ms" test and re-engaged sync
+                        # against a dead clock (0.6s hold-timeout churn after seeks).
+                        self._audio_mutex.lock()
+                        _audio_raw = self._external_audio_clock
+                        self._audio_mutex.unlock()
+                        audio0 = getattr(self, '_v12_freerun_audio0', None)
+                        if audio0 is None:
+                            # baseline = first raw sample after free-run engaged
+                            self._v12_freerun_audio0 = audio0 = _audio_raw
+                        if getattr(self, '_v12_freerun_from_seek', False):
+                            # post-seek: live means the raw clock LANDED near the seek
+                            # base (mpv finished its seek and audio is at position).
+                            # 10s cap = pathological mpv (no audio track / dead seek).
+                            _live = ((abs(_audio_raw - self.base_timestamp) < 1.0 and _audio_raw > 0.1)
+                                     or (time.time() - getattr(self, '_v12_freerun_t0', 0)) > 10.0)
+                        else:
+                            # mid-play stall: live means the raw VALUE actually changed
+                            _live = abs(_audio_raw - audio0) > 0.200
+                        if _live:
+                            self._v12_audio_stale_freerun = False
+                            self._v12_freerun_from_seek = False
+                            logger.info(f"[V59-SYNC] Audio clock live again (raw={_audio_raw:.3f}s, "
+                                        f"base={self.base_timestamp:.3f}s) — resuming sync")
+                            # V61 SNAP: if free-run marched the video ahead while audio
+                            # restarted silently, don't burn the gap in 0.6s hold cycles
+                            # (frozen picture) — jump the AUDIO to the video position via
+                            # the existing atomic-sync path. Last resort: with the audio
+                            # gate + fast seeks this should rarely exceed a few 100ms.
+                            if diff > 0.6:
+                                logger.warning(f"[V61-SYNC] Free-run left video {diff*1000:.0f}ms "
+                                               f"ahead of audio — snapping audio to video position")
+                                try:
+                                    self.seekIDRFound.emit(frame_ts)
+                                except Exception:
+                                    pass
+                                diff = 0.0
+                        else:
+                            self._v12_hold_start = None
+                            diff = 0.0  # free-run: bypass Case 1/2, emit paced below
+
+                    # V60 SYNC-METER: record the true A/V diff (skip free-run's fake 0)
+                    if not getattr(self, '_v12_audio_stale_freerun', False):
+                        self._sync_meter.append(diff * 1000.0)
+                        self._sync_meter_count += 1
+                        if self._sync_meter_count % 240 == 0 and len(self._sync_meter) >= 48:
+                            _s = sorted(self._sync_meter)
+                            _n = len(_s)
+                            logger.info(f"[SYNC-METER] video-audio diff: median={_s[_n//2]:+.0f}ms "
+                                        f"p5={_s[max(0, _n//20)]:+.0f}ms p95={_s[min(_n-1, _n*19//20)]:+.0f}ms "
+                                        f"(n={_n}, av_offset={self._av_sync_offset_s*1000:+.0f}ms)")
 
                     if velvet_probe.ENABLED:
                         velvet_probe.record('v12diff_ms', diff * 1000.0)
@@ -4760,21 +5146,44 @@ class MVCDecoderThread(QThread):
                             if not hasattr(self, '_v12_hold_start') or self._v12_hold_start is None:
                                 self._v12_hold_start = time.time()
                             hold_duration = time.time() - self._v12_hold_start
-                            if hold_duration < 2.0:  # 2-second timeout
+                            # V59: 0.6s cap (was 2.0s) — long enough for a normal mpv
+                            # audio restart, short enough not to feel like a freeze.
+                            if hold_duration < 0.6:
                                 if velvet_probe.ENABLED:
                                     velvet_probe.on_hold()
                                 self._precise_wait(0.010)
                                 self.presentation_queue.appendleft(frame)  # Put back to retry
                                 return
                             else:
-                                # V43: Timeout reached - force emit to prevent permanent freeze
-                                logger.warning(f"[V12-SYNC] Hold timeout ({hold_duration:.1f}s). "
-                                             f"Force-emitting frame (diff={diff*1000:.0f}ms).")
-                                self._v12_hold_start = None  # Reset for next hold
+                                # V59: the clock did not catch up during the hold — it is
+                                # stale/stuck. Enter free-run (wall-clock paced emission)
+                                # instead of re-arming a fresh hold on every frame.
+                                logger.warning(f"[V12-SYNC] Hold timeout ({hold_duration:.1f}s), "
+                                             f"diff={diff*1000:.0f}ms — audio clock stale, "
+                                             f"entering free-run until it moves")
+                                self._v12_hold_start = None
+                                self._v12_audio_stale_freerun = True
+                                self._v12_freerun_from_seek = False
+                                # V61: baseline must be the RAW clock (the moved-test
+                                # now compares raw values; an extrapolated baseline
+                                # would fake up to +1.5s of movement instantly).
+                                self._audio_mutex.lock()
+                                self._v12_freerun_audio0 = self._external_audio_clock
+                                self._audio_mutex.unlock()
                     else:
                         # Frame is synced - reset hold timer
                         if hasattr(self, '_v12_hold_start'):
                             self._v12_hold_start = None
+                        # V60 MICRO-SYNC: inside the old -120..+150ms dead zone NOTHING
+                        # pulled diff toward 0, so a constant lip-sync error of up to
+                        # ~±5 frames could park there forever. Steer pacing gently and
+                        # SYMMETRICALLY toward diff=0: video early (+) -> stretch the
+                        # next interval, video late (-) -> shrink it. Capped at ±8ms
+                        # per frame (~±19% of 24fps pacing): a 100ms offset is absorbed
+                        # in ~0.5s with no drop, no hold, no visible speed change.
+                        # Below 25ms we leave it alone (mpv clock granularity floor).
+                        if self._liquid_pacing and abs(diff) > 0.025:
+                            self._liquid_stretch = max(-0.008, min(0.008, diff * 0.25))
 
                     # Case 3: SYNCED (within -120ms to +150ms) -> Emit normally
                     # V12b: Wider tolerance for smoother playback, continuous sync forever

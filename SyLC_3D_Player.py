@@ -214,7 +214,7 @@ except ImportError as e:
 print("[STARTUP] Base imports succeeded")
 
 os.environ["PATH"] = os.path.dirname(__file__) + os.pathsep + os.environ["PATH"]
-from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QRectF, QPointF, Slot, QEvent, QObject
+from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QRectF, QPointF, Slot, QEvent, QObject, QThread
 from PySide6.QtGui import QPainter, QColor, QFont, QFontMetrics, QPen, QBrush, QPainterPath, QBitmap, QImage, QPixmap, QIcon, QCursor
 
 
@@ -480,6 +480,17 @@ except ImportError as e:
     PGS_SUBTITLE_AVAILABLE = False
     print("[STARTUP] Degraded mode: MVC support disabled.")
 
+# Text subtitle overlay (SRT/ASS) for MVC/edge264 mode — mpv decodes the text
+# track on the shared audio clock, we paint it on the native overlay.
+try:
+    from text_subtitle_renderer import TextSubtitleRenderer
+
+    TEXT_SUBTITLE_AVAILABLE = True
+    print("[STARTUP] OK Text Subtitle renderer imported")
+except ImportError as e:
+    TEXT_SUBTITLE_AVAILABLE = False
+    print(f"[STARTUP] Text Subtitle renderer not available: {e}")
+
 print(f"[STARTUP] MVC_SUPPORT_AVAILABLE = {MVC_SUPPORT_AVAILABLE}")
 print(f"[STARTUP] SYNC_TRACER_AVAILABLE = {SYNC_TRACER_AVAILABLE}")
 print(f"[STARTUP] PGS_SUBTITLE_AVAILABLE = {PGS_SUBTITLE_AVAILABLE if 'PGS_SUBTITLE_AVAILABLE' in dir() else False}")
@@ -551,8 +562,12 @@ class RobustSeekQueue(QObject):
     seek_started = Signal(float)  # Notify UI seek started
     seek_completed = Signal()  # Notify UI seek completed
 
-    DEBOUNCE_DELAY_MS = 150  # Wait time before executing a seek
-    COOLDOWN_PERIOD_MS = 200  # Minimum delay between consecutive seeks
+    # SEEK-PERF: the decoder side of a seek measures ~25ms (headless bench) —
+    # these fixed delays WERE the perceived latency floor. 60ms still coalesces
+    # slider-drag events (they arrive every 10-30ms); 100ms cooldown still
+    # prevents seek storms while halving chained-seek latency.
+    DEBOUNCE_DELAY_MS = 60   # Wait time before executing a seek (was 150)
+    COOLDOWN_PERIOD_MS = 100  # Minimum delay between consecutive seeks (was 200)
     SEEK_TIMEOUT_MS = 45000  # Timeout for a stuck seek. Raised to 45s: a COLD optical SSIF
     # seek legitimately takes a few seconds (re-pairing the interleaved base+dependent views);
     # the old 8s fired mid-seek and its forced reset (resume MPV + seek_completed) raced the
@@ -1356,6 +1371,25 @@ class PreviewTooltip(QLabel):
         self.hide()
 
 
+def _decide_thumbs_mode(file_path, mounted_iso_letters, optical_letters, codec_name=None):
+    """Thumbnail provider decision (spec 2026-07-14). Physical optical → 'off'
+    (single head, measured 45-120s thrash with a third reader). Player-mounted
+    ISO + H.264 → 'edge264' with optical guardrails. Plain H.264 file →
+    'edge264'. Plain non-H.264 → 'ffmpeg'."""
+    if not file_path:
+        return 'off', False
+    EDGE_EXTS = {'.ssif', '.m2ts', '.ts', '.mkv', '.mk3d'}
+    ext = os.path.splitext(file_path)[1].lower()
+    is_h264 = ext in EDGE_EXTS or (codec_name or '').lower() == 'h264'
+    d = os.path.splitdrive(os.path.abspath(file_path))[0]
+    letter = d[0].upper() if d else None
+    if letter and letter in optical_letters:
+        if letter not in mounted_iso_letters:
+            return 'off', True                      # physical disc: never
+        return ('edge264', True) if is_h264 else ('off', True)
+    return ('edge264', False) if is_h264 else ('ffmpeg', False)
+
+
 class TimeSlider(QSlider):
     """Custom slider with time preview on hover."""
 
@@ -1989,6 +2023,12 @@ class PlayerWindow(QMainWindow):
     pgs_notification = Signal(str, bool)  # Emits (message, is_success) for notifications
     pgs_tracks_detected = Signal(list)  # Emits list of detected PGS tracks
     extraction_progress = Signal(float)  # Emits progress 0.0-1.0 during subtitle extraction
+    # Text subtitle (SRT/ASS) overlay: mpv's 'sub-text' observer fires on the mpv
+    # event thread; this signal marshals the cue text onto the Qt main thread.
+    mpv_sub_text_changed = Signal(str)
+    # Authored 3D depth of the active text track (disparity, measured pairs) —
+    # emitted from the background analysis thread, handled on the main thread.
+    text_sub_depth_ready = Signal(float, int)
 
     def __init__(self, parent=None):
         print("[STARTUP] Initializing PlayerWindow...")
@@ -2064,6 +2104,18 @@ class PlayerWindow(QMainWindow):
         self._streaming_subtitle_tracks = []  # Tracks detected from demuxer (no extraction needed)
         self._active_streaming_track = None   # Currently active streaming track number
         # ================================================
+        # ========== TEXT SUBTITLE (SRT/ASS) OVERLAY ==========
+        self._text_subtitle_renderer = None
+        self._text_sub_active = False          # True while a text track feeds the overlay
+        self._text_sub_connected_widgets = []  # Widgets currently wired to the text renderer
+        self._mpv_subtext_observer_registered = False
+        self._sub_depth_cache = {}             # (filepath, sub_index) -> disparity
+        if TEXT_SUBTITLE_AVAILABLE:
+            self._text_subtitle_renderer = TextSubtitleRenderer(self)
+            self.mpv_sub_text_changed.connect(self._on_mpv_sub_text)
+            self.text_sub_depth_ready.connect(self._on_text_sub_depth)
+            print("[STARTUP] Text SubtitleRenderer initialized")
+        # =====================================================
         if PGS_SUBTITLE_AVAILABLE:
             self._subtitle_manager = SubtitleManager(self)
             self._subtitle_extractor = SubtitleExtractor()
@@ -2095,6 +2147,10 @@ class PlayerWindow(QMainWindow):
         self._last_drift_adjust_time = 0.0
         self._cumulative_drift = 0.0
         self._sync_bias = 0.0  # Low-pass bias to cancel constant offset
+
+        # V60: persisted per-install settings (currently: the A/V sync trim set
+        # with [ and ] — re-applied to every new decoder thread).
+        self._app_settings = self._load_app_settings()
         
         # --- SEEK / SCRUBBING STATE ---
         # Standard "Seek on Release" logic to prevent decoder saturation
@@ -2294,6 +2350,14 @@ class PlayerWindow(QMainWindow):
             QTimer.singleShot(100, self._setup_mpv_player)
             return
 
+        # V61 STABILITY: never stack instances. stop_playback arms an async re-init;
+        # if a load already re-created the player synchronously (or re-inits pile up
+        # after several stops), creating another MPV would LEAK the previous one with
+        # live observers and its event thread — a classic source of random crashes.
+        if getattr(self, 'player', None) is not None:
+            logger.info("[MPV] _setup_mpv_player: instance already alive — skipping re-init")
+            return
+
         win_id = str(int(self.video_widget.winId()))
         logger.info(f"Configuring MPV with winId: {win_id}")
 
@@ -2354,7 +2418,11 @@ class PlayerWindow(QMainWindow):
             'demuxer-max-bytes': '2000M',
             'demuxer-max-back-bytes': '1000M',
             'stream-buffer-size': '512k',
-            'index': 'recreate',
+            # V61: 'index': 'recreate' REMOVED — it made mpv ignore the MKV's own
+            # Cues and linearly re-parse the file up to every deep seek target
+            # (2-6s of audio silence per seek on a 26GB MKV, worse the deeper
+            # the seek). Default indexing uses the container's seek index; files
+            # with broken/missing Cues still fall back to mpv's own heuristics.
             'hr-seek': 'yes',
 
             # === DECODING ===
@@ -2515,6 +2583,12 @@ class PlayerWindow(QMainWindow):
         self._is_scrubbing = False
         # Value is in ms, convert to seconds
         target_time = float(self.controls_overlay.time_slider.value()) / 1000.0
+        # PERFECT-SYNC SNAP: land exactly on the frame the tooltip promised
+        # (the exact vignette's IDR), when one was shown for this position.
+        snapped = self.controls_overlay.time_slider.snap_to_vignette(target_time)
+        if snapped != target_time:
+            logger.info(f"[THUMB] click snap: {target_time:.3f}s -> vignette IDR {snapped:.3f}s")
+            target_time = snapped
         print(f"[SEEK] Slider released at {target_time:.2f}s")
         
         # Use robust seek queue to prevent freezing/race conditions
@@ -2569,6 +2643,9 @@ class PlayerWindow(QMainWindow):
         # Clear PGS subtitle during seek
         if self._subtitle_manager:
             self._subtitle_manager.on_seek()
+        # Clear text subtitle overlay too (mpv re-emits sub-text after the seek)
+        if self._text_sub_active and self._text_subtitle_renderer:
+            self._text_subtitle_renderer.clear()
 
         self.show_3d_notification(f"Seeking to {time_pos:.1f}s...", success=True)
 
@@ -2954,7 +3031,12 @@ class PlayerWindow(QMainWindow):
         """Handle duration change in main Qt thread"""
         self.controls_overlay.set_duration(value)
         if self.current_file_path:
+            self._apply_preview_thumbs_policy(self.current_file_path)
             self.controls_overlay.time_slider.set_video_file(self.current_file_path, value or 0)
+            # THUMB: duration arrival = playback is up (mpv loaded the file for
+            # both the 2D and MVC paths) → arm shortly after; seeks re-disarm.
+            QTimer.singleShot(1000, lambda: getattr(self, '_thumb_service', None)
+                              and self._thumb_service.arm())
         # CRITICAL (SSIF/M2TS seek): mpv reports duration asynchronously, usually AFTER
         # the MVC decoder + its demuxer were created, so the demuxer's proportional seek
         # never got a duration and landed at byte 0 (restart). Push it now so seeks work.
@@ -3044,12 +3126,24 @@ class PlayerWindow(QMainWindow):
         if not self.has_media or getattr(self, '_is_loading_file', False):
             return
 
-        # Do not update if user is scrubbing OR seeking
-        if self._is_scrubbing or getattr(self, '_is_seeking', False):
-            self._last_timeline_update_time = time.monotonic()
-            return
+        # V59c AUDIO-CLOCK FIX: this poller is the ONLY feed of the decoder's
+        # audio clock (update_audio_clock below), and it used to early-return
+        # during the whole seek window — freezing the decoder's clock by
+        # construction. That frozen clock is what tripped the V12 hold storm
+        # (post-seek stutter/freeze). Feed the decoder UNCONDITIONALLY: mpv's
+        # time_pos is the truth of the audio clock at all times — pre-seek
+        # values keep the stale-detector honest, and the jump when mpv lands
+        # re-engages sync at the earliest possible moment.
+        if self.mvc_mode_active and self.mvc_decoder_thread and self.player:
+            try:
+                _mpv_now = self.player.time_pos
+                if _mpv_now is not None and _mpv_now >= 0.0:
+                    self.mvc_decoder_thread.update_audio_clock(_mpv_now)
+            except Exception:
+                pass
 
-        if not self.is_playing:
+        # Do not update the UI/timeline if user is scrubbing OR seeking
+        if self._is_scrubbing or getattr(self, '_is_seeking', False):
             self._last_timeline_update_time = time.monotonic()
             return
 
@@ -3133,6 +3227,10 @@ class PlayerWindow(QMainWindow):
 
     def on_pause_state_change(self, _, is_paused):
         """MPV pause state changed - called from MPV event thread!"""
+        # Observer-side pause cache: lets GUI-thread code (VU meter poll) know
+        # the pause state WITHOUT a blocking mpv property read (0xe24c4a02).
+        # Updated even during transitions — it's a plain bool assign.
+        self._mpv_pause_cache = bool(is_paused)
         # V14b: Ignore during transition
         if getattr(self, '_mpv_transition_in_progress', False):
             return
@@ -3260,17 +3358,55 @@ class PlayerWindow(QMainWindow):
         # Reset seek queue to prevent phantom seeks
         if hasattr(self, "_seek_queue"):
             self._seek_queue._force_reset_state()
-        self._stop_mvc_decoder()
+        # V62 STOP-CRASH FIX: mark that this stop ends in terminate() so the MVC
+        # cleanup SKIPS the gpu-next vo restore — rebuilding mpv's D3D11 chain an
+        # instant before destroying the core was half of the 0xe24c4a02 window
+        # (crash_log 2026-07-14 18:03: SEH inside mpv terminate, x3).
+        self._terminating_mpv = True
+        try:
+            self._stop_mvc_decoder()
 
-        if self.player:
+            if self.player:
+                try:
+                    # V7b STABILITY: Use terminate() instead of pause/seek 0 to fully release file handles
+                    # This prevents "file in use" errors and cleans up MPV threads
+                    # V61 STABILITY: stop the VU poller and NULL the reference BEFORE the
+                    # async re-init — every `if self.player:` guard in the codebase then
+                    # routes safely instead of poking a terminated core (access violation
+                    # if a load lands inside the 500ms re-init window).
+                    self._vu_timer.stop()
+                    _dying = self.player
+                    self.player = None
+                    # V62: quiesce BEFORE destroying — same pattern as the proven
+                    # V14b natural-end path (stop the core, let the event loop
+                    # settle, THEN destroy). terminate() on a hot core (file
+                    # loaded, vu lavfi attached) was the other half of the crash.
+                    self._mpv_transition_in_progress = True
+                    try:
+                        _dying.command('stop')
+                        time.sleep(0.150)
+                    except Exception:
+                        pass
+                    _dying.terminate()
+                    # Re-initialize player for next use after short delay
+                    QTimer.singleShot(500, self._initialize_player)
+                except Exception as e:
+                    logger.warning(f"[MPV] Error stopping player: {e}")
+        finally:
+            self._terminating_mpv = False
+
+        # V62b: a real STOP releases the disc entirely, like before the
+        # preview-service era. The thumbnail service holds open handles on the
+        # mounted volume (its own demuxer) — release them on its worker thread
+        # first, then dismount once every reader (decoder, mpv, service) is out.
+        if getattr(self, '_thumb_service', None):
             try:
-                # V7b STABILITY: Use terminate() instead of pause/seek 0 to fully release file handles
-                # This prevents "file in use" errors and cleans up MPV threads
-                self.player.terminate() 
-                # Re-initialize player for next use after short delay
-                QTimer.singleShot(500, self._initialize_player)
-            except Exception as e:
-                logger.warning(f"[MPV] Error stopping player: {e}")
+                self._thumb_service.release_file()
+            except Exception:
+                pass
+        if getattr(self, '_active_iso_mount', None) or getattr(self, '_pending_iso_mount', None):
+            self.current_file_path = None      # nothing is playing anymore
+            QTimer.singleShot(400, self._dismount_isos_after_stop)
 
         self.has_media = False
         self._update_3d_button_state()   # no media → lock the 3D button off
@@ -3849,9 +3985,35 @@ class PlayerWindow(QMainWindow):
                             else:
                                 logger.error("[STREAMING-SUBS] No display widget found for subtitle connection!")
 
-                        # Disable MPV subtitles
+                        # BD3D authored depth: route this PG stream's offset
+                        # sequence (STN_table_SS) + the per-GOP OFMD depth to
+                        # the overlay. No-ops outside BD3D (map empty).
+                        try:
+                            seq = (getattr(self, '_bd3d_pg_offset_map', None) or {}).get(actual_track_number)
+                            if seq is not None and hasattr(self.mvc_decoder_thread, 'set_pg_offset_sequence'):
+                                self.mvc_decoder_thread.set_pg_offset_sequence(seq)
+                            if (not getattr(self, '_pg_depth_connected', False)
+                                    and hasattr(self.mvc_decoder_thread, 'pgDepthChanged')):
+                                self.mvc_decoder_thread.pgDepthChanged.connect(self._on_pg_depth_changed)
+                                self._pg_depth_connected = True
+                        except Exception as _e:
+                            logger.warning(f"[BD3D-DEPTH] wiring skipped: {_e}")
+
+                        # Disable MPV subtitles + any text overlay
+                        self._disable_text_subtitles()
                         self.player.sid = 'no'
                         self.show_3d_notification(f"Streaming: {streaming_track.get('name')}", success=True)
+                        return
+
+                    elif streaming_track and self._text_subtitle_renderer is not None \
+                            and (str(streaming_track.get('codecId', '')).upper().startswith('S_TEXT')
+                                 or str(streaming_track.get('codecId', '')).upper() in ('S_ASS', 'S_SSA')):
+                        # ===== TEXT SUBTITLE PATH (SRT / ASS / SSA) =====
+                        # mpv runs audio-only here (vid=no, vo=null) so it cannot draw
+                        # text subs itself, but it still decodes the selected track on
+                        # the shared audio clock: select it and paint 'sub-text' on the
+                        # native overlay (same widget path as PGS).
+                        self._enable_text_subtitle_track(track_id, streaming_track)
                         return
 
                     elif track_id == 0:
@@ -3861,6 +4023,7 @@ class PlayerWindow(QMainWindow):
                         self._active_streaming_track = None
                         if self._subtitle_manager:
                             self._subtitle_manager.set_enabled(False)
+                        self._disable_text_subtitles()
                         self.player.sid = 'no'
                         return
                 # ====================================================================
@@ -3917,7 +4080,8 @@ class PlayerWindow(QMainWindow):
                             # Need to extract this track (not pre-extracted)
                             logger.info(f"[PGS] Track {pgs_track.index} not pre-extracted, extracting now...")
                             self._load_pgs_subtitle_track(pgs_track)
-                        # Disable MPV's internal subtitles
+                        # Disable MPV's internal subtitles + any text overlay
+                        self._disable_text_subtitles()
                         self.player.sid = 'no'
                         logger.info(f"[PGS] Using PGS overlay for track {track_id}")
                         return
@@ -3925,10 +4089,11 @@ class PlayerWindow(QMainWindow):
                 # Default: Use MPV's subtitle handling
                 if track_id == 0:
                     self.player.sid = 'no'
-                    # Also disable PGS overlay
+                    # Also disable PGS overlay + text overlay
                     if self._subtitle_manager:
                         self._subtitle_manager.set_enabled(False)
                         self._active_pgs_track_index = None
+                    self._disable_text_subtitles()
                     logger.info("[SUBTITLE] Subtitles disabled")
                 else:
                     self.player.sid = track_id
@@ -3936,6 +4101,15 @@ class PlayerWindow(QMainWindow):
                     if self._subtitle_manager:
                         self._subtitle_manager.set_enabled(False)
                         self._active_pgs_track_index = None
+                    if self.mvc_mode_active and self._text_subtitle_renderer is not None:
+                        # edge264/native-renderer playback without a streaming track
+                        # list (e.g. MP4 via lavf demuxer): mpv is audio-only and
+                        # cannot draw its subs — mirror them onto the native overlay.
+                        # Here the combo was filled from mpv's track-list, so
+                        # track_id IS the mpv sid.
+                        self._activate_text_overlay(track_id)
+                    else:
+                        self._disable_text_subtitles()
                     logger.info(f"[SUBTITLE] track changed: ID {track_id}")
             except Exception as e:
                 print(f"Error changing subtitle track: {e}")
@@ -4073,8 +4247,12 @@ class PlayerWindow(QMainWindow):
                 pass
 
             def make_setter(target_widget):
-                def setter(rgba, x, y, width, height, vw, vh):
+                def setter(rgba, x, y, width, height, vw, vh, disparity=0.0):
                     try:
+                        target_widget.set_subtitle(rgba, x, y, width, height, vw, vh,
+                                                   disparity)
+                    except TypeError:
+                        # widget predating the disparity parameter
                         target_widget.set_subtitle(rgba, x, y, width, height, vw, vh)
                     except Exception as e:
                         logger.error(f"[PGS] set_subtitle error on {target_widget.__class__.__name__}: {e}")
@@ -4087,6 +4265,176 @@ class PlayerWindow(QMainWindow):
             logger.info(f"[PGS] CONNECTED subtitles to {[w.__class__.__name__ for w in widgets]}")
         except Exception as e:
             logger.error(f"[PGS] Error connecting subtitle manager: {e}")
+
+    # ========== TEXT SUBTITLE (SRT/ASS) OVERLAY ==========
+
+    def _enable_text_subtitle_track(self, ui_index, streaming_track):
+        """Route a text subtitle track (S_TEXT/UTF8, S_TEXT/ASS…) to the native overlay.
+
+        mpv plays the same file for audio and decodes the selected text track on
+        that clock even without video output; its 'sub-text' property carries the
+        current cue (ASS override tags already stripped, exact show/hide timing).
+        """
+        logger.info(f"[TEXT-SUBS] Enabling text track ui_index={ui_index}: "
+                    f"{streaming_track.get('codecId')} ({streaming_track.get('name')})")
+
+        # Text subs don't use the demuxer streaming queue nor the PGS overlay
+        if self.mvc_decoder_thread:
+            self.mvc_decoder_thread.set_subtitle_track(0)
+        self._active_streaming_track = None
+        if self._subtitle_manager:
+            self._subtitle_manager.set_enabled(False)
+        self._active_pgs_track_index = None
+
+        # Map the menu index (1-based, MKV file order) to mpv's sid. mpv numbers
+        # subtitle tracks in the same file order, so the Nth entry matches sid N —
+        # resolved through track-list rather than assumed, when possible.
+        sid = ui_index
+        try:
+            subs = [t for t in (self.player.track_list or []) if t.get('type') == 'sub']
+            if 0 < ui_index <= len(subs):
+                sid = subs[ui_index - 1].get('id', ui_index)
+        except Exception as e:
+            logger.warning(f"[TEXT-SUBS] track-list sid mapping failed, using index: {e}")
+
+        self._activate_text_overlay(sid, streaming_track.get('name'))
+
+        # Recover the authored 3D depth of this track (per-eye duplicated cues
+        # encode a parallax). Cached per (file, track); analysis is a bounded
+        # ffprobe sampling pass, run off the GUI thread.
+        sub_index = ui_index - 1   # ffprobe s:N == Nth subtitle track in file order
+        cache_key = (self.current_file_path, sub_index)
+        if cache_key in self._sub_depth_cache:
+            self._text_subtitle_renderer.set_disparity(self._sub_depth_cache[cache_key])
+        else:
+            self._text_subtitle_renderer.set_disparity(0.0)   # flat until measured
+            layout = 'tab' if (self.video_3d_info or {}).get('stereo_mode') == 'tab' else 'sbs'
+            filepath = self.current_file_path
+
+            def analyze_depth():
+                try:
+                    from subtitle_depth_analyzer import analyze_text_track_depth
+                    d, pairs = analyze_text_track_depth(filepath, sub_index, layout)
+                    self._sub_depth_cache[cache_key] = d
+                    self.text_sub_depth_ready.emit(d, pairs)
+                except Exception as e:
+                    logger.warning(f"[SUB-DEPTH] background analysis failed: {e}")
+
+            threading.Thread(target=analyze_depth, daemon=True,
+                             name="sub-depth-analyzer").start()
+
+    def _activate_text_overlay(self, sid, name=''):
+        """Select mpv sid and mirror its 'sub-text' onto the native overlay."""
+        # Register the sub-text observer once (fires on mpv's event thread; the
+        # Qt signal marshals onto the main thread where QPainter is legal).
+        if not self._mpv_subtext_observer_registered:
+            def _on_subtext(_name, value):
+                try:
+                    self.mpv_sub_text_changed.emit(value or '')
+                except Exception:
+                    pass
+            try:
+                self.player.observe_property('sub-text', _on_subtext)
+                self._mpv_subtext_observer_registered = True
+                logger.info("[TEXT-SUBS] sub-text observer registered")
+            except Exception as e:
+                logger.error(f"[TEXT-SUBS] Could not observe sub-text: {e}")
+                return
+
+        try:
+            self.player['sub-visibility'] = True
+        except Exception:
+            pass
+        self.player['sid'] = sid
+        self._text_sub_active = True
+        self._connect_text_subtitle_to_widget()
+        logger.info(f"[TEXT-SUBS] Active: mpv sid={sid}")
+        if name:
+            self.show_3d_notification(f"Subtitles: {name}", success=True)
+
+    def _disable_text_subtitles(self):
+        """Stop feeding the text overlay and clear any cue still on screen."""
+        if self._text_sub_active:
+            logger.info("[TEXT-SUBS] Disabled")
+        self._text_sub_active = False
+        if self._text_subtitle_renderer:
+            self._text_subtitle_renderer.clear()
+
+    @Slot(str)
+    def _on_mpv_sub_text(self, text):
+        """Main-thread handler for mpv 'sub-text' changes."""
+        if self._text_sub_active and self._text_subtitle_renderer:
+            self._text_subtitle_renderer.set_text(text)
+
+    @Slot(float)
+    def _on_pg_depth_changed(self, disparity):
+        """Apply the BD3D per-GOP authored PG depth to every display widget."""
+        for w in (getattr(self, 'active_mvc_widget', None),
+                  getattr(self, 'mvc_embedded_widget', None),
+                  getattr(getattr(self, 'framepacking_window', None), 'display_widget', None)):
+            if w is not None and hasattr(w, 'set_subtitle_depth'):
+                w.set_subtitle_depth(disparity)
+        if not getattr(self, '_pg_depth_logged', False):
+            self._pg_depth_logged = True
+            logger.info(f"[BD3D-DEPTH] Authored PG depth active (first value: {disparity:+.4f})")
+
+    @Slot(float, int)
+    def _on_text_sub_depth(self, disparity, pairs):
+        """Apply the measured authored subtitle depth (main thread)."""
+        if not self._text_sub_active or not self._text_subtitle_renderer:
+            return
+        self._text_subtitle_renderer.set_disparity(disparity)
+        if disparity:
+            logger.info(f"[SUB-DEPTH] Applying authored depth: {disparity:+.4f} "
+                        f"eye-width ({pairs} pairs)")
+            self.show_3d_notification(
+                f"3D subtitle depth: {disparity * 100:+.1f}% (authored)", success=True)
+
+    def _connect_text_subtitle_to_widget(self):
+        """Wire the text renderer to every active MVC display widget (same set as PGS)."""
+        if not self._text_subtitle_renderer:
+            return
+        try:
+            widgets = []
+            for w in (getattr(self, 'active_mvc_widget', None),
+                      getattr(self, 'mvc_embedded_widget', None),
+                      getattr(getattr(self, 'framepacking_window', None), 'display_widget', None)):
+                if (w is not None and w not in widgets
+                        and hasattr(w, 'set_subtitle') and hasattr(w, 'clear_subtitle')):
+                    widgets.append(w)
+            if not widgets:
+                logger.warning("[TEXT-SUBS] No display widget with subtitle methods to connect")
+                return
+            if self._text_sub_connected_widgets == widgets:
+                return
+
+            try:
+                self._text_subtitle_renderer.subtitle_changed.disconnect()
+                self._text_subtitle_renderer.subtitle_cleared.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+
+            def make_setter(target_widget):
+                def setter(rgba, x, y, width, height, vw, vh, disparity):
+                    try:
+                        target_widget.set_subtitle(rgba, x, y, width, height, vw, vh,
+                                                   disparity)
+                    except TypeError:
+                        # widget predating the disparity parameter
+                        target_widget.set_subtitle(rgba, x, y, width, height, vw, vh)
+                    except Exception as e:
+                        logger.error(f"[TEXT-SUBS] set_subtitle error on {target_widget.__class__.__name__}: {e}")
+                return setter
+
+            for w in widgets:
+                self._text_subtitle_renderer.subtitle_changed.connect(make_setter(w))
+                self._text_subtitle_renderer.subtitle_cleared.connect(w.clear_subtitle)
+            self._text_sub_connected_widgets = widgets
+            logger.info(f"[TEXT-SUBS] CONNECTED to {[w.__class__.__name__ for w in widgets]}")
+        except Exception as e:
+            logger.error(f"[TEXT-SUBS] Error connecting text renderer: {e}")
+
+    # =====================================================
 
     def load_subtitle_tracks(self):
         logger.info(f"[SUBTITLE] load_subtitle_tracks called, has_media={self.has_media}")
@@ -4226,6 +4574,61 @@ class PlayerWindow(QMainWindow):
                     out.add(L)
         return out
 
+    def _apply_preview_thumbs_policy(self, file_path):
+        """Pick the thumbnail provider for this source (spec 2026-07-14).
+        Physical optical → off (measured 45-120s head thrash). Player-mounted
+        ISO → in-process edge264 with guardrails (a concurrent ffmpeg probe
+        broke demuxer init on 2026-07-14 — the service is disarmed outside
+        steady playback instead). Plain files → edge264 (H.264) or ffmpeg."""
+        try:
+            import disc_archiver as da
+            optical = set(da.list_optical_drives())
+        except Exception:
+            optical = set()
+        codec = None
+        try:
+            codec = (self.video_3d_info or {}).get('codec_name')
+        except Exception:
+            pass
+        mode, is_optical = _decide_thumbs_mode(
+            file_path, self._mounted_iso_letters(), optical, codec)
+        svc = self._ensure_thumbnail_service()
+        dur = 0.0
+        try:
+            dur = float(self.controls_overlay.time_slider.maximum()) / 1000.0
+        except Exception:
+            pass
+        # Packed-stereo sources: thumbnails show a SINGLE eye (sbs → left half,
+        # tab → top half). MVC/2D need no crop (base view is one eye already).
+        _sm = None
+        try:
+            _sm = (self.video_3d_info or {}).get('stereo_mode')
+        except Exception:
+            pass
+        layout = _sm if _sm in ('sbs', 'tab') else None
+        svc.configure(file_path, dur, mode, optical=is_optical, layout=layout)
+        slider = self.controls_overlay.time_slider
+        slider.set_thumbnail_provider(svc if mode == 'edge264' else None)
+        slider.set_thumbnails_allowed(mode != 'off')
+        logger.info(f"[THUMB] provider={mode} optical={is_optical} for {file_path}")
+
+    def _ensure_thumbnail_service(self):
+        """Create the (single) ThumbnailService lazily and wire its lifecycle:
+        disarmed around seeks via the seek queue, thumbnails routed to the
+        slider cache."""
+        if getattr(self, '_thumb_service', None) is None:
+            from thumbnail_service import ThumbnailService
+            svc = ThumbnailService()
+            svc.thumbnailReady.connect(
+                self.controls_overlay.time_slider._on_service_thumbnail)
+            svc.start(QThread.Priority.LowPriority)
+            self._thumb_service = svc
+            if getattr(self, '_seek_queue', None):
+                self._seek_queue.seek_started.connect(lambda _t: svc.disarm())
+                self._seek_queue.seek_completed.connect(
+                    lambda: QTimer.singleShot(500, svc.arm))
+        return self._thumb_service
+
     def _is_physical_bluray(self, letter):
         """True iff `letter` is a physical optical drive holding a Blu-ray (BDMV) — i.e. not a
         mounted ISO and not a non-BD disc. This is the ONLY thing we allow imaging."""
@@ -4347,12 +4750,21 @@ class PlayerWindow(QMainWindow):
         if p is None or not getattr(self, 'has_media', False) or getattr(self, '_archiving', False):
             vu.set_levels(0.0, 0.0)
             return
-        try:
-            if p.pause:                         # paused → let the bars fall to silence
-                vu.set_levels(0.0, 0.0)
-                return
-        except Exception:
-            pass
+        # 0xe24c4a02 HARDENING (2026-07-14, crash_log.txt): this 30Hz tick made a
+        # BLOCKING p.pause read on the GUI thread and crashed inside
+        # mpv_get_property while mpv rebuilt its audio chain (MVC init window).
+        # Rule: no synchronous mpv reads from the GUI thread during loads,
+        # transitions or seeks — and `pause` comes from the observer cache,
+        # never from a property read.
+        if getattr(self, '_mpv_transition_in_progress', False) or getattr(self, '_is_loading_file', False):
+            vu.set_levels(0.0, 0.0)
+            return
+        sq = getattr(self, '_seek_queue', None)
+        if sq is not None and sq.is_busy():
+            return                              # keep last levels through a seek
+        if getattr(self, '_mpv_pause_cache', False):  # paused → bars fall to silence
+            vu.set_levels(0.0, 0.0)
+            return
         try:
             md = p._get_property('af-metadata/vu')
         except Exception:
@@ -4495,6 +4907,26 @@ class PlayerWindow(QMainWindow):
             self._mouse_inactivity_timer.start()
         super().leaveEvent(event)
 
+    # --- V60: tiny per-install settings store (JSON in the user profile) ---
+
+    def _app_settings_path(self):
+        return os.path.join(os.path.expanduser('~'), '.sylc3d_player.json')
+
+    def _load_app_settings(self):
+        try:
+            with open(self._app_settings_path(), 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_app_settings(self):
+        try:
+            with open(self._app_settings_path(), 'w', encoding='utf-8') as f:
+                json.dump(self._app_settings, f, indent=2)
+        except Exception as e:
+            logger.warning(f"[SETTINGS] Could not save {self._app_settings_path()}: {e}")
+
     def keyPressEvent(self, event):
         """Handle keyboard shortcuts."""
         key = event.key()
@@ -4517,13 +4949,24 @@ class PlayerWindow(QMainWindow):
             if self.mvc_decoder_thread and self.mvc_mode_active and hasattr(self.mvc_decoder_thread, 'adjust_av_offset'):
                 delta = 0.05 if key == Qt.Key.Key_BracketRight else -0.05
                 off = self.mvc_decoder_thread.adjust_av_offset(delta)
-                self.show_3d_notification(f"A/V sync — video delayed by {off*1000:.0f} ms", success=True)
+                # V60: persist the trim so every future decoder thread starts with it
+                self._app_settings['av_sync_offset_s'] = off
+                self._save_app_settings()
+                if off >= 0:
+                    self.show_3d_notification(f"A/V sync — video delayed by {off*1000:.0f} ms", success=True)
+                else:
+                    self.show_3d_notification(f"A/V sync — video advanced by {-off*1000:.0f} ms", success=True)
             event.accept()
             return
 
         super().keyPressEvent(event)
 
     def closeEvent(self, event):
+        if getattr(self, '_thumb_service', None):
+            try:
+                self._thumb_service.shutdown()
+            except Exception:
+                pass
         self._stop_mvc_decoder()
         # Release any Blu-ray ISO we mounted, so no phantom drive is left behind.
         try:
@@ -4607,6 +5050,21 @@ class PlayerWindow(QMainWindow):
         except Exception as e:
             logger.warning(f"[DISC] Dismount (pending) failed: {e}")
 
+    def _dismount_isos_after_stop(self):
+        """STOP released all readers (decoder, mpv terminate, thumbnail service
+        release_file) — return the mounted ISO(s) to the system."""
+        try:
+            import bluray_disc
+            for m in (getattr(self, '_active_iso_mount', None),
+                      getattr(self, '_pending_iso_mount', None)):
+                if m:
+                    logger.info(f"[DISC] Dismounting ISO on stop: {m[0]}")
+                    bluray_disc.dismount_iso(m[0])
+            self._active_iso_mount = None
+            self._pending_iso_mount = None
+        except Exception as e:
+            logger.warning(f"[DISC] Dismount on stop failed: {e}")
+
     def _promote_iso_mount(self):
         """After the previous file's handles are released: dismount the previously
         active ISO (when switching away from it) and promote the just-mounted one to
@@ -4616,6 +5074,19 @@ class PlayerWindow(QMainWindow):
             pending = getattr(self, '_pending_iso_mount', None)
             active = getattr(self, '_active_iso_mount', None)
             if active and (not pending or active[0] != pending[0]):
+                # NEVER dismount the ISO that hosts the file being (re)loaded —
+                # the fresh-mount retry replays the SAME D:\...ssif path with no
+                # pending mount, and dismounting here killed the retry
+                # ("Failed to open SSIF file", measured 2026-07-14 on Avatar).
+                cur = getattr(self, 'current_file_path', None) or ''
+                mnt_letter = str(active[1] or '').rstrip('\\').rstrip(':')[:1].upper()
+                cur_drive = os.path.splitdrive(os.path.abspath(cur))[0] if cur else ''
+                cur_letter = cur_drive[:1].upper() if cur_drive else ''
+                if mnt_letter and cur_letter == mnt_letter:
+                    logger.info(f"[DISC] Keeping ISO mounted (current file lives on {mnt_letter}:)")
+                    self._active_iso_mount = active
+                    self._pending_iso_mount = None
+                    return
                 logger.info(f"[DISC] Dismounting previous ISO: {active[0]}")
                 bluray_disc.dismount_iso(active[0])
                 active = None
@@ -4668,6 +5139,13 @@ class PlayerWindow(QMainWindow):
                 except Exception:
                     pass
                 feat, info = bluray_disc.find_feature(file_path)
+                # Freshly-mounted ISO second chance: a large UDF volume can become
+                # browsable a moment after the mount readiness wait gives up —
+                # one bounded retry beats dismounting a perfectly good disc.
+                if not feat and getattr(self, '_pending_iso_mount', None):
+                    logger.info("[DISC] No feature on first scan of fresh ISO mount — retrying in 2s")
+                    time.sleep(2.0)
+                    feat, info = bluray_disc.find_feature(file_path)
                 if feat:
                     kind = info.get('kind')
                     mins = (info.get('duration_s') or 0) / 60.0
@@ -4677,6 +5155,23 @@ class PlayerWindow(QMainWindow):
                     label = "3D feature" if kind == 'ssif' else "2D feature"
                     self.show_3d_notification(f"{label}: {os.path.basename(feat)} ({mins:.0f} min)", success=True)
                     file_path = feat
+                    # BD3D authored subtitle depth: PG PID -> offset_sequence_id
+                    # from the playlist's STN_table_SS (drives the OFMD depth).
+                    self._bd3d_pg_offset_map = {}
+                    try:
+                        _pl = info.get('playlist')
+                        if _pl:
+                            # find_feature reports the playlist BASENAME (e.g.
+                            # '00852.mpls') — resolve it under <BDMV>/PLAYLIST.
+                            if not os.path.isabs(_pl) and info.get('bdmv'):
+                                _pl = os.path.join(info['bdmv'], 'PLAYLIST', _pl)
+                            if os.path.isfile(_pl):
+                                from bd3d_offset_metadata import parse_mpls_pg_offsets
+                                self._bd3d_pg_offset_map = parse_mpls_pg_offsets(_pl)
+                            else:
+                                logger.warning(f"[BD3D-DEPTH] playlist not found: {_pl}")
+                    except Exception as _e:
+                        logger.warning(f"[BD3D-DEPTH] PG offset map unavailable: {_e}")
                     # Seamless-branching 3D feature spanning several SSIF segments: build a
                     # matching mpv EDL (continuous audio on one timeline) + remember the
                     # ordered segment sequence so the decoder plays them as one film.
@@ -4736,6 +5231,10 @@ class PlayerWindow(QMainWindow):
         self._current_precise_time = 0.0 # Reset precise timeline tracker
         logger.info(f"[LOAD] Loading file: {file_path}")
 
+        # THUMB: no thumbnail I/O may overlap the load/demuxer-init window
+        if getattr(self, '_thumb_service', None):
+            self._thumb_service.disarm()
+
         # Show loading overlay with animation (hide welcome screen to avoid text overlap)
         self.info_overlay.hide()
         self._update_overlays_geometry()
@@ -4752,6 +5251,13 @@ class PlayerWindow(QMainWindow):
         self._pgs_subtitle_tracks = []
 
         # CRITICAL STABILITY: Stop MPV first to release file handles and video output
+        # V61 STABILITY: if a previous stop_playback terminated mpv and its async
+        # re-init hasn't fired yet, re-create it SYNCHRONOUSLY now — the whole load
+        # path assumes a live player (the duplicate-init guard in _setup_mpv_player
+        # makes the pending timer a no-op afterwards).
+        if self.player is None:
+            logger.info("[LOAD] MPV instance not alive (post-stop) — synchronous re-init")
+            self._setup_mpv_player()
         if self.player:
             try:
                 self.player.stop()
@@ -4944,6 +5450,10 @@ class PlayerWindow(QMainWindow):
                         self.controls_overlay.set_duration(mpv_duration)
                         self.controls_overlay.time_slider.set_video_file(self.current_file_path, mpv_duration)
                         logger.info(f"[TIMELINE] Updated range from MPV: {mpv_duration}s")
+                        # THUMB: playback is up on this path too → arm shortly after
+                        if getattr(self, '_thumb_service', None):
+                            self._thumb_service.set_duration(float(mpv_duration))
+                            QTimer.singleShot(1000, self._thumb_service.arm)
 
                         # SSIF/M2TS seek needs this duration inside the demuxer (proportional
                         # byte seek). This is where mpv's duration reliably lands at startup.
@@ -5050,6 +5560,7 @@ class PlayerWindow(QMainWindow):
         # This avoids scale conflicts between ffprobe and MPV that cause incorrect seeks
 
         # BUT we keep the FPS and the file name for the previews
+        self._apply_preview_thumbs_policy(file_path)
         self.controls_overlay.time_slider.set_video_file(file_path, 0)  # Duration=0 for now
         fps_val = self.video_3d_info.get('fps')
         if fps_val:
@@ -5267,6 +5778,8 @@ class PlayerWindow(QMainWindow):
 
                         # Connect PGS subtitles to framepacking widget
                         self._connect_subtitle_to_widget(self.framepacking_window.display_widget)
+                        if self._text_sub_active:
+                            self._connect_text_subtitle_to_widget()
 
                         self.framepacking_window.showNormal()
                         self.framepacking_window.activateWindow()
@@ -5293,6 +5806,8 @@ class PlayerWindow(QMainWindow):
 
                         # Connect PGS subtitles to embedded widget
                         self._connect_subtitle_to_widget(self.mvc_embedded_widget)
+                        if self._text_sub_active:
+                            self._connect_text_subtitle_to_widget()
 
                         self.show_3d_notification(f"3D Mode: {stereo_mode.upper()} (Main Window)", success=True)
 
@@ -5463,6 +5978,14 @@ class PlayerWindow(QMainWindow):
                 feature_segments=getattr(self, '_pending_feature_segments', None)
             )
             self.mvc_decoder_thread.set_target_fps(self._get_effective_video_fps())
+            # V60: re-apply the persisted A/V sync trim (new thread = default 0.0)
+            try:
+                _av_trim = float(self._app_settings.get('av_sync_offset_s', 0.0))
+                self.mvc_decoder_thread._av_sync_offset_s = max(-1.0, min(2.0, _av_trim))
+                if _av_trim:
+                    logger.info(f"[V60-SYNC] Applied persisted A/V trim: {_av_trim*1000:+.0f} ms")
+            except Exception:
+                pass
             # Push initial clock
             self.mvc_decoder_thread.update_audio_clock(actual_start_time)
 
@@ -5507,6 +6030,17 @@ class PlayerWindow(QMainWindow):
             if hasattr(self.mvc_decoder_thread, 'subtitleTracksDetected'):
                 self.mvc_decoder_thread.subtitleTracksDetected.connect(self._on_subtitle_tracks_detected)
                 logger.info("[MVC INIT] Subtitle track detection signal connected")
+
+            # THUMB HARVEST: decoded-frame captures (every ~10s + seek landings)
+            # flow into the slider preview cache — zero extra I/O on the source.
+            # Packed sources (sbs/tab): harvest crops to a single eye.
+            try:
+                _sm_thumb = (self.video_3d_info or {}).get('stereo_mode')
+                self.mvc_decoder_thread._thumb_layout = _sm_thumb if _sm_thumb in ('sbs', 'tab') else None
+                self.mvc_decoder_thread.thumbnailHarvested.connect(
+                    self.controls_overlay.time_slider._on_harvest_thumbnail)
+            except Exception:
+                pass
             # ========================================================
 
             # CRITICAL: Let OpenGL initialize before starting decoding
@@ -5810,6 +6344,10 @@ class PlayerWindow(QMainWindow):
         """Stop edge264 MVC decoder and cleanup - V7a Enhanced"""
         logger.info("[MVC CLEANUP] Starting complete decoder shutdown...")
 
+        # THUMB: stop thumbnail I/O before any decoder/demuxer teardown
+        if getattr(self, '_thumb_service', None):
+            self._thumb_service.disarm()
+
         # V7b FIX: Stop control overlay animations to prevent paintEvent crashes during cleanup
         if hasattr(self, 'controls_overlay') and self.controls_overlay:
             try:
@@ -5826,6 +6364,16 @@ class PlayerWindow(QMainWindow):
         # ========== CLEANUP STREAMING SUBTITLE STATE ==========
         self._streaming_subtitle_tracks = []
         self._active_streaming_track = None
+        self._disable_text_subtitles()
+        self._text_sub_connected_widgets = []
+        # BD3D depth: drop the dynamic override + per-file state
+        self._pg_depth_connected = False
+        self._pg_depth_logged = False
+        for _w in (getattr(self, 'active_mvc_widget', None),
+                   getattr(self, 'mvc_embedded_widget', None),
+                   getattr(getattr(self, 'framepacking_window', None), 'display_widget', None)):
+            if _w is not None and hasattr(_w, 'set_subtitle_depth'):
+                _w.set_subtitle_depth(None)
         logger.info("[MVC CLEANUP] Streaming subtitle state cleared")
         # ======================================================
 
@@ -6005,8 +6553,10 @@ class PlayerWindow(QMainWindow):
         self.monitoring_overlay.reset()
         self.monitoring_overlay.hide()
 
-        # Only restore video if we are NOT restarting (e.g. real stop)
-        if not getattr(self, '_mvc_restarting', False):
+        # Only restore video if we are NOT restarting (e.g. real stop) and NOT
+        # about to terminate mpv (V62: restoring gpu-next rebuilds the D3D11
+        # chain on a core that terminate() destroys 50ms later — crash window)
+        if not getattr(self, '_mvc_restarting', False) and not getattr(self, '_terminating_mpv', False):
             self._restore_mpv_video_output()
             # Reset stack to MPV widget only on full stop
             if hasattr(self, 'video_stack'):
@@ -6093,9 +6643,13 @@ class PlayerWindow(QMainWindow):
             hy, hc = y.shape[0] // 2, u.shape[0] // 2
             left = (y[:hy], u[:hc], v[:hc])
             right = (y[hy:hy * 2], u[hc:hc * 2], v[hc:hc * 2])
-        L = tuple(np.ascontiguousarray(p) for p in left)
-        R = tuple(np.ascontiguousarray(p) for p in right)
-        return L, R
+        # ZERO-COPY: return the raw views. The decoded planes are Python-owned
+        # buffers (copied out of the edge264 DPB at decode time), so the views
+        # stay valid, and the native renderer's set_yuv_frame uploads
+        # row-contiguous strided views in place (it honors the row stride).
+        # TAB slices are even fully contiguous. Saves ~5.7 MB of memcpy per
+        # 3840x1012 frame (~140 MB/s at 24 fps).
+        return left, right
 
     @Slot(object, object)
     def _on_mvc_frame_yuv_ready(self, left_planes, right_planes):

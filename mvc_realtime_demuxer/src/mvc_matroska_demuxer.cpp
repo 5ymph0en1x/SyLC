@@ -270,13 +270,48 @@ bool MVCMatroskaDemuxer::rewind_after_failed_seek_ms(int64_t timestampMs, uint32
     return impl_->reader.rewind_after_failed_seek(timestampMs, backoffMs);
 }
 
-void MVCMatroskaDemuxer::separateNALUnits(const std::vector<uint8_t>& blockData,
+void MVCMatroskaDemuxer::separateNALUnits(std::vector<uint8_t>& blockData,
                                           std::vector<uint8_t>& baseOut,
                                           std::vector<uint8_t>& dependentOut) {
     baseOut.clear();
     dependentOut.clear();
 
     if (blockData.empty()) {
+        return;
+    }
+
+    // FAST PATH (in-place, zero copy): a 4-byte AVCC length prefix occupies
+    // exactly the width of an Annex-B start code, so when nalLengthSize == 4
+    // the conversion is a prefix rewrite inside the buffer we already own,
+    // then a move — no second full-frame buffer, no memcpy. Skipped for the
+    // very first frame when codecPrivate (SPS/PPS) must still be prepended.
+    if (impl_->nalLengthSize == 4 &&
+        (impl_->codecPrivateAnnexB.empty() || impl_->codecPrivateInjected)) {
+        size_t pos = 0;
+        const size_t n = blockData.size();
+        while (pos + 4 <= n) {
+            const uint32_t nalSize = (uint32_t(blockData[pos]) << 24) |
+                                     (uint32_t(blockData[pos + 1]) << 16) |
+                                     (uint32_t(blockData[pos + 2]) << 8) |
+                                     uint32_t(blockData[pos + 3]);
+            if (nalSize == 0 || pos + 4 + nalSize > n) {
+                // malformed tail: drop it (the copying path dropped it too),
+                // never leak raw AVCC length bytes into the Annex-B stream
+                blockData.resize(pos);
+                break;
+            }
+            // Stats the pipeline actually consumes (SPS/PPS/SubsetSPS/prefix
+            // bookkeeping) — skip parseUnit for slice NALs, it was pure cost.
+            const uint8_t nalType = blockData[pos + 4] & 0x1F;
+            if (nalType == 7 || nalType == 8 || nalType == 13 ||
+                nalType == 14 || nalType == 15) {
+                impl_->nalParser.parseUnit(blockData.data() + pos + 4, nalSize);
+            }
+            blockData[pos] = 0x00; blockData[pos + 1] = 0x00;
+            blockData[pos + 2] = 0x00; blockData[pos + 3] = 0x01;
+            pos += 4 + size_t(nalSize);
+        }
+        baseOut = std::move(blockData);   // dependentOut stays empty (PRESERVE-ORDER)
         return;
     }
 

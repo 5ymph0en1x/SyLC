@@ -9,8 +9,8 @@
 
 *Stereoscopic 3D Blu-ray (MVC) playback, decoded from scratch, rendered in native HDR — given to the community, no strings attached.*
 
-![Version](https://img.shields.io/badge/version-4.1.1-1f6feb?style=for-the-badge)
-![Platform](https://img.shields.io/badge/Windows-x64%20%7C%20ARM64-0078D6?style=for-the-badge&logo=windows&logoColor=white)
+![Version](https://img.shields.io/badge/version-4.5.0-1f6feb?style=for-the-badge)
+![Platform](https://img.shields.io/badge/Windows-x64-0078D6?style=for-the-badge&logo=windows&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.14-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/license-free%20%26%20open--source-2ea44f?style=for-the-badge)
 
@@ -42,8 +42,9 @@ As far as we know, it is **the only actively-developed, open-source player that 
 - 🌈 **True HDR, not a tone-mapped fake.** Frames land in a 16-bit-float **scRGB** Direct3D 11 swapchain; a GPU shader does YUV→RGB and the stereo frame-packing in one pass. HDR10/PQ is preserved end to end.
 - 🥽 **Real 3D output.** Frame-packed stereo to a detached window for 3D TVs, projectors and HMDs — plus an embedded 2D preview.
 - 🎯 **Pixel-exact.** The decoder's luma output has been verified byte-for-byte against FFmpeg's base view. It's not "close enough" — it's correct.
-- 🪶 **Self-contained.** One executable (x64) or one portable folder (ARM64). Nothing to install, no codec packs, no system pollution.
+- 🪶 **Self-contained.** One executable, or one portable folder. Nothing to install, no codec packs, no system pollution.
 - 💿 **Archive your discs.** Image the 3D Blu-ray you're watching to a **byte-perfect `.iso`** from inside the player — one click, no admin, no external tool — so a failing optical drive can't take your collection with it.
+- 🔍 **A timeline that shows you where you'll land.** Hover the seek bar and a large preview thumbnail follows your cursor — decoded **in-process by the same engine as playback**, live even during MVC playback and on mounted Blu-ray ISOs. Click, and you land **exactly** on the frame the preview promised.
 
 ---
 
@@ -63,7 +64,12 @@ A dedicated **C++ demuxer** (pybind11, on top of **libmatroska/libebml**) opens 
 Decoded YUV planes are uploaded straight to the GPU. A **Direct3D 11** shader converts colour and assembles the stereo frame inside an **RGBA16F (scRGB)** HDR surface — the format Windows uses for native HDR — so there is no SDR round-trip and no OpenGL→DXGI copy tax. As of **4.1.0 the renderer is a ground-up _native C++ D3D11 engine_** (code-named *Tokyo #3*) that takes decoded planes **straight into D3D11 textures** with no per-frame Python/Qt copy — lower latency and less memory churn. It was pixel-validated byte-for-byte against the previous Qt renderer on real 3D hardware, and now **fully replaces it** — the Qt/RHI path is gone. For **Full-SBS** content each eye is **letterboxed into its frame-pack slot, never stretched**, so per-eye resolution is preserved.
 
 ### 4. The real-time problem — and the Python GIL
-Audio rides on **libmpv**; video is slaved to mpv's clock so the two stay locked. But MVC decode is **single-threaded** (the multiview decoder isn't thread-safe), which makes timing brutal: decoding a single key frame can take ~100 ms, and on a naïve loop that froze the picture once per GOP — a visible hitch every second. The fix was to **decouple presentation from decoding** (a dedicated presenter thread with back-pressure so the buffer absorbs the spikes) and then to wrestle the **CPython GIL** itself — `sys.setswitchinterval(0.0005)` was the decisive change that stopped the decode thread from starving the presenter. Result on a dense scene: **16 fps with 33 % dropped frames → a steady 24 fps with zero drops.**
+Audio rides on **libmpv**; video is slaved to mpv's clock so the two stay locked. For a long time MVC decode was **single-threaded** (the multiview decoder wasn't thread-safe), which made timing brutal: decoding a single key frame can take ~100 ms, and on a naïve loop that froze the picture once per GOP — a visible hitch every second. The fix was to **decouple presentation from decoding** (a dedicated presenter thread with back-pressure so the buffer absorbs the spikes) and then to wrestle the **CPython GIL** itself — `sys.setswitchinterval(0.0005)` was the decisive change that stopped the decode thread from starving the presenter. Result on a dense scene: **16 fps with 33 % dropped frames → a steady 24 fps with zero drops.**
+
+As of **4.5.0 the decoder itself is multithreaded** — a task-engine race and a scene-cut
+picture-ordering bug were hunted down and fixed, and edge264 now runs **4 worker threads by
+default** for roughly **+80 % decode throughput** (80 → 146 fps measured), still bit-exact
+against the single-threaded reference.
 
 ---
 
@@ -93,8 +99,10 @@ This is the kind of work that doesn't show up in a feature list — but it's the
 - **Archive a Blu-ray to ISO** — image the disc you're playing to a **byte-perfect `.iso`** from inside the player (no admin, no external tool); resilient to a flaky drive, with optional **SHA-256** verification.
 - **Non-H.264 compatibility** — VC-1 / MPEG-2 / HEVC… (incl. **2D Blu-rays**) play through libmpv at the correct aspect.
 - **PGS (Blu-ray) subtitles** — streamed in real time, **labelled by language** (from the disc's CLPI), and shown on **both the 3D and the 2D** views.
-- **Live A/V sync trim** to cancel your system's audio-output latency — nudge it by ear with `[` and `]`.
-- **Instant, smooth seeking** — no post-seek lag.
+- **Timeline preview thumbnails** — hover the seek bar for an instant **320×180 preview** with a time pill, decoded **in-process by edge264** (no external processes). Live during MVC playback, on mounted **Blu-ray ISOs**, and for packed-stereo sources (single eye shown); on physical discs the timeline fills itself from frames already decoded, at zero disc I/O. **Clicking lands exactly on the previewed frame** — Blu-ray open-GOP recovery points included.
+- **Multithreaded in-house decoding** — edge264 runs **4 threads by default** (~+80 % throughput, bit-exact); scene-cut ordering fixed in the decoder.
+- **Live A/V sync trim** to cancel your system's audio-output latency — nudge it by ear with `[` and `]` (persisted across sessions). True container-PTS timestamps with micro-pacing keep lip-sync honest.
+- **Instant, smooth seeking** — no post-seek lag, audio back immediately, and the preview shows the exact landing frame before you click.
 - **Completely free** — every feature unlocked, forever.
 
 ### Keyboard shortcuts
@@ -106,22 +114,24 @@ This is the kind of work that doesn't show up in a feature list — but it's the
 
 ---
 
-## Two native builds — no emulation
+## Native x64 build — no emulation
 
-| Platform | Asset | Notes |
+| Flavor | Asset | Notes |
 |---|---|---|
-| **Windows x64** | `SyLC_3D_Player_v4.1.1_win-x64.exe` | Single self-contained file. Built for the **x86-64-v3 (AVX2)** baseline — runs natively on any AVX2 CPU (Haswell 2013+ / Zen 1+). |
-| **Windows on ARM** | `SyLC_3D_Player_v4.1.1_win-arm64.zip` | Portable folder, **100 % native ARM64** (Snapdragon / Adreno) — every binary cross-compiled to aarch64, zero x64 emulation. |
+| **Single file** | `SyLC_3D_Player_v4.5.0_win-x64.exe` | One self-contained executable. First launch unpacks to a local cache; later launches are instant. |
+| **Portable folder** | `SyLC_3D_Player_v4.5.0_win-x64.zip` | Unzip anywhere and run `SyLC_3D_Player.exe` — no extraction step, no installer. |
 
-The decoder's SIMD hot loop is compiled for each architecture's vector unit (AVX2 / NEON), so you get the real silicon, not a translation layer.
+Both are built for the **x86-64-v3 (AVX2)** baseline — the decoder's SIMD hot loop runs
+natively on any AVX2 CPU (Haswell 2013+ / Zen 1+): real silicon, no translation layer.
+*(The ARM64/NEON port lives in the codebase, but **4.5.0 ships Windows x64 only**.)*
 
 ---
 
 ## System requirements
 
-- **Windows 10/11 (x64)** or **Windows 11 on ARM (ARM64)**.
+- **Windows 10/11 (x64)**.
 - A **Direct3D 11**-capable GPU (an HDR display to enjoy HDR).
-- x64: a CPU with **AVX2** (standard since ~2013).
+- A CPU with **AVX2** (standard since ~2013).
 - Input: a **3D MKV** (MVC track), a **raw Blu-ray stream** (`.ssif` / `.m2ts`), a **BDMV disc/folder**, or a **Blu-ray `.iso`**. Rip with **MakeMKV**, or just point SyLC at the disc. (2D files of any codec play through libmpv.)
 
 > **No remux required for Blu-rays.** Open the **disc/drive**, the **BDMV folder**, or the **`.iso` directly** — SyLC mounts the image (no admin), finds the 3D feature by duration, and streams the **SSIF** straight off it. `.iso` opens via *Open file* or drag-and-drop; a disc/folder via the **disc** button or drag-and-drop.
@@ -131,7 +141,7 @@ The decoder's SIMD hot loop is compiled for each architecture's vector unit (AVX
 ## Get started
 
 1. Download the asset for your platform from **Releases**.
-2. **x64:** run `SyLC_3D_Player_v4.1.1_win-x64.exe`. **ARM64:** unzip and run `SyLC_3D_Player.exe`.
+2. Run `SyLC_3D_Player_v4.5.0_win-x64.exe` (single file) — or unzip `SyLC_3D_Player_v4.5.0_win-x64.zip` and run `SyLC_3D_Player.exe`.
 3. Open your 3D content — a **MKV**, a raw **`.ssif` / `.m2ts`**, a **BDMV folder**, or a Blu-ray **`.iso`** (drag-and-drop, the **Open file** button, or the **disc** button). Send the frame-packed window to your 3D display and enjoy.
 
 Nothing to install. Everything — decoder, demuxer, audio, codecs, Python runtime — is bundled.
@@ -140,7 +150,7 @@ Nothing to install. Everything — decoder, demuxer, audio, codecs, Python runti
 
 ## Build from source
 
-Everything needed lives in this repository: the Python application, the **decoder sources** (`edge264/`), the **demuxer sources** (`mvc_realtime_demuxer/`), the binaries, and the build scripts. Full details in **[`BUILD.md`](BUILD.md)** (x64) and **`BUILD_ARM.md`** (ARM64).
+Everything needed lives in this repository: the Python application, the **decoder sources** (`edge264/`), the **demuxer sources** (`mvc_realtime_demuxer/`), the binaries, and the build scripts. Full details in **[`BUILD.md`](BUILD.md)**.
 
 The short version (x64):
 

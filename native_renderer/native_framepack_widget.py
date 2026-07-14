@@ -99,7 +99,10 @@ class NativeFramepackWidget(QWidget):
         self._hdr = False
         self._gamma = 0.0
         self._rendering_paused = False
-        self._sub = None               # (rgba_ndarray, (x,y,w,h) normalized) or None
+        self._sub = None               # (rgba_ndarray, (x,y,w,h) normalized, disparity) or None
+        self._sub_dirty = False        # upload the RGBA to the GPU only when it changed
+        self._sub_depth_override = None  # BD3D dynamic depth (OFMD); None = per-cue value
+        self._uniforms_take_disparity = True   # probed once; False on an older renderer build
         self._fail_logged = False
 
         # Public attrs some call sites read on the Qt widget.
@@ -172,11 +175,25 @@ class NativeFramepackWidget(QWidget):
             return
         try:
             rect = self._sub[1] if self._sub else (0.0, 0.0, 1.0, 1.0)
-            self._r.set_uniforms(self._stereo_mode, 1 if self._sub else 0,
-                                 rect[0], rect[1], rect[2], rect[3],
-                                 self._sdr_white, self._gamma)
-            if self._sub is not None:
+            disp = (self._sub_depth_override if self._sub_depth_override is not None
+                    else (self._sub[2] if self._sub else 0.0))
+            if self._uniforms_take_disparity:
+                try:
+                    self._r.set_uniforms(self._stereo_mode, 1 if self._sub else 0,
+                                         rect[0], rect[1], rect[2], rect[3],
+                                         self._sdr_white, self._gamma, disp)
+                except TypeError:
+                    # renderer built before the subtitle_disparity uniform
+                    self._uniforms_take_disparity = False
+            if not self._uniforms_take_disparity:
+                self._r.set_uniforms(self._stereo_mode, 1 if self._sub else 0,
+                                     rect[0], rect[1], rect[2], rect[3],
+                                     self._sdr_white, self._gamma)
+            # The subtitle texture persists on the GPU (slot t0) — upload only
+            # when the image actually changed, not on every frame.
+            if self._sub is not None and self._sub_dirty:
                 self._r.set_subtitle_rgba(self._sub[0])
+                self._sub_dirty = False
             self._r.set_yuv_frame(yl, ul, vl, yr, ur, vr)
             self._r.present()
             self.has_video = True
@@ -215,19 +232,32 @@ class NativeFramepackWidget(QWidget):
             except Exception:
                 pass
 
-    def set_subtitle(self, rgba_array, x, y, w, h, video_width=1920, video_height=1080):
+    def set_subtitle(self, rgba_array, x, y, w, h, video_width=1920, video_height=1080,
+                     disparity=0.0):
+        """disparity: stereoscopic overlay depth — horizontal disparity normalized
+        to eye width; > 0 floats the subtitle in FRONT of the screen (each eye view
+        is shifted by half, in opposite directions). 0.0 = screen depth."""
         try:
             vw = float(video_width) or 1920.0
             vh = float(video_height) or 1080.0
             nx, ny = x / vw, y / vh
             nw, nh = w / vw, h / vh
-            self._sub = (np.ascontiguousarray(rgba_array, dtype=np.uint8), (nx, ny, nw, nh))
+            self._sub = (np.ascontiguousarray(rgba_array, dtype=np.uint8),
+                         (nx, ny, nw, nh), float(disparity))
+            self._sub_dirty = True
         except Exception as e:
             logger.warning(f"[NATIVE-WIDGET] set_subtitle failed: {e}")
             self._sub = None
 
     def clear_subtitle(self):
         self._sub = None
+
+    def set_subtitle_depth(self, disparity):
+        """Dynamic depth override for the overlay (BD3D per-GOP offset metadata).
+
+        Applies on top of whatever subtitle is displayed, without re-uploading
+        the bitmap. Pass None to clear (per-cue authored disparity applies)."""
+        self._sub_depth_override = None if disparity is None else float(disparity)
 
     # --- deprecated / no-ops the player may still call ------------------------
     def set_frame_fast(self, *args, **kwargs):

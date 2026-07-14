@@ -4,6 +4,10 @@ cbuffer buf : register(b0)
 {
     int _401_stereo_mode : packoffset(c0);
     int _401_subtitle_enabled : packoffset(c0.y);
+    // Stereoscopic subtitle depth: horizontal disparity normalized to eye width.
+    // > 0 = crossed (left-eye copy shifted right, right-eye left) = in FRONT of
+    // the screen; 0 = screen depth (flat). Each eye is shifted by half.
+    float _401_subtitle_disparity : packoffset(c0.z);
     float4 _401_subtitle_rect : packoffset(c1);
     float _401_sdr_white_level : packoffset(c2);
     float _401_output_gamma : packoffset(c2.y);
@@ -161,21 +165,24 @@ float3 sampleYUV_Spline36_V(Texture2D<float4> texY, SamplerState _texY_sampler, 
     return _368;
 }
 
-float4 sampleSubtitle(float2 videoUV)
+float4 sampleSubtitle(float2 videoUV, float eyeShift)
 {
     if (_401_subtitle_enabled == 0)
     {
         return 0.0f.xxxx;
     }
+    // eyeShift = displayed horizontal shift for THIS eye (normalized eye width).
+    // Shifting the displayed overlay by +s means sampling the rect at (x - s).
+    float x = videoUV.x - eyeShift;
     float sx = _401_subtitle_rect.x;
     float sy = _401_subtitle_rect.y;
     float sw = _401_subtitle_rect.z;
     float sh = _401_subtitle_rect.w;
-    bool _429 = videoUV.x >= sx;
+    bool _429 = x >= sx;
     bool _438;
     if (_429)
     {
-        _438 = videoUV.x < (sx + sw);
+        _438 = x < (sx + sw);
     }
     else
     {
@@ -201,7 +208,7 @@ float4 sampleSubtitle(float2 videoUV)
     }
     if (_454)
     {
-        float2 subUV = float2((videoUV.x - sx) / sw, (videoUV.y - sy) / sh);
+        float2 subUV = float2((x - sx) / sw, (videoUV.y - sy) / sh);
         return texSubtitle.Sample(_texSubtitle_sampler, subUV);
     }
     return 0.0f.xxxx;
@@ -217,6 +224,9 @@ void frag_main()
     float y_flipped = 1.0f - v_texCoord.y;
     float3 rgb;
     float2 videoUV;
+    // Which eye this pixel belongs to, for stereoscopic subtitle depth:
+    // +1 = left eye, -1 = right eye, 0 = mono/2D (no disparity applied).
+    float eyeSign = 0.0f;
     if (_401_stereo_mode == 0)
     {
         float2 uv = float2(v_texCoord.x, y_flipped);
@@ -250,6 +260,7 @@ void frag_main()
                     float2 param_1 = uv_1;
                     rgb = sampleYUV(texY_L, _texY_L_sampler, texU_L, _texU_L_sampler, texV_L, _texV_L_sampler, param_1);
                     videoUV = uv_1;
+                    eyeSign = 1.0f;
                 }
             }
             else
@@ -268,6 +279,7 @@ void frag_main()
                         float2 param_2 = uv_2;
                         rgb = sampleYUV(texY_R, _texY_R_sampler, texU_R, _texU_R_sampler, texV_R, _texV_R_sampler, param_2);
                         videoUV = uv_2;
+                        eyeSign = -1.0f;
                     }
                 }
                 else
@@ -287,6 +299,7 @@ void frag_main()
                     float2 param_3 = uv_3;
                     rgb = sampleYUV_Spline36_H(texY_L, _texY_L_sampler, texU_L, _texU_L_sampler, texV_L, _texV_L_sampler, param_3);
                     videoUV = uv_3;
+                    eyeSign = 1.0f;
                 }
                 else
                 {
@@ -294,6 +307,7 @@ void frag_main()
                     float2 param_4 = uv_4;
                     rgb = sampleYUV_Spline36_H(texY_R, _texY_R_sampler, texU_R, _texU_R_sampler, texV_R, _texV_R_sampler, param_4);
                     videoUV = uv_4;
+                    eyeSign = -1.0f;
                 }
             }
             else
@@ -306,6 +320,7 @@ void frag_main()
                         float2 param_5 = uv_5;
                         rgb = sampleYUV_Spline36_V(texY_L, _texY_L_sampler, texU_L, _texU_L_sampler, texV_L, _texV_L_sampler, param_5);
                         videoUV = uv_5;
+                        eyeSign = 1.0f;
                     }
                     else
                     {
@@ -313,13 +328,15 @@ void frag_main()
                         float2 param_6 = uv_6;
                         rgb = sampleYUV_Spline36_V(texY_R, _texY_R_sampler, texU_R, _texU_R_sampler, texV_R, _texV_R_sampler, param_6);
                         videoUV = uv_6;
+                        eyeSign = -1.0f;
                     }
                 }
             }
         }
     }
     float2 param_7 = videoUV;
-    float4 subtitle = sampleSubtitle(param_7);
+    // Each eye gets half the disparity, in opposite directions (crossed when > 0).
+    float4 subtitle = sampleSubtitle(param_7, eyeSign * _401_subtitle_disparity * 0.5f);
     float3 param_8 = rgb;
     float4 param_9 = subtitle;
     rgb = blendSubtitle(param_8, param_9);

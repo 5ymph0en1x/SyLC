@@ -13,6 +13,7 @@ python -m nuitka SyLC_3D_Player.py ^
   --include-module=mvc_demuxer_cpp ^
   --include-module=bluray_disc ^
   --include-module=lavf_h264_demuxer ^
+  --include-module=thumbnail_service ^
   --include-package=native_renderer ^
   --include-data-files=edge264.dll=edge264.dll ^
   --include-data-files=libwinpthread-1.dll=libwinpthread-1.dll ^
@@ -29,7 +30,7 @@ python -m nuitka SyLC_3D_Player.py ^
   --include-data-files=icon.png=icon.png ^
   --output-dir=build_nuitka ^
   --output-filename=SyLC_3D_Player.exe ^
-  --company-name=SyLC --product-name="SyLC 3D Player" --file-version=4.1.0 --product-version=4.1.0
+  --company-name=SyLC --product-name="SyLC 3D Player" --file-version=4.5.0 --product-version=4.5.0
 
 echo.
 echo Build done. Result: build_nuitka\SyLC_3D_Player.dist\SyLC_3D_Player.exe

@@ -22,12 +22,7 @@ class MonitoringOverlay(QWidget):
         super().__init__(parent)
         # Optimization: Use native window for overlay to bypass Qt software composition overhead
         # This allows the OpenGL widget underneath to render at full speed (VSync)
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.Tool |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.WindowDoesNotAcceptFocus
-        )
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)

@@ -113,7 +113,9 @@ private:
     void analyzeTracks();
 
     // Extract NAL units from block data and separate by type
-    void separateNALUnits(const std::vector<uint8_t>& blockData,
+    // NOTE: blockData is consumed (moved-from / rewritten in place) on the
+    // 4-byte-AVCC fast path — callers must treat it as spent afterwards.
+    void separateNALUnits(std::vector<uint8_t>& blockData,
                          std::vector<uint8_t>& baseOut,
                          std::vector<uint8_t>& dependentOut);
 
