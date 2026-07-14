@@ -3453,6 +3453,13 @@ class PlayerWindow(QMainWindow):
             if self._render_heartbeat_timer.isActive():
                 self._render_heartbeat_timer.stop()
 
+            # Restore the DWM window border + rounded corners we suppressed
+            try:
+                from framepacking_window_d3d11 import apply_borderless_dwm
+                apply_borderless_dwm(int(self.winId()), False)
+            except Exception:
+                pass
+
             # Restore original window style
             if hasattr(self, '_saved_style'):
                 user32.SetWindowLongW(int(self.winId()), GWL_STYLE, self._saved_style)
@@ -3529,6 +3536,15 @@ class PlayerWindow(QMainWindow):
                 mon_x, mon_y, mon_w, mon_h,
                 SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOZORDER
             )
+
+            # Windows 11 draws a thin border + rounded corners around any
+            # top-level window (the white 'liseret' all around fake-fullscreen).
+            # Suppress both so the video reaches the true screen edge.
+            try:
+                from framepacking_window_d3d11 import apply_borderless_dwm
+                apply_borderless_dwm(int(self.winId()), True)
+            except Exception:
+                pass
 
             self._is_fake_fullscreen = True
             self.controls_overlay.set_fullscreen_icon(True)

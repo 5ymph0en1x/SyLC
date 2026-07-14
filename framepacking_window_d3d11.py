@@ -21,6 +21,43 @@ from PySide6.QtGui import QKeyEvent, QMouseEvent
 
 logger = logging.getLogger(__name__)
 
+
+def apply_borderless_dwm(hwnd, enable):
+    """Kill (or restore) the DWM window border + rounded corners on a top-level
+    window. On Windows 11, DWM draws a thin border and rounds the corners of
+    EVERY top-level window — even one stripped of WS_CAPTION/WS_THICKFRAME and
+    sized to the whole monitor — which is the light 'liseret' seen all around a
+    borderless fake-fullscreen window. `enable=True` squares the corners and
+    sets the border colour to NONE; `enable=False` restores the defaults.
+
+    Returns the border-colour call's HRESULT (0 = S_OK). Harmless on Windows 10
+    / pre-22000 (unsupported attribute → non-zero HRESULT, ignored)."""
+    try:
+        dwmapi = ctypes.windll.dwmapi
+        dwmapi.DwmSetWindowAttribute.argtypes = [
+            wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+        dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long  # HRESULT
+
+        DWMWA_WINDOW_CORNER_PREFERENCE = 33
+        DWMWA_BORDER_COLOR = 34
+        DWMWCP_DEFAULT = 0
+        DWMWCP_DONOTROUND = 1
+        DWMWA_COLOR_DEFAULT = 0xFFFFFFFF
+        DWMWA_COLOR_NONE = 0xFFFFFFFE
+
+        corner = ctypes.c_uint(DWMWCP_DONOTROUND if enable else DWMWCP_DEFAULT)
+        color = ctypes.c_uint(DWMWA_COLOR_NONE if enable else DWMWA_COLOR_DEFAULT)
+        h = wintypes.HWND(int(hwnd))
+        dwmapi.DwmSetWindowAttribute(h, DWMWA_WINDOW_CORNER_PREFERENCE,
+                                     byref(corner), ctypes.sizeof(corner))
+        hr = dwmapi.DwmSetWindowAttribute(h, DWMWA_BORDER_COLOR,
+                                          byref(color), ctypes.sizeof(color))
+        return hr
+    except Exception as e:
+        logger.debug(f"[DWM] borderless attribute skipped: {e}")
+        return -1
+
+
 FRAMEPACK_WIDTH = 1920
 FRAMEPACK_HEIGHT = 2205
 TARGET_ASPECT = FRAMEPACK_WIDTH / FRAMEPACK_HEIGHT
@@ -142,6 +179,10 @@ class Framepacking3DWindow(QMainWindow):
             user32.SetWindowPos(hwnd, 0, mon_x, mon_y, mon_w, mon_h,
                                SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOZORDER)
 
+            # Win11: suppress the DWM border + rounded corners (the light
+            # 'liseret' around a borderless window) so 3D reaches the edge.
+            apply_borderless_dwm(hwnd, True)
+
             # Force DWM composition refresh to ensure HDR state is preserved
             try:
                 dwmapi.DwmFlush()
@@ -175,6 +216,9 @@ class Framepacking3DWindow(QMainWindow):
             SWP_NOZORDER = 0x0004  # Preserve Z-order
 
             hwnd = int(self.winId())
+
+            # Restore the DWM border + rounded corners we suppressed on enter
+            apply_borderless_dwm(hwnd, False)
 
             # Restore style
             if self._saved_style is not None:
