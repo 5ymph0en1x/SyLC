@@ -40,6 +40,14 @@ MVCSSIFDemuxer::~MVCSSIFDemuxer() {
 }
 
 bool MVCSSIFDemuxer::open(const std::string& path) {
+    // Review fix DF-2 (finding 2): dualFileMode_ must not leak from a prior openDual() call on
+    // a reused object. open() always (re)establishes SSIF/streaming mode, so force it false
+    // here at the top before anything else runs; the branch below may still set it back to
+    // true only via the historical (disabled) streaming-mode dual-file attempt path.
+    dualFileMode_ = false;
+    basePesFlushCount_ = 0;
+    mvcPesFlushCount_ = 0;
+
     std::cout << "[MVCSSIFDemuxer] Opening SSIF 3D stream: " << path << std::endl;
 
     // Determine if path is .ssif or .m2ts
@@ -284,6 +292,131 @@ bool MVCSSIFDemuxer::open(const std::string& path) {
     return true;
 }
 
+bool MVCSSIFDemuxer::openDual(const std::string& basePath, const std::string& depPath) {
+    // DUAL-SOURCE MODE (DF-2): base view and dependent view live in SEPARATE .m2ts files
+    // (MakeMKV backup, no interleaved .ssif). This is a NEW entry point that reuses the
+    // existing, battle-tested dual-file machinery (readNextFramePairDualFile / tryMatchFramePair
+    // / findByteForPts / seek dualFileMode_ branch) which was implemented but previously
+    // unreachable (dualFileMode_ was only ever left false). It bypasses the SSIF parser.
+    std::cout << "[SSIF-DUAL] openDual: base=" << basePath << ", dep=" << depPath << std::endl;
+
+    // Fresh state (openDual may be called on a reused object, but tests use a fresh one).
+    close();
+    hasCodecPrivate_ = false;
+    hasSPS_ = false;
+    hasPPS_ = false;
+    codecPrivate_.clear();
+
+    // Open both independent readers.
+    if (!baseReader_->open(basePath)) {
+        std::cerr << "[SSIF-DUAL] Failed to open base file: " << basePath << std::endl;
+        return false;
+    }
+    if (!dependentReader_->open(depPath)) {
+        std::cerr << "[SSIF-DUAL] Failed to open dependent file: " << depPath << std::endl;
+        baseReader_->close();
+        return false;
+    }
+
+    isStreamingMode_ = false;
+    dualFileMode_ = true;
+
+    M2TSReader::TSPacket packet;
+
+    // Detect the base video PID from the base file's PMT (H.264 stream_type 0x1B).
+    uint16_t basePid = 0;
+    for (int i = 0; i < 20000 && baseReader_->readPacket(packet); i++) {
+        for (const auto& prog : baseReader_->getPrograms()) {
+            for (const auto& kv : prog.streamPids) {
+                if (kv.second == 0x1B && basePid == 0) basePid = kv.first;  // H.264 (AVC)
+            }
+        }
+        if (basePid != 0) break;
+    }
+    if (basePid == 0) {
+        auto vids = baseReader_->getVideoPids();
+        if (!vids.empty()) basePid = *std::min_element(vids.begin(), vids.end());
+    }
+
+    // Detect the dependent video PID from the dependent file's PMT. A MakeMKV-split
+    // dependent .m2ts lists the view as 0x1B (AVC) or 0x20 (MVC).
+    uint16_t mvcPid = 0;
+    for (int i = 0; i < 20000 && dependentReader_->readPacket(packet); i++) {
+        for (const auto& prog : dependentReader_->getPrograms()) {
+            for (const auto& kv : prog.streamPids) {
+                if ((kv.second == 0x1B || kv.second == 0x20) && mvcPid == 0) mvcPid = kv.first;
+            }
+        }
+        if (mvcPid != 0) break;
+    }
+    if (mvcPid == 0) {
+        auto vids = dependentReader_->getVideoPids();
+        if (!vids.empty()) mvcPid = *std::min_element(vids.begin(), vids.end());
+    }
+    if (mvcPid == 0 && basePid != 0) mvcPid = basePid + 1;  // BD convention (dep = base+1)
+
+    if (basePid == 0) {
+        std::cerr << "[SSIF-DUAL] Failed to detect base video PID" << std::endl;
+        close();
+        return false;
+    }
+
+    videoInfo_.width = 1920;
+    videoInfo_.height = 1080;
+    videoInfo_.fps = 23.976;
+    videoInfo_.hasMVC = true;
+    videoInfo_.baseVideoPid = basePid;
+    videoInfo_.mvcVideoPid = mvcPid;
+    hasVideoInfo_ = true;
+    std::cout << "[SSIF-DUAL] PIDs: base=0x" << std::hex << basePid
+              << " dep=0x" << mvcPid << std::dec << std::endl;
+
+    // Extract codec_private (SPS + PPS) from the BASE file. Same routine the SSIF path uses.
+    baseReader_->seek(0);
+    basePesStates_.clear();
+    for (int i = 0; i < 200000 && baseReader_->readPacket(packet) && !hasCodecPrivate_; i++) {
+        if (packet.pid == basePid) processVideoPacket(packet, true);
+    }
+    if (!hasCodecPrivate_) {
+        // Non-fatal: the base .m2ts carries inline SPS/PPS in each IDR AU (passed through raw),
+        // so playback works without a separate codec_private. Warn and continue (unlike the SSIF
+        // open() which hard-fails) since get_codec_private() is optional for the dual-file path.
+        std::cerr << "[SSIF-DUAL] WARNING: SPS/PPS not captured in probe window "
+                  << "(continuing; base AUs carry inline parameter sets)" << std::endl;
+    }
+
+    // Reset BOTH readers to byte 0 and clear ALL reassembly/pairing/subtitle state so the
+    // read loop resyncs cleanly from the start (same discipline as SSIF open()).
+    baseReader_->seek(0);
+    dependentReader_->seek(0);
+    basePesStates_.clear();
+    dependentPesStates_.clear();
+    streamingPesState_.clear();
+    baseFrameBuffer_.clear();
+    dependentFrameBuffer_.clear();
+    frameQueue_.clear();
+    pendingBase_.baseView.clear();      pendingBase_.dependentView.clear();
+    pendingBase_.hasData = false;       pendingBase_.pts = 0;  pendingBase_.alreadyPrefixed = false;
+    pendingDependent_.baseView.clear(); pendingDependent_.dependentView.clear();
+    pendingDependent_.hasData = false;  pendingDependent_.pts = 0; pendingDependent_.alreadyPrefixed = false;
+    basePtsOffset_ = 0;
+    basePtsInitialized_ = false;
+    currentExtentIndex_ = 0;
+    totalFramePairs_ = 0;
+    depReseekBudget_ = 0;
+    basePesFlushCount_ = 0;
+    mvcPesFlushCount_ = 0;
+    selectedSubtitlePid_ = 0;
+    subtitlePesStates_.clear();
+    subtitleQueue_.clear();
+    abortRequested_.store(false, std::memory_order_relaxed);
+
+    isOpen_ = true;
+    std::cout << "[SSIF-DUAL] openDual complete (dual-file mode, "
+              << (hasCodecPrivate_ ? "codec_private ready" : "inline params") << ")" << std::endl;
+    return true;
+}
+
 void MVCSSIFDemuxer::close() {
     if (baseReader_) {
         baseReader_->close();
@@ -296,6 +429,16 @@ void MVCSSIFDemuxer::close() {
     }
     isOpen_ = false;
     isStreamingMode_ = false;
+    // Review fix DF-2 (finding 2): dualFileMode_ leaked across object reuse — neither close()
+    // nor open()'s non-streaming branch cleared it, so a demuxer instance that had been used
+    // for openDual() and then reopened via open() (SSIF path) would still take the dual-file
+    // read/seek branches against SSIF-mode readers. Clear it here unconditionally.
+    dualFileMode_ = false;
+    // Review fix DF-2 (finding 3): the PES-flush counters were function-static in
+    // processVideoPacket() (shared by ALL instances/reuses); now instance members, reset
+    // consistently with the other per-open counters (totalFramePairs_, depReseekBudget_).
+    basePesFlushCount_ = 0;
+    mvcPesFlushCount_ = 0;
 }
 
 bool MVCSSIFDemuxer::readNextFramePair(FramePair& framePair) {
@@ -388,9 +531,17 @@ bool MVCSSIFDemuxer::tryMatchFramePair(FramePair& framePair, bool allowDropBase)
                 (long long)basePtsOffset_, basePtsOffset_ / 90000.0);
     }
 
+    // Review fix DF-2 (finding 1): capture the dependent frame's OWN PTS before it's moved out,
+    // so framePair.depTimestamp reflects its real source timestamp instead of being left equal
+    // to the base timestamp (which made any base<->dep delta assertion structurally vacuous —
+    // it compared a value to itself). Same normalization offset as the base so both timestamps
+    // stay on one shared zero-based timeline.
+    int64_t depPts = dependentFrameBuffer_[bestDi].pts;
+
     framePair.baseData = std::move(front.data);
     framePair.dependentData = std::move(dependentFrameBuffer_[bestDi].data);
     framePair.timestamp = (basePts - basePtsOffset_) / 90;  // 90kHz -> ms (presentation ts)
+    framePair.depTimestamp = (depPts - basePtsOffset_) / 90;  // dep's own PTS, same timeline
     framePair.isKeyframe = front.isKeyframe;
 
     baseFrameBuffer_.erase(baseFrameBuffer_.begin());
@@ -542,6 +693,14 @@ bool MVCSSIFDemuxer::readNextFramePairDualFile(FramePair& framePair) {
     // DUAL-FILE MODE: base frames from baseReader_ (00001.m2ts), dependent frames from
     // dependentReader_ (00002.m2ts). Each file is one contiguous view, so we can advance
     // each independently to keep base+dependent aligned by PTS — no SSIF interleave gaps.
+
+    // Cooperative abort (DF-2): a newer seek superseded this read, or the thread is stopping.
+    // Bail immediately so a mid-read abort is a prompt clean stop (never a hang). read_next_*
+    // releases the GIL, so requestAbort() from another thread is observed here.
+    if (abortRequested_.load(std::memory_order_relaxed)) {
+        return false;
+    }
+
     uint16_t basePid = videoInfo_.baseVideoPid;
     uint16_t mvcPid = videoInfo_.mvcVideoPid;
     if (mvcPid == 0 && basePid != 0) {
@@ -558,6 +717,13 @@ bool MVCSSIFDemuxer::readNextFramePairDualFile(FramePair& framePair) {
     long iters = 0;
 
     while (iters++ < MAX_ITERS) {
+        // Cooperative abort inside the scan loop (checked cheaply, atomic, every 256 iters) so a
+        // long unmatched scan on a cold/contended disc can never pin the decoder thread past the
+        // GUI watchdog. Returning false ends the read; the caller treats it as no-pair/stop.
+        if ((iters & 255) == 0 && abortRequested_.load(std::memory_order_relaxed)) {
+            fprintf(stderr, "[SSIF-DUAL-ABORT] read aborted after %ld iters (superseded/stopping)\n", iters);
+            return false;
+        }
         bool progressed = false;
 
         // Keep base buffer populated; also harvest PGS subtitle packets from the base m2ts.
@@ -896,8 +1062,9 @@ void MVCSSIFDemuxer::separateNALUnits(const std::vector<uint8_t>& nalData, int64
 void MVCSSIFDemuxer::processVideoPacket(const M2TSReader::TSPacket& packet, bool isBase) {
     auto& pesStates = isBase ? basePesStates_ : dependentPesStates_;
     auto& state = pesStates[packet.pid];
-    static int basePesFlushCount = 0;
-    static int mvcPesFlushCount = 0;
+    // Review fix DF-2 (finding 3): basePesFlushCount_/mvcPesFlushCount_ moved to instance
+    // members (declared in the header) — they used to be `static` locals here, which are
+    // shared by every MVCSSIFDemuxer instance/reuse in the process, not per-object counters.
 
     if (packet.payloadUnitStartIndicator) {
         // Flush previous PES
@@ -970,9 +1137,9 @@ void MVCSSIFDemuxer::processVideoPacket(const M2TSReader::TSPacket& packet, bool
                     pending.hasData = hasValidContent;
 
                     if (isBase) {
-                        basePesFlushCount++;
+                        basePesFlushCount_++;
                     } else {
-                        mvcPesFlushCount++;
+                        mvcPesFlushCount_++;
                     }
                 }
             }
@@ -1166,6 +1333,10 @@ bool MVCSSIFDemuxer::synchronizeFrames(FramePair& framePair) {
     }
     int64_t normalizedPts = pendingBase_.pts - basePtsOffset_;
     framePair.timestamp = normalizedPts / 90; // Convert 90kHz to milliseconds
+    // Review fix DF-2 (finding 1): stamp the dependent's own PTS here too (legacy
+    // extents-based SSIF path — reached only when the SSIF is small enough to skip streaming
+    // mode). Same fix/rationale as tryMatchFramePair().
+    framePair.depTimestamp = (pendingDependent_.pts - basePtsOffset_) / 90;
     framePair.isKeyframe = false; // TODO: detect keyframes
 
     // Check for IDR in base view

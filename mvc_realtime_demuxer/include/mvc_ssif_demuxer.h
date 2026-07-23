@@ -39,7 +39,10 @@ public:
     struct FramePair {
         std::vector<uint8_t> baseData;
         std::vector<uint8_t> dependentData;
-        uint64_t timestamp;
+        uint64_t timestamp;     // base view's presentation ts (ms, normalized)
+        uint64_t depTimestamp;  // dependent view's OWN presentation ts (ms, normalized) —
+                                // review fix DF-2: previously unset/copied from `timestamp`,
+                                // making any base==dep comparison structurally vacuous.
         bool isKeyframe;
     };
 
@@ -52,6 +55,21 @@ public:
      * @return true if successful
      */
     bool open(const std::string& ssifPath);
+
+    /**
+     * Open a DUAL-SOURCE BD3D pair: base view and dependent view in SEPARATE .m2ts
+     * files (MakeMKV-style backup with no interleaved .ssif — e.g. GITS 00005.m2ts +
+     * 00006.m2ts). Bypasses the SSIF parser entirely: opens two independent M2TSReaders
+     * (base file -> PID 0x1011 video AUs, dependent file -> PID 0x1012 AUs), reusing the
+     * SAME per-stream PES/AU-assembly + PTS-pairing + per-file PTS-scan seek machinery as
+     * the SSIF dual-file path (dualFileMode_). Delivers base/dep AU pairs through the exact
+     * same interface (readNextFramePair / seek / getCodecPrivate / requestAbort) as the
+     * SSIF demuxer, so the Python pipeline consumes it unchanged.
+     * @param basePath Path to the base-view .m2ts (H.264 base, PID 0x1011)
+     * @param depPath  Path to the dependent-view .m2ts (MVC dependent, PID 0x1012)
+     * @return true if both files opened, PIDs detected, and codec_private extracted
+     */
+    bool openDual(const std::string& basePath, const std::string& depPath);
 
     /**
      * Close the demuxer
@@ -259,6 +277,13 @@ private:
     std::vector<std::pair<int64_t, uint64_t>> ssifSeekTable_;
     int totalFramePairs_ = 0;  // emitted pair counter (was a static local)
     int depReseekBudget_ = 0;  // post-seek: allowed dependent re-seeks to align to base
+
+    // Review fix DF-2 (finding 3): these were function-static locals in processVideoPacket(),
+    // so they persisted across MVCSSIFDemuxer instances/reuse (a static local is shared by ALL
+    // objects of the process). Made instance members; reset alongside the other counters in
+    // open()/openDual()/close().
+    int basePesFlushCount_ = 0;
+    int mvcPesFlushCount_ = 0;
 
     // PGS subtitle streaming state
     int selectedSubtitlePid_ = 0;                       // 0 = disabled

@@ -550,6 +550,14 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
         .def("open", &MVCSSIFDemuxer::open,
              "Open an SSIF file or M2TS file (auto-detects SSIF)",
              py::arg("file_path"))
+        .def("open_dual", &MVCSSIFDemuxer::openDual,
+             py::call_guard<py::gil_scoped_release>(),
+             "Open a DUAL-SOURCE BD3D pair: base view and dependent view in SEPARATE .m2ts "
+             "files (MakeMKV backup with no interleaved .ssif). base_path -> PID 0x1011 video "
+             "AUs, dep_path -> PID 0x1012 AUs; base/dep pairs are matched by PTS and delivered "
+             "through the identical read_next_frame_pair / seek / get_codec_private / "
+             "request_abort interface as the SSIF path (Python pipeline unchanged).",
+             py::arg("base_path"), py::arg("dep_path"))
         .def("close", &MVCSSIFDemuxer::close,
              "Close the demuxer")
         .def("get_video_info", &MVCSSIFDemuxer::getVideoInfo,
@@ -582,7 +590,15 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
 
                  py::dict dep;
                  dep["data"] = py::array_t<uint8_t>(pair.dependentData.size(), pair.dependentData.data());
-                 dep["timestamp"] = pair.timestamp;
+                 // Review fix DF-2 (finding 1): use the dependent view's OWN PTS (depTimestamp),
+                 // not a copy of the base timestamp. Previously this line read `pair.timestamp`,
+                 // so base/dep pair-timestamp deltas were structurally 0 (comparing a value to
+                 // itself) for BOTH the dual-file and SSIF-streaming paths (they share the same
+                 // FramePair producer, tryMatchFramePair()). Consumers checked (mvc_decoder.py
+                 // _push_pair_pts / IDR-scan timestamp extraction) only ever read dep['timestamp']
+                 // as a fallback when `base` itself is absent/falsy, which never happens for these
+                 // demuxer pairs — so this is safe for existing consumers.
+                 dep["timestamp"] = pair.depTimestamp;
                  dep["isKeyframe"] = pair.isKeyframe;
 
                  return py::make_tuple(true, base, dep);
@@ -782,9 +798,21 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
              "output_gamma>0 linearizes the gamma-domain RGB before scaling; "
              "subtitle_disparity = stereoscopic overlay depth, normalized eye-width, "
              ">0 = in front of the screen).")
+        .def("set_source_aspect", &sylc::NativeRenderer::set_source_aspect,
+             py::arg("aspect"),
+             "C2: display-aspect override (width/height). >0 forces the letterbox/pillarbox "
+             "aspect (half-SBS/half-TAB, where the packed frame carries the original 2D "
+             "dims); 0.0 = derive from the uploaded eye dimensions (full formats/MVC/2D).")
+        .def("set_color_params", &sylc::NativeRenderer::set_color_params,
+             py::arg("yuv_matrix_sel"), py::arg("transfer_sel"),
+             "HDR10/PQ color selectors (HEVC). yuv_matrix_sel: 0=BT.601 limited (legacy), "
+             "1=BT.709 limited, 2=BT.2020nc limited. transfer_sel: 0=legacy gamma/sdr_white, "
+             "1=PQ->scRGB absolute (HDR display), 2=PQ->tone-mapped SDR. Both 0 (DEFAULT) is "
+             "byte-identical to the pre-HDR path.")
         .def("set_yuv_frame",
              [](sylc::NativeRenderer& r, py::object yl, py::object ul, py::object vl,
                 py::object yr, py::object ur, py::object vr) {
+                 r.set_plane_scale(1.0f);   // 8-bit R8: identity scale
                  py::object planes[6] = { yl, ul, vl, yr, ur, vr };
                  bool ok = true;
                  for (int i = 0; i < 6; ++i) {
@@ -825,6 +853,55 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
              py::arg("y_l"), py::arg("u_l"), py::arg("v_l"),
              py::arg("y_r") = py::none(), py::arg("u_r") = py::none(), py::arg("v_r") = py::none(),
              "Upload the 6 YUV planes (uint8 2-D arrays; right planes optional for 2D).")
+        .def("set_yuv_frame16",
+             [](sylc::NativeRenderer& r, py::object yl, py::object ul, py::object vl,
+                py::object yr, py::object ur, py::object vr, float plane_scale) {
+                 // 10-bit (yuv420p10le) path: uint16 planes -> R16_UNORM textures.
+                 // plane_scale rescales the 10-bit-in-low-bits sample to [0,1] in
+                 // the shader before YUV->RGB. Same shape/stride contract as the
+                 // 8-bit path, right planes None-capable for 2D.
+                 r.set_plane_scale(plane_scale);
+                 py::object planes[6] = { yl, ul, vl, yr, ur, vr };
+                 bool ok = true;
+                 for (int i = 0; i < 6; ++i) {
+                     if (planes[i].is_none()) continue;
+                     // ZERO-COPY fast path: uint16 2-D array whose rows are
+                     // element-contiguous (strides(1)==2) is uploaded in place;
+                     // upload_plane16 honors the (byte) row stride.
+                     if (py::isinstance<py::array>(planes[i])) {
+                         auto a = planes[i].cast<py::array>();
+                         if (a.ndim() == 2 && a.dtype().is(py::dtype::of<uint16_t>())
+                                 && a.strides(1) == static_cast<py::ssize_t>(sizeof(uint16_t))
+                                 && a.strides(0) >= a.shape(1) * static_cast<py::ssize_t>(sizeof(uint16_t))) {
+                             const uint32_t h = static_cast<uint32_t>(a.shape(0));
+                             const uint32_t w = static_cast<uint32_t>(a.shape(1));
+                             const uint32_t stride = static_cast<uint32_t>(a.strides(0)); // bytes
+                             const auto* data = static_cast<const uint16_t*>(a.data());
+                             py::gil_scoped_release nogil;   // memcpy without holding the GIL
+                             if (!r.upload_plane16(i, data, w, h, stride)) ok = false;
+                             continue;
+                         }
+                     }
+                     // Fallback: force a contiguous uint16 copy.
+                     auto a = planes[i].cast<py::array_t<uint16_t,
+                                  py::array::c_style | py::array::forcecast>>();
+                     if (a.ndim() != 2)
+                         throw std::runtime_error("YUV16 plane must be a 2-D uint16 array");
+                     const uint32_t h = static_cast<uint32_t>(a.shape(0));
+                     const uint32_t w = static_cast<uint32_t>(a.shape(1));
+                     const uint32_t stride = static_cast<uint32_t>(a.strides(0)); // bytes (c_style => w*2)
+                     const auto* data = a.data();
+                     py::gil_scoped_release nogil;
+                     if (!r.upload_plane16(i, data, w, h, stride)) ok = false;
+                 }
+                 return ok;
+             },
+             py::arg("y_l"), py::arg("u_l"), py::arg("v_l"),
+             py::arg("y_r") = py::none(), py::arg("u_r") = py::none(), py::arg("v_r") = py::none(),
+             py::arg("plane_scale") = 1.0f,
+             "Upload the 6 YUV planes as uint16 2-D arrays (10-bit in low bits) into "
+             "R16_UNORM textures; right planes optional for 2D. plane_scale multiplies "
+             "each sample before YUV->RGB (65535/1023 ~= 64.06 for yuv420p10le).")
         .def("set_subtitle_rgba",
              [](sylc::NativeRenderer& r,
                 py::array_t<uint8_t, py::array::c_style | py::array::forcecast> a) {

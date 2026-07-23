@@ -68,6 +68,38 @@ public:
     bool upload_plane(int plane_index, const uint8_t* data,
                       uint32_t width, uint32_t height, uint32_t src_stride);
 
+    // Upload one 16-bit plane into an R16_UNORM texture (10-bit HEVC: yuv420p10le
+    // stores the value in the LOW bits). Same plane_index mapping as upload_plane;
+    // the texture is (re)created when the FORMAT or dimensions change. src_stride is
+    // the source row stride in BYTES (tight = width*2). Pair with set_plane_scale()
+    // so the shader rescales the sample back to [0,1] before YUV->RGB.
+    bool upload_plane16(int plane_index, const uint16_t* data,
+                        uint32_t width, uint32_t height, uint32_t src_stride);
+
+    // Per-sample scale multiplied into every Y/U/V texel BEFORE the YUV->RGB math
+    // (stored in the cbuffer). 1.0 = 8-bit R8 (identity); 65535/1023 ~= 64.06 maps a
+    // 10-bit value stored low in an R16_UNORM texel back to [0,1]. Takes effect on
+    // the next present. 8-bit uploads must set this to 1.0.
+    void set_plane_scale(float scale);
+
+    // HDR10/PQ color selectors (HEVC). Stored in the cbuffer (c3.y/c3.z). Both 0 (DEFAULT)
+    // is the legacy path — BYTE-IDENTICAL for MVC/H.264 and every existing source.
+    //   yuv_matrix_sel: 0 = BT.601 limited (legacy), 1 = BT.709 limited, 2 = BT.2020nc limited.
+    //   transfer_sel:   0 = legacy gamma/sdr_white, 1 = PQ -> scRGB absolute (HDR display),
+    //                   2 = PQ -> tone-mapped SDR (SDR display fallback).
+    // Mirrors set_plane_scale: mutates only these two cbuffer fields and re-uploads, so a
+    // per-frame color-param change takes effect without re-specifying every other uniform.
+    // Takes effect on the next present; serialized by the same mutex as the sibling setters.
+    void set_color_params(int yuv_matrix_sel, int transfer_sel);
+
+    // C2: display-aspect override for the packed-frame formats. > 0 forces the display
+    // aspect (width/height) used by the letterbox/pillarbox geometry instead of deriving
+    // it from the uploaded eye dimensions. Needed for half-SBS/half-TAB, where each eye is
+    // squeezed (e.g. 960x1080) yet must display at the ORIGINAL 2D aspect (the packed
+    // frame's own W/H). 0.0f = derive from planes (default; full formats, MVC, 2D). Takes
+    // effect on the next present; serialized by the same mutex as the sibling setters.
+    void set_source_aspect(float aspect);
+
     // Upload the RGBA8 subtitle overlay (texture slot t0). Straight alpha.
     bool upload_subtitle(const uint8_t* data,
                          uint32_t width, uint32_t height, uint32_t src_stride);
@@ -101,10 +133,21 @@ public:
     void shutdown();
 
 private:
+    // Plane texture pixel format. Kept free of DXGI/Windows types so this public
+    // header needs no d3d headers; mapped to DXGI_FORMAT in the .cpp.
+    //   R8    = 8-bit luma/chroma plane (R8_UNORM)
+    //   R16   = 16-bit (10-bit HEVC) luma/chroma plane (R16_UNORM)
+    //   RGBA8 = straight-alpha subtitle overlay (R8G8B8A8_UNORM)
+    enum class TexFormat { R8, R16, RGBA8 };
+
     bool create_rtv_for_backbuffer();
     void release_backbuffer_views();
+    // ResizeBuffers + RTV recreate assuming the impl_->mtx is ALREADY held (used by
+    // both the public resize() and the present()-time self-heal so a locked present
+    // never re-locks the non-recursive mutex -> deadlock).
+    bool resize_backbuffer_locked(uint32_t width, uint32_t height);
     bool create_pipeline();                    // shaders, input layout, sampler, cbuffer, vbuffer
-    bool ensure_texture(int slot, uint32_t w, uint32_t h, bool rgba);
+    bool ensure_texture(int slot, uint32_t w, uint32_t h, TexFormat fmt);
 
     struct Impl;            // holds the ComPtr<> members (kept out of this header)
     Impl* impl_ = nullptr;
@@ -113,11 +156,16 @@ private:
     bool        pipeline_ready_ = false;
     bool        has_frame_     = false;        // a left-Y plane has been uploaded
     bool        paused_        = false;        // seek/pause gate (guarded by impl_->mtx)
-    uint32_t    width_  = 0;                   // backbuffer size
+    uint64_t    hwnd_   = 0;                   // owning HWND (for present()-time client-size self-heal)
+    uint32_t    width_  = 0;                   // backbuffer size (physical px)
     uint32_t    height_ = 0;
     uint32_t    src_w_  = 0;                   // decoded left-Y size (for 2D aspect)
     uint32_t    src_h_  = 0;
     int         stereo_mode_ = 0;
+    float       plane_scale_ = 1.0f;           // cbuffer plane_scale (guarded by impl_->mtx)
+    int         yuv_matrix_sel_ = 0;           // cbuffer yuv_matrix_sel (mtx-guarded), 0=legacy BT.601
+    int         transfer_sel_   = 0;           // cbuffer transfer_sel (mtx-guarded), 0=legacy
+    float       aspect_ = 0.0f;                 // C2 display-aspect override, 0=derive (mtx-guarded)
     std::string backend_info_;
     std::string last_error_;
 };

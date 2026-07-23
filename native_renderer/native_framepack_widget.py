@@ -17,6 +17,7 @@ push (Copy #1 elimination) is the subsequent step (S5b).
 """
 import logging
 import os
+import time
 import numpy as np
 from PySide6.QtWidgets import QWidget
 from PySide6.QtCore import Qt
@@ -24,6 +25,16 @@ from PySide6.QtCore import Qt
 logger = logging.getLogger("SyLC.NativeWidget")
 
 _MODE = {'2d': 0, 'framepack': 1, 'sbs': 2, 'tab': 3}
+
+
+def _pct(sorted_vals, q):
+    """p-quantile of an already-sorted list (nearest-rank). 0.0 on empty."""
+    if not sorted_vals:
+        return 0.0
+    idx = int(q * (len(sorted_vals) - 1) + 0.5)
+    if idx >= len(sorted_vals):
+        idx = len(sorted_vals) - 1
+    return sorted_vals[idx]
 
 
 def query_sdr_white_level():
@@ -96,7 +107,13 @@ class NativeFramepackWidget(QWidget):
         # so we no longer depend on the Qt widget having done it.
         self._sdr_white = float(sdr_white) if sdr_white is not None else query_sdr_white_level()
         self._sdr_white_level = self._sdr_white   # alias: some call sites read _sdr_white_level
-        self._hdr = False
+        # Decide SDR vs HDR from the display's SDR white level (>1.01 => HDR), with the
+        # SYLC_NATIVE_HDR override, AT CONSTRUCTION so the player can read _hdr BEFORE the
+        # first frame (HEVC transfer_sel selection). _ensure() recomputes it identically.
+        self._hdr = self._sdr_white > 1.01
+        _env_hdr = os.environ.get("SYLC_NATIVE_HDR")
+        if _env_hdr is not None:
+            self._hdr = _env_hdr == "1"
         self._gamma = 0.0
         self._rendering_paused = False
         self._sub = None               # (rgba_ndarray, (x,y,w,h) normalized, disparity) or None
@@ -104,20 +121,63 @@ class NativeFramepackWidget(QWidget):
         self._sub_depth_override = None  # BD3D dynamic depth (OFMD); None = per-cue value
         self._uniforms_take_disparity = True   # probed once; False on an older renderer build
         self._fail_logged = False
+        # 10-bit HEVC (uint16 planes) routing. plane_scale rescales a 10-bit value
+        # stored low in an R16 texel back to [0,1]: 65535/1023 ~= 64.06 (yuv420p10le).
+        # The player overwrites plane_scale per-source (Task 8).
+        self.plane_scale = 65535.0 / 1023.0
+        self._have_yuv16 = True                # False after an old .pyd rejects set_yuv_frame16
+        self._yuv16_unsupported_logged = False
+        # C2: display-aspect override forwarded to the renderer each frame. > 0 forces the
+        # display aspect (half-SBS/half-TAB: the packed frame carries the ORIGINAL 2D dims,
+        # so each squeezed eye must still display at that aspect); 0.0 = derive from the
+        # uploaded eye dimensions. The player sets it per-source (Task C2).
+        self.source_aspect = 0.0
+        self._have_source_aspect = True        # False after an old .pyd rejects set_source_aspect
+        self._source_aspect_unsupported_logged = False
+        # HDR10/PQ selectors forwarded to the renderer each frame (next to plane_scale/
+        # source_aspect). The player sets them per-source in _try_start_hevc; 0/0 = legacy
+        # (byte-identical for MVC/H.264/8-bit). Reset to 0/0 in _stop_hevc_decoder.
+        self.yuv_matrix_sel = 0
+        self.transfer_sel = 0
+        self._have_color_params = True         # False after an old .pyd rejects set_color_params
+        self._color_params_unsupported_logged = False
 
         # Public attrs some call sites read on the Qt widget.
         self.has_video = False
+
+        # --- [HEVC-METER] instrumentation (SYLC_HEVC_DIAG=1, silent otherwise) ---
+        # Measures the GUI-thread cost of one frame: slot-to-slot cadence, the native
+        # YUV upload call, and present() (vsync) — reported every ~5 s as p50/p99/max.
+        self._diag = os.environ.get("SYLC_HEVC_DIAG") == "1"
+        self._diag_slot = []       # slot-to-slot intervals (ms)
+        self._diag_upload = []     # set_yuv_frame[16] duration (ms)
+        self._diag_present = []    # present() duration (ms)
+        self._diag_last_slot = None
+        self._diag_win = None
 
     # --- Qt overrides ---------------------------------------------------------
     def paintEngine(self):
         return None  # rendering goes through D3D11, not Qt's paint system
 
+    def _phys(self, w, h):
+        """Logical (Qt) -> PHYSICAL pixels for the D3D11 backbuffer. The swapchain and
+        the HWND client area live in physical pixels; on a HiDPI display Qt's sizes are
+        logical, so passing them raw would make the backbuffer smaller than the client
+        area (DXGI STRETCH upscales it -> blur). The C++ present() also self-heals to the
+        true GetClientRect, so this keeps the two in agreement instead of fighting."""
+        try:
+            dpr = float(self.devicePixelRatioF())
+        except Exception:
+            dpr = 1.0
+        return max(1, int(round(w * dpr))), max(1, int(round(h * dpr)))
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self._r and self._r is not False:
             s = event.size()
+            pw, ph = self._phys(s.width(), s.height())
             try:
-                self._r.resize(max(1, s.width()), max(1, s.height()))
+                self._r.resize(pw, ph)
             except Exception:
                 pass
 
@@ -145,7 +205,8 @@ class NativeFramepackWidget(QWidget):
 
             r = m.NativeRenderer()
             sz = self.size()
-            if not r.initialize(int(self.winId()), max(1, sz.width()), max(1, sz.height()), self._hdr):
+            pw, ph = self._phys(sz.width(), sz.height())
+            if not r.initialize(int(self.winId()), pw, ph, self._hdr):
                 logger.warning(f"[NATIVE-WIDGET] initialize failed: {r.last_error()}")
                 self._r = False
                 return False
@@ -173,6 +234,13 @@ class NativeFramepackWidget(QWidget):
             yr, ur, vr = y_r, u_r, v_r
         if not self._ensure():
             return
+        if self._diag:
+            _t_slot = time.perf_counter()
+            if self._diag_last_slot is not None:
+                self._diag_slot.append((_t_slot - self._diag_last_slot) * 1000.0)
+            self._diag_last_slot = _t_slot
+            if self._diag_win is None:
+                self._diag_win = _t_slot
         try:
             rect = self._sub[1] if self._sub else (0.0, 0.0, 1.0, 1.0)
             disp = (self._sub_depth_override if self._sub_depth_override is not None
@@ -189,14 +257,74 @@ class NativeFramepackWidget(QWidget):
                 self._r.set_uniforms(self._stereo_mode, 1 if self._sub else 0,
                                      rect[0], rect[1], rect[2], rect[3],
                                      self._sdr_white, self._gamma)
+            # C2: forward the display-aspect override each frame (next to the uniforms). An
+            # old .pyd without set_source_aspect raises AttributeError/TypeError -> disable
+            # it (logged once); geometry then derives the aspect from planes as before.
+            if self._have_source_aspect:
+                try:
+                    self._r.set_source_aspect(float(self.source_aspect))
+                except (AttributeError, TypeError):
+                    self._have_source_aspect = False
+                    if not self._source_aspect_unsupported_logged:
+                        logger.warning("[NATIVE-WIDGET] set_source_aspect unavailable "
+                                       "(old .pyd); deriving aspect from planes")
+                        self._source_aspect_unsupported_logged = True
+            # HDR10/PQ: forward the two color selectors each frame (same old-.pyd probe
+            # idiom). An old .pyd without set_color_params raises AttributeError/TypeError
+            # -> disable it (logged once); rendering then stays on the legacy 0/0 path.
+            if self._have_color_params:
+                try:
+                    self._r.set_color_params(int(self.yuv_matrix_sel), int(self.transfer_sel))
+                except (AttributeError, TypeError):
+                    self._have_color_params = False
+                    if not self._color_params_unsupported_logged:
+                        logger.warning("[NATIVE-WIDGET] set_color_params unavailable "
+                                       "(old .pyd); HDR/PQ color disabled (legacy render)")
+                        self._color_params_unsupported_logged = True
             # The subtitle texture persists on the GPU (slot t0) — upload only
             # when the image actually changed, not on every frame.
             if self._sub is not None and self._sub_dirty:
                 self._r.set_subtitle_rgba(self._sub[0])
                 self._sub_dirty = False
-            self._r.set_yuv_frame(yl, ul, vl, yr, ur, vr)
+            # Route by plane dtype: uint16 (10-bit HEVC) -> R16 path with plane_scale;
+            # uint8 -> the existing R8 path. Same TypeError/AttributeError-probe idiom
+            # as _uniforms_take_disparity: an old .pyd without set_yuv_frame16 drops
+            # 10-bit frames (logged once) instead of crashing; 8-bit is unaffected.
+            is16 = (yl is not None and getattr(yl, 'dtype', None) == np.uint16)
+            _t_up0 = time.perf_counter() if self._diag else 0.0
+            if is16:
+                if not self._have_yuv16:
+                    return
+                try:
+                    self._r.set_yuv_frame16(yl, ul, vl, yr, ur, vr, float(self.plane_scale))
+                except (AttributeError, TypeError):
+                    self._have_yuv16 = False
+                    if not self._yuv16_unsupported_logged:
+                        logger.warning("[NATIVE-WIDGET] set_yuv_frame16 unavailable "
+                                       "(old .pyd); dropping 10-bit frames")
+                        self._yuv16_unsupported_logged = True
+                    return
+            else:
+                self._r.set_yuv_frame(yl, ul, vl, yr, ur, vr)
+            if self._diag:
+                _t_up1 = time.perf_counter()
+                self._diag_upload.append((_t_up1 - _t_up0) * 1000.0)
             self._r.present()
             self.has_video = True
+            if self._diag:
+                self._diag_present.append((time.perf_counter() - _t_up1) * 1000.0)
+                if self._diag_win is not None and (time.perf_counter() - self._diag_win) >= 5.0:
+                    _ss, _su, _sp = (sorted(self._diag_slot), sorted(self._diag_upload),
+                                     sorted(self._diag_present))
+                    logger.info(
+                        f"[HEVC-METER] widget slot ms p50={_pct(_ss, 0.5):.1f} "
+                        f"p99={_pct(_ss, 0.99):.1f} max={(_ss[-1] if _ss else 0.0):.1f} | "
+                        f"upload ms p50={_pct(_su, 0.5):.2f} p99={_pct(_su, 0.99):.2f} "
+                        f"max={(_su[-1] if _su else 0.0):.2f} | present ms "
+                        f"p50={_pct(_sp, 0.5):.2f} p99={_pct(_sp, 0.99):.2f} "
+                        f"max={(_sp[-1] if _sp else 0.0):.2f} | n={len(_ss)}")
+                    self._diag_slot, self._diag_upload, self._diag_present = [], [], []
+                    self._diag_win = time.perf_counter()
         except Exception as e:
             if not self._fail_logged:
                 logger.warning(f"[NATIVE-WIDGET] frame delivery failed: {e}")
@@ -225,6 +353,9 @@ class NativeFramepackWidget(QWidget):
 
     def clear_textures(self):
         self.has_video = False
+        # C2: reset the display-aspect override so the next source derives aspect from
+        # planes again until the player re-sets it.
+        self.source_aspect = 0.0
         if self._r and self._r is not False:
             try:
                 self._r.clear_frame()
@@ -267,9 +398,22 @@ class NativeFramepackWidget(QWidget):
         pass  # native picks SDR/HDR at init from the white level
 
     def shutdown(self):
-        if self._r and self._r is not False:
+        # Release the D3D11 renderer but stay RE-INITIALIZABLE. The framepack window is a
+        # session singleton the player creates once and reuses (never recreated / never
+        # nulled). Closing the detached window (X / Alt-F4 / app-exit closeEvent) fires
+        # Framepacking3DWindow.closeEvent -> shutdown(); a later MultiView relaunch reuses
+        # THIS same widget. Reset to None (the "not yet initialized" state) instead of the
+        # sticky False "permanently unavailable" sentinel, so _ensure() lazily rebuilds the
+        # renderer on the next delivered frame — and rebinds the swapchain to the CURRENT
+        # winId, which Qt recreates when the window is closed and reshown. Leaving it False
+        # made _ensure() early-return False forever -> every frame dropped -> a completely
+        # WHITE native surface on replay. Idempotent: a 2nd shutdown finds _r None (or False)
+        # and no-ops; on app exit the decoder is stopped before this runs, so no stray frame
+        # re-triggers _ensure().
+        r = self._r
+        self._r = None
+        if r and r is not False:
             try:
-                self._r.shutdown()
+                r.shutdown()
             except Exception:
                 pass
-        self._r = False
