@@ -30,7 +30,7 @@ python -m nuitka SyLC_3D_Player.py ^
   --include-data-files=icon.png=icon.png ^
   --output-dir=build_nuitka ^
   --output-filename=SyLC_3D_Player.exe ^
-  --company-name=SyLC --product-name="SyLC 3D Player" --file-version=4.5.0 --product-version=4.5.0
+  --company-name=SyLC --product-name="SyLC 3D Player" --file-version=5.0.0 --product-version=5.0.0
 
 echo.
 echo Build done. Result: build_nuitka\SyLC_3D_Player.dist\SyLC_3D_Player.exe

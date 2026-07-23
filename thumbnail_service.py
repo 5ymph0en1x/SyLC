@@ -40,13 +40,22 @@ EXTRACT_DEADLINE_S = 3.0
 MAX_PAIR_SCAN = 600
 
 
-def planes_to_qimage_320(y, u, v, layout=None):
-    """Downscale numpy Y/U/V planes (I420 layout) to a 320x180 RGB QImage.
-    Resize planes first (cheap), then one small I420->RGB conversion.
+def planes_to_qimage_320(y, u, v, layout=None, half=False):
+    """Downscale numpy Y/U/V planes (I420 layout) to a 320x180 RGB QImage,
+    PRESERVING the display aspect ratio (letterboxed with black bars inside the
+    fixed box). Resize planes first (cheap), then one small I420->RGB conversion.
     Also used by the decoder-thread harvest tap (zero-I/O cache fill).
+
+    The consumer (PreviewTooltip) blits the pixmap into a FIXED 320x180 rect, so
+    a non-16:9 frame must be letterboxed HERE or it would be re-stretched on
+    screen (e.g. a 2.40:1 scope master looked squished). We always return a
+    320x180 image; off-aspect content is centred with black bars.
 
     layout: 'sbs' → keep the LEFT half (packed side-by-side sources),
             'tab' → keep the TOP half (top-and-bottom), else full frame.
+    half:   half-packed source (HSBS/HTAB): the cropped eye is spatially
+            squeezed, so its DISPLAY aspect is un-squeezed before letterboxing
+            (×2 wide for sbs, ×2 tall for tab) — an HSBS eye 960x1080 shows 16:9.
     A thumbnail is a single eye — never the packed pair."""
     try:
         if layout == 'sbs':
@@ -57,22 +66,45 @@ def planes_to_qimage_320(y, u, v, layout=None):
             y = y[:y.shape[0] // 2]
             u = u[:u.shape[0] // 2]
             v = v[:v.shape[0] // 2]
-        y_s = cv2.resize(y, (THUMB_W, THUMB_H), interpolation=cv2.INTER_AREA)
-        u_s = cv2.resize(u, (THUMB_W // 2, THUMB_H // 2), interpolation=cv2.INTER_AREA)
-        v_s = cv2.resize(v, (THUMB_W // 2, THUMB_H // 2), interpolation=cv2.INTER_AREA)
-        i420 = np.empty((THUMB_H * 3 // 2, THUMB_W), np.uint8)
-        i420[:THUMB_H] = y_s
-        i420[THUMB_H:THUMB_H + THUMB_H // 4] = u_s.reshape(THUMB_H // 4, THUMB_W)
-        i420[THUMB_H + THUMB_H // 4:] = v_s.reshape(THUMB_H // 4, THUMB_W)
+        src_h, src_w = int(y.shape[0]), int(y.shape[1])
+        if src_w <= 0 or src_h <= 0:
+            return None
+        # Display aspect ratio of the (cropped, un-squeezed) eye.
+        dar = src_w / float(src_h)
+        if half and layout == 'sbs':
+            dar *= 2.0
+        elif half and layout == 'tab':
+            dar *= 0.5
+        # Fit within the 320x180 box preserving DAR (letterbox / pillarbox).
+        if dar >= (THUMB_W / float(THUMB_H)):
+            fw, fh = THUMB_W, int(round(THUMB_W / dar))
+        else:
+            fw, fh = int(round(THUMB_H * dar)), THUMB_H
+        fw = max(2, min(THUMB_W, fw - (fw % 2)))    # even width  (I420 chroma)
+        fh = max(4, min(THUMB_H, fh - (fh % 4)))    # mult-of-4 height (I420 pack)
+        y_s = cv2.resize(y, (fw, fh), interpolation=cv2.INTER_AREA)
+        u_s = cv2.resize(u, (fw // 2, fh // 2), interpolation=cv2.INTER_AREA)
+        v_s = cv2.resize(v, (fw // 2, fh // 2), interpolation=cv2.INTER_AREA)
+        i420 = np.empty((fh * 3 // 2, fw), np.uint8)
+        i420[:fh] = y_s
+        i420[fh:fh + fh // 4] = u_s.reshape(fh // 4, fw)
+        i420[fh + fh // 4:] = v_s.reshape(fh // 4, fw)
         rgb = cv2.cvtColor(i420, cv2.COLOR_YUV2RGB_I420)
-        img = QImage(rgb.data, THUMB_W, THUMB_H, THUMB_W * 3, QImage.Format.Format_RGB888)
+        if fw == THUMB_W and fh == THUMB_H:
+            canvas = np.ascontiguousarray(rgb)
+        else:
+            canvas = np.zeros((THUMB_H, THUMB_W, 3), np.uint8)      # black bars
+            ox, oy = (THUMB_W - fw) // 2, (THUMB_H - fh) // 2
+            canvas[oy:oy + fh, ox:ox + fw] = rgb
+        img = QImage(canvas.data, THUMB_W, THUMB_H, THUMB_W * 3, QImage.Format.Format_RGB888)
         return img.copy()   # detach from the numpy buffer (mandatory)
     except Exception:
         return None
 
 
-def frame_to_qimage_320(frame, layout=None):
-    """Downscale one Edge264Frame (base view) to a 320x180 RGB QImage."""
+def frame_to_qimage_320(frame, layout=None, half=False):
+    """Downscale one Edge264Frame (base view) to a 320x180 RGB QImage
+    (display-aspect preserved, letterboxed — see planes_to_qimage_320)."""
     w, h = frame.width_Y, frame.height_Y
     if w <= 0 or h <= 0 or frame.bit_depth_Y != 8 or not frame.samples[0]:
         return None
@@ -85,7 +117,7 @@ def frame_to_qimage_320(frame, layout=None):
     y = np.ctypeslib.as_array(frame.samples[0], shape=(h, sy))[:, :w]
     u = np.ctypeslib.as_array(frame.samples[1], shape=(ch, sc))[:, :cw]
     v = np.ctypeslib.as_array(frame.samples[2], shape=(ch, sc))[:, :cw]
-    return planes_to_qimage_320(y, u, v, layout)
+    return planes_to_qimage_320(y, u, v, layout, half)
 
 
 class ThumbnailService(QThread):
@@ -102,20 +134,23 @@ class ThumbnailService(QThread):
         self._pending_t = None          # newest-wins slot (seconds)
         self._filepath = None
         self._duration_s = 0.0
-        self._mode = 'off'              # 'edge264' | 'ffmpeg' | 'off'
+        self._mode = 'off'              # 'edge264' | 'avcodec' | 'off'
         self._optical = False
         self._layout = None             # 'sbs' | 'tab' | None
+        self._half = False              # half-packed (HSBS/HTAB) → un-squeeze aspect
         self._armed = False
         self._stopping = False
         self._demuxer = None
         self._decoder = None            # ctypes.c_void_p edge264 session
+        self._hevc_source = None        # LavfHevcSource (mode 'avcodec', HEVC) — worker-owned
         self._headers_fed = False
         self._blacklist = {}            # round(t) -> time.monotonic() deadline
         self._last_extract = 0.0
         self._release = False           # worker-side pipeline close request
+        self._arm_logged = False        # one [THUMB] armed log per configure
 
     # ---- GUI-thread API -----------------------------------------------
-    def configure(self, filepath, duration_s, mode, optical=False, layout=None):
+    def configure(self, filepath, duration_s, mode, optical=False, layout=None, half=False):
         with self._lock:
             if filepath != self._filepath:
                 self._close_pipeline_locked()
@@ -125,7 +160,9 @@ class ThumbnailService(QThread):
             self._mode = mode
             self._optical = bool(optical)
             self._layout = layout        # 'sbs' | 'tab' | None (single-eye crop)
+            self._half = bool(half)      # half-packed source → un-squeeze aspect
             self._armed = False          # every (re)configure starts disarmed
+            self._arm_logged = False
             self._pending_t = None
 
     def set_duration(self, duration_s):
@@ -140,10 +177,27 @@ class ThumbnailService(QThread):
             except Exception:
                 pass
 
-    def arm(self):
+    def set_layout(self, layout, half=None):
+        """Late single-eye crop update. The HEVC stereo layout ('sbs'/'tab') is
+        only finalised by the SEI/side-data detector in _try_start_hevc, which
+        runs AFTER configure() (which took the ffprobe analyzer's earlier, maybe
+        absent, verdict). Refresh it so packed-3D HEVC thumbs show one eye — and
+        the half/full verdict too, so a half-packed eye is un-squeezed."""
         with self._lock:
-            if self._filepath and self._mode == 'edge264':
+            self._layout = layout if layout in ('sbs', 'tab') else None
+            if half is not None:
+                self._half = bool(half)
+
+    def arm(self):
+        log_mode = None
+        with self._lock:
+            if self._filepath and self._mode in ('edge264', 'avcodec'):
+                if not self._armed and not self._arm_logged:
+                    self._arm_logged = True
+                    log_mode = self._mode
                 self._armed = True
+        if log_mode:
+            logger.info(f"[THUMB] armed (mode={log_mode})")
 
     def disarm(self):
         with self._lock:
@@ -158,7 +212,7 @@ class ThumbnailService(QThread):
 
     def request(self, t_seconds):
         with self._lock:
-            if not self._armed or self._mode != 'edge264' or self._stopping:
+            if not self._armed or self._mode not in ('edge264', 'avcodec') or self._stopping:
                 return
             key = round(t_seconds)
             if self._blacklist.get(key, 0) > time.monotonic():
@@ -201,7 +255,7 @@ class ThumbnailService(QThread):
                 with self._lock:
                     t = self._pending_t
                     self._pending_t = None
-                    armed = self._armed and self._mode == 'edge264'
+                    armed = self._armed and self._mode in ('edge264', 'avcodec')
                     optical = self._optical
                 if t is None or self._stopping:
                     break
@@ -289,9 +343,92 @@ class ThumbnailService(QThread):
             except Exception:
                 pass
             self._demuxer = None
+        if self._hevc_source is not None:
+            try:
+                self._hevc_source.close()
+            except Exception:
+                pass
+            self._hevc_source = None
         self._headers_fed = False
 
+    def _open_hevc(self):
+        """Open ONE software LavfHevcSource for the armed HEVC file, kept alive
+        across extractions (like the edge264 session). SW only (allow_hw=False):
+        hover thumbnails are sporadic single frames — a D3D11VA device per hover
+        is pure overhead. Created + used + closed on THIS worker thread only."""
+        if self._hevc_source is not None:
+            return True
+        with self._lock:
+            filepath = self._filepath
+        if not filepath:
+            return False
+        try:
+            from lavf_hevc_source import LavfHevcSource
+        except Exception as e:
+            logger.info(f"[THUMB] lavf_hevc_source unavailable: {e}")
+            return False
+        src = LavfHevcSource()
+        try:
+            mi = src.open(filepath, allow_hw=False)
+        except Exception as e:
+            logger.info(f"[THUMB] HEVC open raised: {e}")
+            try:
+                src.close()
+            except Exception:
+                pass
+            return False
+        if mi is None:
+            try:
+                src.close()
+            except Exception:
+                pass
+            logger.info(f"[THUMB] HEVC open refused (out of scope): {filepath}")
+            return False
+        with self._lock:
+            self._hevc_source = src
+        logger.info(f"[THUMB] avcodec pipeline open: {mi.width}x{mi.height} "
+                    f"{mi.bit_depth}-bit {mi.pix_fmt_name}")
+        return True
+
+    def _extract_avcodec(self, t_seconds):
+        """HEVC hover extraction via avcodec (SW): seek -> one read_frame ->
+        (Y,U,V) numpy -> 320x180 RGB QImage. 10-bit planes are LSB-aligned
+        (yuv420p10le, allow_hw=False) so a >>2 downshift yields 8-bit. Bounded
+        (single seek + single decoded frame, <100ms @ 4K10 SW): its boundedness
+        stands in for the abort hook LavfHevcSource lacks."""
+        if not self._open_hevc():
+            return None
+        src = self._hevc_source
+        if not src.seek(int(max(0.0, t_seconds) * 1000)):
+            return None
+        with self._lock:
+            if not self._armed or self._stopping:
+                return None
+        res = src.read_frame()          # None => EOF (t past end): no crash, no image
+        if res is None:
+            return None
+        (y, u, v), pts_ms = res
+        if y.dtype != np.uint8:         # 10-bit yuv420p10le (LSB-aligned 0..1023)
+            y = (y >> 2).astype(np.uint8)
+            u = (u >> 2).astype(np.uint8)
+            v = (v >> 2).astype(np.uint8)
+        with self._lock:
+            layout, half = self._layout, self._half
+        img = planes_to_qimage_320(y, u, v, layout, half)   # same crop + I420->RGB as edge264
+        if img is None:
+            return None
+        # Snap target: the frame's own container PTS (post-BACKWARD-seek this is
+        # the keyframe a click-seek would also land on). +10ms rounding safety so
+        # the seek resolves at-or-after this entry (mirrors the edge264 path).
+        snap_s = (float(pts_ms) / 1000.0) if pts_ms is not None and pts_ms >= 0 else float(t_seconds)
+        snap_s += 0.010
+        return (img, snap_s)
+
     def _extract(self, t_seconds):
+        with self._lock:
+            mode = self._mode
+        if mode == 'avcodec':
+            return self._extract_avcodec(t_seconds)
         if not self._open_pipeline():
             return None
         d = self._demuxer
@@ -406,7 +543,7 @@ class ThumbnailService(QThread):
                     ret = edge264.edge264_get_frame(self._decoder, ctypes.byref(frame), 1)  # borrow
                     if ret != 0 or not frame.samples[0]:
                         break
-                    img = frame_to_qimage_320(frame, self._layout)
+                    img = frame_to_qimage_320(frame, self._layout, self._half)
                     if img is not None:
                         best = img
                     if frame.return_arg:

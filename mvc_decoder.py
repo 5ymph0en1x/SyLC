@@ -827,13 +827,19 @@ class MVCDecoderThread(QThread):
     def __init__(self, filepath, shared_buffer, parent=None,
                  use_gpu_yuv_conversion=True, store_frame_struct_for_gpu=True,
                  start_position=0.0, threads=4, media_duration=None,
-                 feature_segments=None):
+                 feature_segments=None, dual_pair=None):
         super().__init__(parent)
         self.filepath = filepath
         self.demuxer = None  # Lazy init in run()
         # Multi-segment (seamless-branching) Blu-ray feature: ordered
         # [{'path','m2ts','duration_s'}]. None or a single segment => normal single clip.
         self._feature_segments = feature_segments if (feature_segments and len(feature_segments) > 1) else None
+        # BD3D backup WITHOUT SSIF interleave (MakeMKV: base + dependent views in
+        # SEPARATE .m2ts files). (base_path, dep_path) -> _init_demuxer opens an
+        # MVCSSIFDemuxer via open_dual() instead of open(); the demuxer then delivers
+        # the IDENTICAL base/dep pairs as a real SSIF disc, so the whole downstream
+        # pipeline (edge264, POC re-pair, frameYUVReady, seek, abort) is unchanged.
+        self._dual_pair = tuple(dual_pair) if (dual_pair and len(dual_pair) == 2) else None
         self.shared_buffer = shared_buffer
         self._media_duration = media_duration  # seconds (float) or None
         
@@ -1366,6 +1372,15 @@ class MVCDecoderThread(QThread):
         (Multi-segment features set their tables per clip inside SequenceDemuxer.)"""
         _apply_bd_seek_tables(self.demuxer, self.filepath)
 
+    def _open_demuxer(self):
+        """Open self.demuxer for the current source. BD3D dual-file backups use
+        open_dual(base, dep) (base + dependent m2ts read in parallel, paired by PTS);
+        every other source uses the normal open(path). Kept separate so the
+        fresh-mount settle-retry re-runs the correct open call."""
+        if self._dual_pair:
+            return self.demuxer.open_dual(self._dual_pair[0], self._dual_pair[1])
+        return self.demuxer.open(self.filepath)
+
     def _init_demuxer(self):
         """Initializes the appropriate demuxer based on file extension."""
         if self.demuxer: return True
@@ -1376,7 +1391,16 @@ class MVCDecoderThread(QThread):
 
             logger.info(f"[MVC-THREAD] Initializing demuxer for {ext}...")
 
-            if self._feature_segments and ext == '.ssif':
+            if self._dual_pair:
+                # BD3D backup with no SSIF interleave: base + dependent views live in
+                # SEPARATE .m2ts files. The C++ dual-source demuxer (open_dual) reads
+                # both and matches AUs by PTS, yielding the SAME base/dep pairs an SSIF
+                # disc would — the downstream MVC pipeline is untouched.
+                base_p, dep_p = self._dual_pair
+                logger.info(f"[MVC] dual-file: base={os.path.basename(base_p)} dep={os.path.basename(dep_p)}")
+                self.demuxer = mvc_demuxer_cpp.MVCSSIFDemuxer()
+                self.filepath = base_p  # base clip = seek-table / logging anchor
+            elif self._feature_segments and ext == '.ssif':
                 # Seamless-branching feature: play the ordered SSIF segments as one
                 # continuous stream (timestamps shifted to a global timeline matching
                 # the mpv EDL). The decoder loop sees a normal demuxer.
@@ -1392,7 +1416,7 @@ class MVCDecoderThread(QThread):
                     self.filepath = _eff  # Use SSIF path for demuxer
                 logger.info(f"[MVC-THREAD] Using {type(self.demuxer).__name__} (create_demuxer)")
 
-            if not self.demuxer.open(self.filepath):
+            if not self._open_demuxer():
                 # FRESH-MOUNT SETTLE RETRY (2026-07-14, Avatar ISO): right after
                 # an ISO mount, reads can transiently return nothing — the
                 # codec-private extraction failed at T+0 while the IDENTICAL
@@ -1403,14 +1427,16 @@ class MVCDecoderThread(QThread):
                         return False
                     time.sleep(0.1)
                 try:
-                    if self._feature_segments and ext == '.ssif':
+                    if self._dual_pair:
+                        self.demuxer = mvc_demuxer_cpp.MVCSSIFDemuxer()
+                    elif self._feature_segments and ext == '.ssif':
                         self.demuxer = SequenceDemuxer(self._feature_segments, mvc_demuxer_cpp.MVCSSIFDemuxer)
                     else:
                         self.demuxer, _eff_r = create_demuxer(self.filepath)
                         self.filepath = _eff_r
                 except Exception as e:
                     logger.warning(f"[MVC-THREAD] Settle-retry re-create failed: {e}")
-                if not self.demuxer.open(self.filepath):
+                if not self._open_demuxer():
                     self.error.emit(f"Unable to open file: {self.filepath}")
                     return False
                 logger.info("[MVC-THREAD] Settle retry succeeded — demuxer open on 2nd attempt")
@@ -2894,6 +2920,27 @@ class MVCDecoderThread(QThread):
                         pass  # Don't let subtitle errors break video playback
 
                 if not success:
+                    # DF-FINAL FIX 1: a False read mid-stream is NOT always genuine
+                    # end-of-stream. The dual-file/SSIF demuxer can also bail out on
+                    # MAX_ITERS / no-progress (corrupt dependent-view PTS class) far
+                    # short of the real end of the disc. Treat that as an error so
+                    # the player falls back to 2D instead of settling into a fake
+                    # "playback finished" freeze. Genuine near-end EOS (or unknown
+                    # duration) is unaffected.
+                    _last_known_ts = self._pts_last_emit_ts
+                    if _last_known_ts is None:
+                        _last_known_ts = self.base_timestamp + (self.frame_count * self.target_frame_time)
+                    _known_duration = self._media_duration
+                    if _known_duration and _known_duration > 0 and (_known_duration - _last_known_ts) > 10.0:
+                        logger.error(
+                            f"[MVC] fin prematuree a {_last_known_ts:.1f}s/{_known_duration:.1f}s -> fallback 2D"
+                        )
+                        self.error.emit(
+                            f"Premature end of stream at {_last_known_ts:.1f}s of {_known_duration:.1f}s "
+                            "(dependent-view desync or corrupt disc read) -- falling back to 2D playback."
+                        )
+                        break
+
                     logger.info("[MVC-THREAD] EOS. Flushing final frames.")
 
                     # SOL CRASH FIX: Protect flush from 0xe24c4a02

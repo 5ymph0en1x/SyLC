@@ -1,7 +1,7 @@
 @echo off
 REM === SyLC 3D Player - SINGLE-FILE no-console build (Nuitka --onefile) ===
 REM Single .exe. First launch extracts the payload to a persistent cache dir
-REM ({CACHE_DIR}\SyLC_3D_Player_v3) so subsequent launches are fast.
+REM ({CACHE_DIR}\SyLC_3D_Player_v5_0_0) so subsequent launches are fast.
 REM Prereqs: Python 3.14 venv with requirements + nuitka; MSVC 2022 (run from the activated venv).
 cd /d "%~dp0"
 
@@ -29,10 +29,10 @@ python -m nuitka SyLC_3D_Player.py ^
   --include-data-files=swscale-9.dll=swscale-9.dll ^
   --windows-icon-from-ico=icon.ico ^
   --include-data-files=icon.png=icon.png ^
-  --onefile-tempdir-spec="{CACHE_DIR}/SyLC_3D_Player_v4_5_0" ^
+  --onefile-tempdir-spec="{CACHE_DIR}/SyLC_3D_Player_v5_0_0" ^
   --output-dir=build_onefile ^
-  --output-filename=SyLC_3D_Player_v4.5.0_win-x64.exe ^
-  --company-name=SyLC --product-name="SyLC 3D Player" --file-version=4.5.0 --product-version=4.5.0
+  --output-filename=SyLC_3D_Player_v5.0.0_win-x64.exe ^
+  --company-name=SyLC --product-name="SyLC 3D Player" --file-version=5.0.0 --product-version=5.0.0
 
 echo.
-echo Single-file build done: build_onefile\SyLC_3D_Player_v4.5.0_win-x64.exe
+echo Single-file build done: build_onefile\SyLC_3D_Player_v5.0.0_win-x64.exe

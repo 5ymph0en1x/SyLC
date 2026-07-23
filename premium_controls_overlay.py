@@ -25,13 +25,13 @@ import time
 logger = logging.getLogger(__name__)
 from PySide6.QtWidgets import (
     QWidget, QSlider, QPushButton, QHBoxLayout, QVBoxLayout, QLabel,
-    QComboBox, QSizePolicy, QGraphicsDropShadowEffect, QFrame
+    QComboBox, QSizePolicy, QGraphicsDropShadowEffect, QFrame, QLayout, QMenu
 )
-from PySide6.QtCore import Qt, Signal, QTimer, QRectF, QPointF, QPoint, QPropertyAnimation, QEasingCurve, Property, Slot
+from PySide6.QtCore import Qt, Signal, QTimer, QRectF, QPointF, QPoint, QSize, QPropertyAnimation, QEasingCurve, Property, Slot
 from PySide6.QtGui import (
     QPainter, QColor, QFont, QFontMetrics, QPen, QBrush,
     QPainterPath, QLinearGradient, QRadialGradient, QConicalGradient, QPixmap,
-    QImage, QGuiApplication
+    QImage, QGuiApplication, QAction
 )
 
 # (license/subscription system removed - freeware build)
@@ -1385,10 +1385,21 @@ class PremiumSpectrumMeter(QWidget):
     motion is a level-driven envelope rather than literal frequency content.)
     """
     BANDS = 22
+    PREF_W, FIXED_H = 180, 40   # preferred footprint when the bar has room
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(180, 40)
+        # The VU meter is the FLEXIBLE middle of the control bar: it sits between
+        # the transport buttons and the 3D controls and is the deficit absorber.
+        # It shows at PREF_W when there's room but may shrink all the way to 0 so
+        # the bar's layout minimum never forces the overlay wider than the parent
+        # window (which pushed the fullscreen button past the right edge — see the
+        # fix_bar_overflow report). Fixed height, min width 0, capped at PREF_W so
+        # it never balloons on wide windows.
+        self.setFixedHeight(self.FIXED_H)
+        self.setMinimumWidth(0)
+        self.setMaximumWidth(self.PREF_W)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setToolTip("Audio spectrum")
         n = self.BANDS
@@ -1407,6 +1418,14 @@ class PremiumSpectrumMeter(QWidget):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.setInterval(33)  # ~30 fps, only runs while there's signal
+
+    def sizeHint(self):
+        # Preferred (uncompressed) footprint; the layout shrinks below this
+        # toward minimumSizeHint (width 0) to absorb the bar's width deficit.
+        return QSize(self.PREF_W, self.FIXED_H)
+
+    def minimumSizeHint(self):
+        return QSize(0, self.FIXED_H)
 
     def set_levels(self, level, peak=None):
         """Feed the overall normalized level (0..1); peak adds a transient kick."""
@@ -1445,6 +1464,11 @@ class PremiumSpectrumMeter(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
         n = self.BANDS
+        # When the bar is tight the layout shrinks us toward 0; below a few px
+        # there's no room for legible bars, so draw nothing rather than cram a
+        # smear of clipped rectangles (the VU is decorative — safe to vanish).
+        if w < 12:
+            return
         top, bot = 6.0, h - 6.0
         span = bot - top
         gap = 2.5
@@ -1498,10 +1522,27 @@ class PremiumControlsOverlay(QWidget):
     file_opened = Signal()
     disc_opened = Signal()  # open a Blu-ray 3D disc/folder (auto-detect the feature)
     archive_requested = Signal()  # archive the current optical disc to an .iso image
+    export_mvhevc_requested = Signal(str)  # export current 3D media to MV-HEVC .mov; arg = 'quality'|'fast'
     stereo_mode_changed = Signal(str)
     mode_3d_toggled = Signal(bool)
     audio_track_changed = Signal(int)
     subtitle_track_changed = Signal(int)
+
+    # Every string SyLC_3D_Player._format_badge_label() can hand to
+    # set_format_badge() (swept from all call sites). The badge slot is sized
+    # to fit the WIDEST of these so the control bar never reflows when the
+    # badge's text changes or the badge is hidden/shown.
+    FORMAT_BADGE_LABELS = (
+        "MultiView 3D",
+        "Full-SBS 3D",
+        "SBS 3D",
+        "Full-TAB 3D",
+        "TAB 3D",
+    )
+
+    # Items offered by the stereo-mode combo (display labels only — the
+    # internal mode keys are unaffected, see stereo_mode_combo below).
+    STEREO_COMBO_ITEMS = ("MultiView", "Side-by-Side", "Top-Bottom")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1519,6 +1560,19 @@ class PremiumControlsOverlay(QWidget):
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(20, 16, 20, 16)
         main_layout.setSpacing(12)
+        # The overlay is a top-level floating window that the PLAYER sizes
+        # explicitly (SyLC_3D_Player._update_overlays_geometry). By default a
+        # QLayout uses SetDefaultConstraint, which re-applies the layout's
+        # minimumSize as this WINDOW's minimum on every re-activation — so a
+        # badge toggle or a track-list update would re-grow the window back to
+        # its content minimum, pushing the fullscreen button past the client
+        # edge (and, because a badge toggle never re-runs the geometry clamp,
+        # it would silently re-introduce the overflow). SetNoConstraint decouples
+        # the layout from the window minimum: the player's resize() is the sole
+        # authority on the bar width, children are simply arranged within it, and
+        # the flexible VU meter absorbs any deficit. This is what makes the badge
+        # slot reflow-free at EVERY width, not just above the content floor.
+        main_layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
 
         # === ROW 1: TIMELINE ===
         timeline_layout = QHBoxLayout()
@@ -1557,8 +1611,13 @@ class PremiumControlsOverlay(QWidget):
         self.open_disc_button = PremiumIconButton('disc', 'medium')
         self.open_disc_button.setToolTip("Open Blu-ray 3D (drive or BDMV folder)")
         self.archive_button = PremiumIconButton('archive', 'medium')
-        self.archive_button.setToolTip("Archive this Blu-ray to an ISO image")
-        self.archive_button.setEnabled(False)  # enabled only when a Blu-ray disc is the source
+        self.archive_button.setToolTip("Sauvegarde / Export")
+        # EX-4: the former ISO button now opens a unified « Sauvegarde / Export »
+        # QMenu (ISO of the disc + MV-HEVC .mov export). The button itself is
+        # never disabled anymore (the individual menu entries carry their own
+        # enablement + tooltips, refreshed by the host on aboutToShow) so
+        # « Exporter en MV-HEVC » stays reachable even for a non-disc 3D file.
+        self._build_export_menu()
 
         # Audio track
         self.audio_track_combo = QComboBox()
@@ -1625,25 +1684,57 @@ class PremiumControlsOverlay(QWidget):
         # stream is detected & adapted by edge264, so the user sees the player
         # recognised the stream. Hidden by default; the player sets the adaptive
         # label (Full-SBS 3D / SBS 3D / Full-TAB 3D / TAB 3D / MVC 3D).
+        #
+        # The slot must NEVER reflow the bar when the badge appears/disappears
+        # or when its text changes between labels of different lengths, so:
+        #   - retainSizeWhenHidden keeps the layout space reserved while hidden
+        #   - a fixed width (from font metrics of the widest possible label)
+        #     means show()/setText() never changes the widget's footprint
         self.format_badge = QLabel()
         self.format_badge.setObjectName("formatBadge")
         self.format_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge_qss_font = "font-size: 11px; font-weight: 700; letter-spacing: 0.4px;"
         self.format_badge.setStyleSheet(
             "#formatBadge {"
             " color: #7FEBFF;"
             " background-color: rgba(45, 212, 255, 0.13);"
             " border: 1px solid rgba(45, 212, 255, 0.55);"
             " border-radius: 9px; padding: 2px 10px;"
-            " font-size: 11px; font-weight: 700; letter-spacing: 0.4px; }"
+            f" font-family: 'Segoe UI'; {badge_qss_font} }}"
         )
+        badge_slot_width = self._compute_format_badge_width()
+        badge_size_policy = self.format_badge.sizePolicy()
+        badge_size_policy.setHorizontalPolicy(QSizePolicy.Policy.Fixed)
+        badge_size_policy.setRetainSizeWhenHidden(True)
+        self.format_badge.setSizePolicy(badge_size_policy)
+        self.format_badge.setFixedWidth(badge_slot_width)
         self.format_badge.hide()
 
         # Stereo mode combo
         self.stereo_mode_combo = QComboBox()
-        self.stereo_mode_combo.addItems(["MVC", "Side-by-Side", "Top-Bottom"])
-        self.stereo_mode_combo.setMinimumWidth(140)
+        self.stereo_mode_combo.setObjectName("stereoModeCombo")
+        # Display label "MultiView"; the internal key stays 'mvc' (mode_map below) — dozens
+        # of consumers depend on the 'mvc' string, only the user-visible text changes.
+        self.stereo_mode_combo.addItems(list(self.STEREO_COMBO_ITEMS))
+        # Widened from a hardcoded 140 (which truncated "MultiView" to "MultiVi") to a
+        # font-metrics-derived floor covering the longest item, so no item is ever clipped.
+        combo_min_width = max(140, self._compute_stereo_combo_width())
+        self.stereo_mode_combo.setMinimumWidth(combo_min_width)
         self.stereo_mode_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._style_combo(self.stereo_mode_combo)
+        # SyLC_3D_Player.APP_STYLE (applied on the parent PlayerWindow) carries a bare
+        # "QComboBox { min-width: 60px; ... }" rule. Qt's stylesheet cascade fills in any
+        # box-model property a closer/own stylesheet doesn't set from the nearest ancestor
+        # rule that does — and once a stylesheet supplies min-width, it replaces
+        # setMinimumWidth() for that widget. _style_combo's QComboBox block never declared
+        # min-width, so the ancestor's 60px silently won, shrinking this combo back down and
+        # truncating "MultiView"/"Side-by-Side" despite the setMinimumWidth() call above.
+        # An ID-selector rule has higher specificity than the ancestor's bare type selector,
+        # so it wins regardless of stylesheet application order or widget-tree position.
+        self.stereo_mode_combo.setStyleSheet(
+            self.stereo_mode_combo.styleSheet()
+            + f"\n#stereoModeCombo {{ min-width: {combo_min_width}px; }}"
+        )
 
         # Separator
         sep3 = PremiumSeparator()
@@ -1680,6 +1771,42 @@ class PremiumControlsOverlay(QWidget):
         controls_layout.addLayout(right_group, 1)
 
         main_layout.addLayout(controls_layout)
+
+    def _compute_format_badge_width(self):
+        """Fixed width for the format-badge slot: font-metrics width of the
+        WIDEST label in FORMAT_BADGE_LABELS, plus the badge's own CSS chrome
+        (padding: 2px 10px + 1px border each side) and a small safety margin
+        for letter-spacing (0.4px/char, not counted by QFontMetrics) and
+        hinting/DPI rounding. Using one fixed width for every label means the
+        slot's footprint never changes when the text changes or the badge is
+        hidden/shown."""
+        font = QFont('Segoe UI')
+        font.setPixelSize(11)
+        font.setBold(True)
+        fm = QFontMetrics(font)
+        widest = max(self.FORMAT_BADGE_LABELS, key=lambda s: fm.horizontalAdvance(s))
+        text_width = fm.horizontalAdvance(widest)
+        letter_spacing_slack = 0.4 * max(0, len(widest) - 1)
+        padding = 10 * 2   # "padding: 2px 10px" -> 10px left + 10px right
+        border = 1 * 2     # "border: 1px solid ..." on both sides
+        safety_margin = 8  # hinting/DPI rounding slack
+        return int(text_width + letter_spacing_slack + padding + border + safety_margin)
+
+    def _compute_stereo_combo_width(self):
+        """Font-metrics width covering the longest STEREO_COMBO_ITEMS entry,
+        plus the combo's own CSS chrome (padding: 5px 10px, padding-right:
+        25px for the arrow, 1px border each side) and a safety margin, so no
+        item (e.g. "MultiView") is ever truncated regardless of DPI/hinting."""
+        font = QFont('Segoe UI')
+        font.setPixelSize(11)
+        fm = QFontMetrics(font)
+        widest = max(self.STEREO_COMBO_ITEMS, key=lambda s: fm.horizontalAdvance(s))
+        text_width = fm.horizontalAdvance(widest)
+        left_padding = 10
+        right_padding = 25  # reserved for the drop-down arrow
+        border = 1 * 2
+        safety_margin = 20
+        return int(text_width + left_padding + right_padding + border + safety_margin)
 
     def _style_combo(self, combo, icon=None):
         """Applies premium style to ComboBox."""
@@ -1727,6 +1854,50 @@ class PremiumControlsOverlay(QWidget):
             }
         """)
 
+    def _build_export_menu(self):
+        """EX-4: build the unified « Sauvegarde / Export » QMenu attached to the
+        (former ISO) archive_button.
+
+        Two families of entries:
+          * « Créer un ISO du disque » — emits archive_requested (the UNCHANGED
+            existing ISO archiving flow). Enabled only for a physical Blu-ray
+            disc/ISO source — the host refreshes it on aboutToShow.
+          * « Exporter en MV-HEVC (.mov) » submenu with a Qualité / Rapide choice,
+            each emitting export_mvhevc_requested('quality'|'fast'). Enabled only
+            for an exportable 3D source with the export tools present — the host
+            refreshes the submenu's enabled state, tooltip and title (it becomes
+            « … (copie sans réencodage) » for an MV-HEVC remux source).
+
+        Enablement/labels are owned by the host (SyLC_3D_Player) because they
+        depend on the current media session; the menu only exposes the action
+        objects (iso_action, export_mvhevc_menu, export_quality_action,
+        export_fast_action) and wires them to signals here.
+        """
+        menu = QMenu(self.archive_button)
+        menu.setToolTipsVisible(True)   # show the disabled-entry explanation tooltips
+
+        self.iso_action = QAction("Créer un ISO du disque", menu)
+        self.iso_action.triggered.connect(lambda: self.archive_requested.emit())
+        menu.addAction(self.iso_action)
+
+        menu.addSeparator()
+
+        sub = QMenu("Exporter en MV-HEVC (.mov)", menu)
+        sub.setToolTipsVisible(True)
+        self.export_quality_action = QAction("Qualité (lente, CRF 20)", sub)
+        self.export_quality_action.triggered.connect(
+            lambda: self.export_mvhevc_requested.emit('quality'))
+        self.export_fast_action = QAction("Rapide (moyenne, CRF 23)", sub)
+        self.export_fast_action.triggered.connect(
+            lambda: self.export_mvhevc_requested.emit('fast'))
+        sub.addAction(self.export_quality_action)
+        sub.addAction(self.export_fast_action)
+        menu.addMenu(sub)
+
+        self.export_mvhevc_menu = sub
+        self.export_menu = menu
+        self.archive_button.setMenu(menu)
+
     def _connect_signals(self):
         """Connects internal signals."""
         self.play_pause_button.clicked.connect(self.play_toggled)
@@ -1734,7 +1905,9 @@ class PremiumControlsOverlay(QWidget):
         self.fullscreen_button.clicked.connect(self.fullscreen_toggled)
         self.open_file_button.clicked.connect(self.file_opened)
         self.open_disc_button.clicked.connect(self.disc_opened)
-        self.archive_button.clicked.connect(self.archive_requested)
+        # archive_button no longer emits archive_requested on click — it opens the
+        # « Sauvegarde / Export » QMenu (setMenu, wired in _build_export_menu); the
+        # ISO entry is what emits archive_requested now.
         self.volume_slider.volume_changed.connect(self.volume_changed)
         self.time_slider.sliderMoved.connect(lambda pos: self._on_slider_scrub(pos))
         # ANTI-SPAM: Use scrub_finished (debounced) instead of sliderReleased
@@ -1844,11 +2017,6 @@ class PremiumControlsOverlay(QWidget):
     def set_buffer_progress(self, progress):
         """Updates the buffer indicator (0-1)."""
         self.time_slider.set_buffer_progress(progress)
-
-    def enable_3d_controls(self, enabled):
-        """Activates/deactivates 3D controls."""
-        self.mode_3d_button.setEnabled(enabled)
-        self.stereo_mode_combo.setEnabled(enabled)
 
     def update_audio_tracks(self, tracks):
         """Updates the audio track list."""
@@ -1974,7 +2142,10 @@ class PremiumControlsOverlay(QWidget):
         self.time_label.setText(self._format_time(pos / 1000.0))
 
     def _on_stereo_mode_changed(self, text):
-        mode_map = {"MVC": "mvc", "Side-by-Side": "sbs", "Top-Bottom": "tab"}
+        # "MultiView" is the display label for the internal 'mvc' key (unchanged everywhere
+        # internal). "MVC" kept as an alias for robustness against older callers.
+        mode_map = {"MultiView": "mvc", "MVC": "mvc",
+                    "Side-by-Side": "sbs", "Top-Bottom": "tab"}
         self.stereo_mode_changed.emit(mode_map.get(text, "auto"))
 
     def _on_audio_track_changed(self, index):
