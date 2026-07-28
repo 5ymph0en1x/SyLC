@@ -185,6 +185,10 @@ class PGSSubtitleParser:
         self._streaming_mode: bool = False
         self._pes_buffer: bytes = b''  # Accumulate PES packets
         self._last_rendered_idx: int = 0  # Track which DS have been rendered
+        # How far into the stream the parser has actually been fed (seconds).
+        # Streaming: grows with each segment. File mode: infinite once parsed,
+        # because everything is then known. See get_subtitle_at_time().
+        self._fed_until: float = 0.0
 
     def load_from_file(self, filepath: str) -> bool:
         """Load and parse a .sup file."""
@@ -297,6 +301,10 @@ class PGSSubtitleParser:
                 else:
                     # Last subtitle - show for max duration
                     ds.end_pts = ds.pts + MAX_SUBTITLE_DURATION
+
+        # The whole file has been read: every cue is known, so the read-ahead
+        # bridge in get_subtitle_at_time() must never engage on this parser.
+        self._fed_until = float('inf')
 
         # Log summary
         logger.info(f"[PGSParser] Parsed {len(self.display_sets)} subtitles ({rendered_count} rendered) from {segment_count} segments")
@@ -859,6 +867,7 @@ class PGSSubtitleParser:
         # BRIDGE_GAP and sits between two shows, keep showing the previous one — real clears
         # (gaps to the next subtitle) are seconds long and are honored normally.
         BRIDGE_GAP = 0.7
+        MAX_SUBTITLE_DURATION = 8.0  # same ceiling as the file-mode end_pts pass
 
         def _is_show(ds):
             return len(ds.compositions) > 0 and ds.rendered_image is not None
@@ -894,8 +903,29 @@ class PGSSubtitleParser:
         if prev_show is not None:
             if next_show is not None and (next_show.pts - ds.pts) < BRIDGE_GAP:
                 return prev_show  # brief clear between two shows -> bridge it
-            if next_show is None and (time_seconds - ds.pts) < 0.3:
-                return prev_show  # next show not parsed yet (read-ahead) -> short grace hold
+            if next_show is None:
+                # Streaming: the next show may simply not have been PARSED yet, and
+                # a fixed time grace cannot tell that apart from a genuine clear.
+                # `_fed_until` can: it is how far into the stream the parser has
+                # actually been fed. While the feed has not yet passed this clear
+                # by BRIDGE_GAP, the verdict is still unknown -- hold the previous
+                # subtitle. Once the feed IS past it and nothing followed, the
+                # clear is real and we honour it.
+                #
+                # On Blu-ray this is what stops the flicker: the disc re-transmits
+                # every cue as SHOW (1.5-4s) / CLEAR (0.167s) epochs, and whenever
+                # parsing lagged the clock through one of those 167ms clears the
+                # subtitle was wiped and redrawn -- the "flash and disappear" the
+                # MKV path never shows, because MakeMKV strips these epochs.
+                #
+                # Bounded by MAX_SUBTITLE_DURATION from the caption's own start,
+                # the same ceiling the rest of the parser uses: at end of stream
+                # (or after a seek, where the feed restarts from nothing) the
+                # feed never advances past the clear, and without this the last
+                # caption would stay on screen forever.
+                if (self._fed_until <= ds.pts + BRIDGE_GAP
+                        and time_seconds < prev_show.pts + MAX_SUBTITLE_DURATION):
+                    return prev_show
         return None
 
     # =========================================================================
@@ -908,6 +938,10 @@ class PGSSubtitleParser:
         Call this before feeding PES packets.
         """
         self._streaming_mode = True
+        # How far into the stream the parser has actually been fed. Lets
+        # get_subtitle_at_time() tell "the next cue has not arrived yet" apart
+        # from "there is genuinely nothing after this clear".
+        self._fed_until = 0.0
         self._pes_buffer = b''
         self._last_rendered_idx = 0
         self.display_sets = []
@@ -990,6 +1024,8 @@ class PGSSubtitleParser:
 
             # Process segment
             prev_ds_count = len(self.display_sets)
+            if seg_pts > self._fed_until:
+                self._fed_until = seg_pts
             self._process_segment(segment_type, seg_pts, seg_dts, segment_data)
 
             # Check if new display set was completed
@@ -1030,6 +1066,8 @@ class PGSSubtitleParser:
             self.start_streaming()
 
         prev_ds_count = len(self.display_sets)
+        if pts > self._fed_until:
+            self._fed_until = pts
         self._process_segment(segment_type, pts, dts, data)
 
         # Check if new display set was completed
@@ -1065,6 +1103,9 @@ class PGSSubtitleParser:
         Clear the streaming buffer and pending state (call on seek).
         Does NOT stop streaming mode - just resets the parse state.
         """
+        # A seek moves the feed elsewhere: how far it had read before says
+        # nothing about the new position, so restart the read-ahead watermark.
+        self._fed_until = 0.0
         self._pes_buffer = b''
         self._current_ds = None
         self._pending_objects = {}

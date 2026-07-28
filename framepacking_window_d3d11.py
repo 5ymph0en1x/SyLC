@@ -63,39 +63,26 @@ FRAMEPACK_HEIGHT = 2205
 TARGET_ASPECT = FRAMEPACK_WIDTH / FRAMEPACK_HEIGHT
 
 
-class Framepacking3DWindow(QMainWindow):
-    """
-    D3D11-native 3D framepacking window with HDR support.
+class _BorderlessOutputWindow(QMainWindow):
+    """Top-level output window that can go fullscreen WITHOUT losing HDR.
 
-    Drop-in replacement for the OpenGL version with same API.
+    Shared by the frame-packed output and the Dual Projector eye windows. The
+    two Win32 details here are load-bearing and were established empirically:
+    `SWP_NOZORDER` keeps Windows from treating the resize as exclusive
+    fullscreen (which drops HDR), and `apply_borderless_dwm` removes the thin
+    border and rounded corners Windows 11 draws around every top-level window.
+
+    Subclasses MUST assign `self.display_widget` before any fullscreen call.
     """
     visibilityChanged = Signal(bool)
 
-    def __init__(self, parent=None, use_yuv_shader=True, display_widget=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("3D Frame-Packed Output (D3D11 HDR)")
-        self.resize(960, 1102)
-        self.setStyleSheet("background-color: black;")
-
-        # Use the provided widget, or create the native C++ D3D11 renderer widget.
-        if display_widget:
-            self.display_widget = display_widget
-        else:
-            from native_renderer.native_framepack_widget import NativeFramepackWidget
-            self.display_widget = NativeFramepackWidget(self)
-            self.display_widget.set_stereo_mode('framepack')
-
-        self.setCentralWidget(self.display_widget)
-
+        self.display_widget = None
         self.is_fullscreen = False
-        self.use_yuv_shader = use_yuv_shader
-
-        # Fullscreen state (Win32 API for true fullscreen)
         self._is_fake_fullscreen = False
         self._saved_style = None
         self._saved_rect = None
-
-        logger.info("[D3D11-WINDOW] Framepacking3DWindow created (D3D11 HDR mode)")
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key.Key_F:
@@ -245,11 +232,6 @@ class Framepacking3DWindow(QMainWindow):
         except Exception as e:
             logger.error(f"[D3D11-WINDOW] Failed to exit fullscreen: {e}")
 
-    def display_frame(self, qimage):
-        """Display a QImage frame (compatibility method)."""
-        # This method exists for compatibility but D3D11 version uses YUV directly
-        pass
-
     def showEvent(self, event):
         super().showEvent(event)
         self.visibilityChanged.emit(True)
@@ -269,6 +251,72 @@ class Framepacking3DWindow(QMainWindow):
         except Exception:
             pass
         super().closeEvent(event)
+
+
+class Framepacking3DWindow(_BorderlessOutputWindow):
+    """D3D11-native 3D framepacking window with HDR support."""
+
+    def __init__(self, parent=None, use_yuv_shader=True, display_widget=None):
+        super().__init__(parent)
+        self.setWindowTitle("3D Frame-Packed Output (D3D11 HDR)")
+        self.resize(960, 1102)
+        self.setStyleSheet("background-color: black;")
+
+        if display_widget:
+            self.display_widget = display_widget
+        else:
+            from native_renderer.native_framepack_widget import NativeFramepackWidget
+            self.display_widget = NativeFramepackWidget(self)
+            self.display_widget.set_stereo_mode('framepack')
+
+        self.setCentralWidget(self.display_widget)
+        self.use_yuv_shader = use_yuv_shader
+        logger.info("[D3D11-WINDOW] Framepacking3DWindow created (D3D11 HDR mode)")
+
+    def display_frame(self, qimage):
+        """Display a QImage frame (compatibility method)."""
+        pass
+
+
+# UI copy is English throughout the application.
+_EYE_TITLES = {'left': "SyLC — Left Eye", 'right': "SyLC — Right Eye"}
+
+
+class EyeOutputWindow(_BorderlessOutputWindow):
+    """One eye of a stereo pair, for a passive-3D dual-projector setup.
+
+    Two of these replace the frame-packed window: the same picture cut in two,
+    one window per projector, each going fullscreen independently on whichever
+    monitor it happens to sit on (the base class resolves that per window).
+
+    The picture needs no new shader. The renderer's '2d' mode already samples
+    only the first eye's three textures, so this window is fed ITS eye in that
+    first slot -- see PlayerWindow._planes_for_target, which reads the
+    `eye_view` stamp left on the widget here.
+
+    Titled rather than auto-placed: the user drags each window onto the right
+    projector once per session, and the title is how they tell them apart.
+    """
+
+    def __init__(self, eye, parent=None, display_widget=None):
+        if eye not in _EYE_TITLES:
+            raise ValueError(f"eye must be 'left' or 'right', got {eye!r}")
+        super().__init__(parent)
+        self.eye = eye
+        self.setWindowTitle(_EYE_TITLES[eye])
+        self.resize(960, 540)
+        self.setStyleSheet("background-color: black;")
+
+        if display_widget is not None:
+            self.display_widget = display_widget
+        else:
+            from native_renderer.native_framepack_widget import NativeFramepackWidget
+            self.display_widget = NativeFramepackWidget(self)
+
+        self.display_widget.set_stereo_mode('2d')
+        self.display_widget.eye_view = eye
+        self.setCentralWidget(self.display_widget)
+        logger.info("[D3D11-WINDOW] EyeOutputWindow created (%s eye)", eye)
 
 
 # Check availability

@@ -1,5 +1,5 @@
 # SyLC 3D Player - Requirements
-# Python 3.12+ recommended (tested with 3.12, 3.13, 3.14)
+# Python 3.14 required (native extension ABI: cp314)
 
 # Core UI Framework
 PySide6>=6.6.0

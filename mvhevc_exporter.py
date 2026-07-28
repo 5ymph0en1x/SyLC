@@ -71,12 +71,52 @@ try/finally purges it on ANY exit. `cancel()` terminates the child processes
 (x265/ffmpeg/mp4box) without zombies, purges, and emits failed('annule'). The
 job NEVER touches the live player's decode instances (dedicated instances only).
 
-NB: the `vexu` box injection is Task EX-3 (`vexu_injector.py`), out of scope
-here — the MP4Box output already carries hvc1+hvcC+lhvC+colr (ffprobe
-view_ids_available=0,1), which is what EX-2 validates.
+The `vexu` box injection lives in `vexu_injector.py` (Task EX-3) and runs as
+the shared tail of EVERY tier — it is what makes the output Apple *spatial*
+video rather than merely stereo HEVC.
+
+## Hardening invariants
+
+Five rules the pipeline now enforces rather than hopes for. Each exists
+because its absence produced a wrong file (or destroyed a good one) while
+reporting success; `tests\export\test_hardening.py` pins all of them.
+
+  1. **The destination is never at risk.** The finished movie is staged
+     beside the target and swapped in with `os.replace` (see `_finalize`).
+     A failure at any point — full disk, locked file, a validation refusal —
+     leaves whatever was already at `out_path` untouched. Nothing is ever
+     deleted in the hope that a later step will succeed.
+
+  2. **A short export is a failed export.** ffmpeg's stderr and return code
+     are read (`PackedAdapter.frames` -> `adapter.error`), and the encoded
+     frame count is checked against the source's (`_check_completeness`,
+     gross shortfall = refuse, small = warn). A decoder that dies mid-file
+     can no longer come back as a complete-looking movie.
+
+  3. **Geometry is checked before a frame is decoded.** Odd per-view
+     dimensions have no 4:2:0 chroma size, and a packed canvas that
+     disagrees with the source frame desynchronises every fixed-size raw
+     read after the first. Both are refused by name (`_finalise_meta`,
+     `PackedAdapter.metadata`), not rounded away.
+
+  4. **Never emit 8-bit PQ/HLG.** The bundled x265 is an 8-bit-only build.
+     An HDR source is tone-mapped to bt709 SDR where the frames pass
+     through ffmpeg, and refused with the reason where they do not (see
+     the "HDR policy" section). The remux fast-path is exempt: it copies,
+     so an HDR MV-HEVC source stays bit-exact — the correct handling.
+
+  5. **What we claim, we verify on the final bytes.** `_validate` re-reads
+     the output and asserts hvc1 + hvcC + lhvC + a parseable vexu, then
+     ffprobe's two views, then a dogfood decode with our own reader — no
+     stage is trusted on its own say-so.
+
+Audio remains best-effort (a soundtrack we cannot convert must not cost a
+whole re-encode), but no longer silently: `audio_status` reaches the
+completion payload and the UI warns when a file came back video-only.
 
 Windows-only; ctypes + PySide6.
 """
+import collections
 import json
 import logging
 import os
@@ -92,9 +132,44 @@ import numpy as np
 
 from PySide6.QtCore import QThread, Signal
 
+from stereo_eye_order import UNKNOWN, effective_view_swap, normalise_eye_order
+
 logger = logging.getLogger(__name__)
 
-_ROOT = os.path.dirname(os.path.abspath(__file__))
+def _resolve_tool_root():
+    """Directory that should contain ``tools/x265`` + ``tools/gpac``.
+
+    Handles three deployments with one probe:
+      - source run        -> the module directory (__file__)
+      - Nuitka standalone -> the .dist directory (exe / __file__ both live there)
+      - Nuitka --onefile  -> the LAUNCHER exe directory, NOT the temporary payload
+        extraction dir that __file__ resolves to. In onefile mode ``sys.argv[0]``
+        is the original launcher exe (Nuitka only exports NUITKA_ONEFILE_PARENT,
+        a PID, so argv[0] is the reliable path); ``tools\\`` is shipped SIDE-BY-SIDE
+        with that exe, so the payload/temp dir will NOT contain it.
+    Each candidate is accepted only if it actually holds x265.exe, so ordering is
+    safe; falls back to the module dir (keeps a sane path for the missing-tool
+    tooltip)."""
+    cands = []
+    for _c in (os.environ.get('NUITKA_ONEFILE_BINARY'),   # future-proof (unset on 4.1.2)
+               sys.argv[0] if sys.argv else None,          # onefile launcher / standalone exe / source script
+               sys.executable,                             # exe dir (belt-and-braces)
+               __file__):                                  # source + standalone dist dir
+        if not _c:
+            continue
+        try:
+            _d = os.path.dirname(os.path.abspath(_c))
+        except Exception:
+            continue
+        if _d and _d not in cands:
+            cands.append(_d)
+    for _d in cands:
+        if os.path.isfile(os.path.join(_d, 'tools', 'x265', 'x265.exe')):
+            return _d
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+_ROOT = _resolve_tool_root()
 X265 = os.path.join(_ROOT, 'tools', 'x265', 'x265.exe')
 MP4BOX = os.path.join(_ROOT, 'tools', 'gpac', 'mp4box.exe')
 
@@ -117,8 +192,8 @@ def _ffprobe_path():
 
 def tools_available():
     """True iff every external tool the pipeline needs is present."""
-    return (os.path.isfile(X265) and os.path.isfile(MP4BOX)
-            and shutil.which('ffmpeg') and shutil.which('ffprobe'))
+    return bool(os.path.isfile(X265) and os.path.isfile(MP4BOX)
+                and shutil.which('ffmpeg') and shutil.which('ffprobe'))
 
 
 # ---------------------------------------------------------------------------
@@ -159,15 +234,37 @@ def probe_metadata(path):
     """ffprobe the first video + audio stream. Returns a dict with the packed-
     canvas geometry-agnostic facts (per-view derivation is the adapter's job):
     width/height (as stored), pix_fmt, fps_str/fps_float, colour tokens (x265),
-    range_full, nb_frames, duration_s, audio_codec (or None)."""
+    the RAW source transfer/primaries (HDR policy needs the untranslated
+    tokens, since _map_trc() flattens everything unknown to bt709), range_full,
+    nb_frames, duration_s, audio_codec (or None).
+
+    Raises RuntimeError when ffprobe itself fails or reports no video stream.
+    Silently returning zeroed geometry (the old behaviour) turned an
+    unreadable/permission-denied source into a confusing downstream failure
+    ('adapter frame size 0 != 0') instead of naming the real cause."""
     exe = _ffprobe_path()
     v = subprocess.run(
         [exe, '-v', 'error', '-select_streams', 'v:0', '-show_entries',
          'stream=width,height,pix_fmt,r_frame_rate,avg_frame_rate,'
-         'color_primaries,color_transfer,color_space,color_range,nb_frames,duration',
+         'color_primaries,color_transfer,color_space,color_range,nb_frames,duration:'
+         'stream_tags=DURATION,DURATION-eng,NUMBER_OF_FRAMES,NUMBER_OF_FRAMES-eng:'
+         'format=duration',
          '-of', 'json', path], capture_output=True, text=True,
-        creationflags=_NO_WINDOW)
-    st = (json.loads(v.stdout or '{}').get('streams') or [{}])[0]
+         creationflags=_NO_WINDOW)
+    if v.returncode != 0:
+        raise RuntimeError(f'ffprobe failed on {os.path.basename(path)} '
+                           f'(rc={v.returncode}): {(v.stderr or "").strip()[-300:]}')
+    try:
+        video_probe = json.loads(v.stdout or '{}')
+    except ValueError as e:
+        raise RuntimeError(f'ffprobe returned unparsable JSON for '
+                           f'{os.path.basename(path)}: {e}') from None
+    streams = video_probe.get('streams') or []
+    if not streams:
+        raise RuntimeError(f'no video stream found in {os.path.basename(path)}')
+    st = streams[0]
+    fmt = video_probe.get('format') or {}
+    tags = st.get('tags') or {}
     a = subprocess.run(
         [exe, '-v', 'error', '-select_streams', 'a:0', '-show_entries',
          'stream=codec_name', '-of', 'json', path],
@@ -188,14 +285,49 @@ def probe_metadata(path):
         fps_str, fps_float = _rate(st.get('avg_frame_rate') or '')
     if not fps_float:
         fps_str, fps_float = '24/1', 24.0
-    try:
-        dur = float(st.get('duration')) if st.get('duration') not in (None, 'N/A') else 0.0
-    except Exception:
-        dur = 0.0
-    try:
-        nbf = int(st.get('nb_frames')) if st.get('nb_frames') not in (None, 'N/A') else 0
-    except Exception:
-        nbf = 0
+    def _duration(value):
+        if value in (None, '', 'N/A'):
+            return 0.0
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            pass
+        # Matroska statistics tags use HH:MM:SS.nnnnnnnnn.
+        try:
+            parts = str(value).strip().split(':')
+            if len(parts) == 3:
+                h, m, s = float(parts[0]), float(parts[1]), float(parts[2])
+                return max(0.0, h * 3600.0 + m * 60.0 + s)
+        except (TypeError, ValueError):
+            pass
+        return 0.0
+
+    def _positive_int(*values):
+        for value in values:
+            if value in (None, '', 'N/A'):
+                continue
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                return parsed
+        return 0
+
+    # Matroska frequently omits AVStream.duration/nb_frames while exposing the
+    # exact values in Format.duration and mkvmerge statistics tags.  Considering
+    # every bounded header-level source avoids an expensive full-file
+    # ``-count_frames`` scan and gives the progress dialog an ETA immediately.
+    dur = next((d for d in (
+        _duration(st.get('duration')),
+        _duration(fmt.get('duration')),
+        _duration(tags.get('DURATION')),
+        _duration(tags.get('DURATION-eng')),
+    ) if d > 0.0), 0.0)
+    nbf = _positive_int(
+        st.get('nb_frames'),
+        tags.get('NUMBER_OF_FRAMES'),
+        tags.get('NUMBER_OF_FRAMES-eng'))
     return {
         'width': int(st.get('width') or 0),
         'height': int(st.get('height') or 0),
@@ -205,11 +337,95 @@ def probe_metadata(path):
         'colorprim': _map_prim(st.get('color_primaries')),
         'transfer': _map_trc(st.get('color_transfer')),
         'colormatrix': _map_matrix(st.get('color_space')),
+        # untranslated, for the HDR verdict (see _hdr_transfer)
+        'src_transfer': (st.get('color_transfer') or '').strip().lower(),
+        'src_primaries': (st.get('color_primaries') or '').strip().lower(),
         'range_full': (st.get('color_range') == 'pc'),
         'nb_frames': nbf,
         'duration_s': dur,
         'audio_codec': audio_codec,
     }
+
+
+# ---------------------------------------------------------------------------
+# HDR policy (hardening pass)
+# ---------------------------------------------------------------------------
+# The bundled x265 is an 8-bit-ONLY build ("build info [...] 8bit"), so every
+# re-encode lands in 8 bits no matter what the source was. Copying a PQ/HLG
+# transfer characteristic onto an 8-bit stream produces a file that is wrong
+# twice over: severe banding (PQ's code space assumes >=10 bits), and an Apple
+# player that dutifully treats it as HDR and grades it as such. Neither is
+# recoverable by the viewer.
+#
+# Policy: convert. Tone-map PQ/HLG down to bt709 SDR with ffmpeg before x265
+# sees the frames, and signal bt709 honestly. Where the frames do not travel
+# through ffmpeg (our own MV-HEVC/MVC decoders hand us raw planes), refuse with
+# the reason spelled out rather than emit the broken file.
+#
+# The remux fast-path is untouched by all of this: it never decodes, so an HDR
+# MV-HEVC source (an iPhone spatial video is HLG) is copied bit-exact as
+# always -- which is the correct handling and better than any conversion.
+_HDR_TRANSFERS = {'smpte2084', 'arib-std-b67'}
+
+# Canonical ffmpeg HDR->SDR chain: linearise, tone-map in float, land in
+# bt709 limited-range 8-bit. Needs zscale (libzimg) + tonemap, which a
+# minimal ffmpeg build may lack -- hence _ffmpeg_has_filters() below.
+_TONEMAP_FILTER = (
+    'zscale=transfer=linear:npl=100,'
+    'format=gbrpf32le,'
+    'zscale=primaries=bt709,'
+    'tonemap=tonemap=hable:desat=0,'
+    'zscale=transfer=bt709:matrix=bt709:range=limited,'
+    'format=yuv420p'
+)
+_TONEMAP_FILTERS_REQUIRED = ('zscale', 'tonemap')
+
+_ffmpeg_filters_cache = {}
+
+
+def _ffmpeg_has_filters(names):
+    """True iff the ffmpeg on PATH exposes every filter in `names`. Cached:
+    `ffmpeg -filters` costs ~100ms and the answer cannot change mid-session."""
+    key = tuple(names)
+    cached = _ffmpeg_filters_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        out = subprocess.run([_ffmpeg_path(), '-hide_banner', '-filters'],
+                             capture_output=True, text=True, timeout=20,
+                             creationflags=_NO_WINDOW)
+        have = out.stdout or ''
+        # A filter line is "  T.. name  in->out  description"; matching the
+        # name as a whitespace-delimited token avoids 'tonemap' matching
+        # 'tonemap_opencl' (a hardware filter we cannot use here).
+        tokens = {line.split()[1] for line in have.splitlines()
+                  if len(line.split()) >= 2}
+        ok = all(n in tokens for n in names)
+    except Exception as e:
+        logger.warning('[EXPORT] could not enumerate ffmpeg filters (%s) — '
+                       'assuming the tone-mapping filters are unavailable', e)
+        ok = False
+    _ffmpeg_filters_cache[key] = ok
+    return ok
+
+
+def _hdr_transfer(meta):
+    """The source's HDR transfer token ('smpte2084'/'arib-std-b67'), or None
+    for SDR. Reads the RAW ffprobe token, never the x265-mapped one (which
+    collapses anything unrecognised to bt709 and would hide the problem)."""
+    trc = (meta.get('src_transfer') or '').strip().lower()
+    return trc if trc in _HDR_TRANSFERS else None
+
+
+def _sdr_colour_tokens(meta):
+    """Rewrite a meta dict's colour signalling to plain bt709 SDR — used once
+    the frames have actually BEEN tone-mapped, so what we signal matches what
+    we encoded."""
+    meta['colorprim'] = 'bt709'
+    meta['transfer'] = 'bt709'
+    meta['colormatrix'] = 'bt709'
+    meta['range_full'] = False
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -410,13 +626,69 @@ def _as_u8(p):
     return p if p.dtype == np.uint8 else _down10to8(p)
 
 
-def _pack_i420(yl, ul, vl, yr, ur, vr):
+def _pack_i420(yl, ul, vl, yr, ur, vr, swap=False):
     """hstack a left+right I420 view pair into one packed-SBS 8-bit frame's bytes
     (Y row-plane || then U || then V, all left|right hstacked)."""
+    for name, a, b in (('Y', yl, yr), ('U', ul, ur), ('V', vl, vr)):
+        if a.shape != b.shape:
+            # np.hstack would still succeed on mismatched WIDTHS and silently
+            # emit a frame of the wrong size; name the real problem instead.
+            raise ValueError(f'left/right {name} plane shape mismatch: '
+                             f'{a.shape} vs {b.shape} (decoder view pair is inconsistent)')
+    if swap:
+        yl, ul, vl, yr, ur, vr = yr, ur, vr, yl, ul, vl
     Y = np.hstack([_as_u8(yl), _as_u8(yr)])
     U = np.hstack([_as_u8(ul), _as_u8(ur)])
     V = np.hstack([_as_u8(vl), _as_u8(vr)])
     return Y.tobytes() + U.tobytes() + V.tobytes()
+
+
+def _swap_packed_i420(data, canvas_w, canvas_h, packing):
+    """Swap the two eye regions of one packed 8-bit I420 frame.
+
+    This is deliberately performed before x265 instead of relying on container
+    metadata: MV-HEVC layer/view 0 must receive the actual left eye.
+    """
+    expected = canvas_w * canvas_h * 3 // 2
+    if len(data) != expected:
+        raise ValueError(f'packed I420 frame size {len(data)} != {expected}')
+    if canvas_w % 2 or canvas_h % 2:
+        raise ValueError(f'I420 canvas must be even-sized, got {canvas_w}x{canvas_h}')
+    if packing not in ('sbs', 'tab'):
+        raise ValueError(f'unsupported packed layout for eye swap: {packing!r}')
+    # The eye boundary must fall on a CHROMA sample boundary, not just a luma
+    # one. In 4:2:0 the chroma plane is half-size on the packed axis, so an
+    # even canvas is not enough: with e.g. canvas_w=2*per_w and per_w odd, the
+    # chroma plane is per_w wide (odd) and `//2` truncates -- the swap would
+    # shear the colour planes by one sample against the luma. Requiring the
+    # packed axis to be a multiple of 4 makes the per-view chroma width/height
+    # an exact integer.
+    axis, size = (('width', canvas_w) if packing == 'sbs' else ('height', canvas_h))
+    if size % 4:
+        raise ValueError(
+            f'packed {packing.upper()} {axis} {size} is not a multiple of 4: the eye '
+            f'boundary would not land on a 4:2:0 chroma sample boundary, so the two '
+            f'views cannot be swapped losslessly (per-view {axis} must be even)')
+
+    src = np.frombuffer(data, dtype=np.uint8)
+    y_size = canvas_w * canvas_h
+    c_w, c_h = canvas_w // 2, canvas_h // 2
+    c_size = c_w * c_h
+    planes = (
+        src[:y_size].reshape(canvas_h, canvas_w),
+        src[y_size:y_size + c_size].reshape(c_h, c_w),
+        src[y_size + c_size:y_size + 2 * c_size].reshape(c_h, c_w),
+    )
+    out = []
+    for plane in planes:
+        if packing == 'sbs':
+            split = plane.shape[1] // 2
+            swapped = np.hstack((plane[:, split:], plane[:, :split]))
+        else:
+            split = plane.shape[0] // 2
+            swapped = np.vstack((plane[split:, :], plane[:split, :]))
+        out.append(np.ascontiguousarray(swapped).tobytes())
+    return b''.join(out)
 
 
 # ===========================================================================
@@ -425,13 +697,52 @@ def _pack_i420(yl, ul, vl, yr, ur, vr):
 # frames() (generator of `frame_bytes`-sized bytes) -> close() (release).
 # ===========================================================================
 class _BaseAdapter:
+    # True only for adapters whose frames travel through the ffmpeg CLI, where
+    # an HDR->SDR tone-map filter can be inserted (see _apply_hdr_policy).
+    supports_tonemap = False
+
     def __init__(self, desc, opts):
         self.desc = desc
         self.opts = opts
+        # Set by an adapter when its decode ended ABNORMALLY. frames() is a
+        # generator, so it cannot raise a meaningful error at the point of
+        # failure without fighting GeneratorExit during a cancel/slice teardown;
+        # the exporter reads this after the encode loop instead. Without it a
+        # decoder that died mid-file just looked like a short source, and the
+        # export "succeeded" with a truncated movie.
+        self.error = None
         self.path = desc['path']
+        self.eye_order = normalise_eye_order(desc.get('eye_order'))
+        self._swap_views = effective_view_swap(
+            self.eye_order, desc.get('swap_eyes'), opts.get('swap_eyes'))
+        if self.eye_order == UNKNOWN:
+            logger.warning(
+                '[EXPORT] source eye order is unknown; legacy API fallback assumes '
+                'the first/base view is left (UI exports require an explicit choice)')
         self._cancel = threading.Event()
         self._procs = []            # child Popen handles for cancel()
         self._meta = None
+
+    def _probe_metadata(self):
+        """Probe media facts and apply trusted caller hints only as fallbacks."""
+        m = probe_metadata(self.path)
+        if not m.get('duration_s'):
+            try:
+                hint = float(self.desc.get('duration_s') or 0.0)
+            except (TypeError, ValueError):
+                hint = 0.0
+            if hint > 0.0:
+                m['duration_s'] = hint
+                m['duration_source'] = 'source descriptor'
+        if not m.get('nb_frames'):
+            try:
+                hint_frames = int(self.desc.get('total_frames') or 0)
+            except (TypeError, ValueError):
+                hint_frames = 0
+            if hint_frames > 0:
+                m['nb_frames'] = hint_frames
+                m['frame_count_source'] = 'source descriptor'
+        return m
 
     # subclasses fill self._meta with the packed-canvas facts
     def metadata(self):
@@ -453,15 +764,66 @@ class _BaseAdapter:
         for p in list(self._procs):
             _kill(p)
 
+    # ---- HDR verdict (see the "HDR policy" section) ----
+    def _apply_hdr_policy(self, m):
+        """Decide what to do about an HDR (PQ/HLG) source and record it in `m`.
+
+        Returns True when the caller must tone-map the frames; raises with the
+        reason when this adapter cannot. Never returns silently for an HDR
+        source: the one outcome ruled out is emitting 8-bit PQ/HLG."""
+        hdr = _hdr_transfer(m)
+        m['hdr_transfer'] = hdr
+        m['tonemap'] = False
+        if not hdr:
+            return False
+        label = 'PQ (HDR10)' if hdr == 'smpte2084' else 'HLG'
+        if not self.supports_tonemap:
+            raise RuntimeError(
+                f'{label} HDR source cannot be re-encoded: the bundled x265 is an '
+                f'8-bit build, and this source is decoded by our own decoder, which '
+                f'has no tone-mapping stage. Exporting it would produce an 8-bit file '
+                f'still flagged as HDR (severe banding, wrong grading on Apple '
+                f'devices). A native MV-HEVC HDR source is copied untouched by the '
+                f'no-re-encode path — only a forced re-encode or an eye-order swap '
+                f'reaches here.')
+        if not _ffmpeg_has_filters(_TONEMAP_FILTERS_REQUIRED):
+            raise RuntimeError(
+                f'{label} HDR source needs tone-mapping to SDR (the bundled x265 is '
+                f'an 8-bit build), but this ffmpeg build lacks the required filters '
+                f'({", ".join(_TONEMAP_FILTERS_REQUIRED)}; zscale needs libzimg). '
+                f'Install a full ffmpeg build, or export this title from an SDR source.')
+        logger.warning('[EXPORT] %s HDR source -> tone-mapping to bt709 SDR before x265 '
+                       '(8-bit encoder); output is signalled bt709, not %s', label, hdr)
+        _sdr_colour_tokens(m)
+        m['tonemap'] = True
+        return True
+
     # ---- shared per-view/canvas geometry from base ffprobe facts ----
     def _finalise_meta(self, m, per_view_w, per_view_h, fmt):
         canvas_w = per_view_w * (2 if fmt == 1 else 1)
         canvas_h = per_view_h * (2 if fmt == 2 else 1)
+        # Geometry gate. x265 encodes each VIEW at per_view_w x per_view_h in
+        # 4:2:0, so an odd per-view dimension has no valid chroma plane; and
+        # on the packed path an odd canvas would make our fixed-size raw frame
+        # reads drift against what ffmpeg actually emits, quietly shredding the
+        # whole export. Both are caught here, before a single frame is decoded.
+        if per_view_w <= 0 or per_view_h <= 0:
+            raise RuntimeError(
+                f'unusable source geometry: per-view size {per_view_w}x{per_view_h} '
+                f'(source reported {m.get("width")}x{m.get("height")})')
+        if per_view_w % 2 or per_view_h % 2:
+            raise RuntimeError(
+                f'per-view size {per_view_w}x{per_view_h} has an odd dimension: 4:2:0 '
+                f'chroma has no integer size for it, so neither x265 nor the eye-swap '
+                f'can represent this frame exactly (source '
+                f'{m.get("width")}x{m.get("height")}, packing format={fmt})')
         m.update({
             'per_view_w': per_view_w, 'per_view_h': per_view_h,
             'canvas_w': canvas_w, 'canvas_h': canvas_h,
             'frame_bytes': canvas_w * canvas_h * 3 // 2,
             'format': fmt,
+            'source_eye_order': self.eye_order,
+            'views_swapped': self._swap_views,
         })
         return m
 
@@ -469,12 +831,15 @@ class _BaseAdapter:
 class PackedAdapter(_BaseAdapter):
     """F-SBS / F-TAB (HEVC or H.264). ffmpeg CLI decodes to rawvideo on a pipe —
     out-of-process, fast, and packed sources need no pairing logic. F-TAB is fed
-    to x265 as native top-bottom (format=2, no re-pack)."""
+    to x265 as native top-bottom (format=2, no re-pack). This is also the ONLY
+    adapter that can tone-map an HDR source (the frames pass through ffmpeg)."""
+
+    supports_tonemap = True
 
     def metadata(self):
         if self._meta:
             return self._meta
-        m = probe_metadata(self.path)
+        m = self._probe_metadata()
         packing = self.desc.get('packing')
         if packing not in ('sbs', 'tab'):
             # auto-detect from the packed aspect / filename (hevc_stereo_detect)
@@ -484,7 +849,21 @@ class PackedAdapter(_BaseAdapter):
             per_w, per_h, fmt = m['width'], m['height'] // 2, 2
         else:
             per_w, per_h, fmt = m['width'] // 2, m['height'], 1
-        self._meta = self._finalise_meta(m, per_w, per_h, fmt)
+        self._apply_hdr_policy(m)
+        m = self._finalise_meta(m, per_w, per_h, fmt)
+        # The canvas we derived is what we will read from the pipe in
+        # FIXED-SIZE blocks; ffmpeg emits the source's real geometry. If a
+        # rounding-down (odd source dimension) made them disagree, every read
+        # after the first would be offset by the difference and the export
+        # would be shredded pixel soup that still muxes and still plays. The
+        # per-view parity gate in _finalise_meta already rejects that, so this
+        # is the belt to its braces — and it names the actual mismatch.
+        if (m['canvas_w'], m['canvas_h']) != (m['width'], m['height']):
+            raise RuntimeError(
+                f'packed canvas {m["canvas_w"]}x{m["canvas_h"]} does not match the '
+                f'source frame {m["width"]}x{m["height"]} for {packing.upper()} '
+                f'packing — raw frame reads would desynchronise')
+        self._meta = m
         return self._meta
 
     def frames(self):
@@ -494,22 +873,55 @@ class PackedAdapter(_BaseAdapter):
         cmd = [_ffmpeg_path(), '-v', 'error', '-nostdin', '-i', self.path, '-map', '0:v:0']
         if max_frames:
             cmd += ['-frames:v', str(int(max_frames))]  # OUTPUT option — must follow -i
+        if m.get('tonemap'):
+            cmd += ['-vf', _TONEMAP_FILTER]
         cmd += ['-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-']
+        logger.info('[EXPORT] packed decode: %s', ' '.join(cmd))
+        # stderr is CAPTURED, not discarded: it used to go to DEVNULL and the
+        # return code was never checked, so an ffmpeg that died 30% into a
+        # damaged/unreadable source just looked like a short file — the export
+        # then "succeeded", silently truncated. Drained on a thread so a full
+        # stderr pipe can never deadlock the decode.
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, bufsize=0,
+                                stderr=subprocess.PIPE, bufsize=0,
                                 creationflags=_NO_WINDOW)
         self._procs.append(proc)
+        err_tail = collections.deque(maxlen=32)
+        drain = threading.Thread(target=_drain_stream, args=(proc.stderr, err_tail),
+                                 daemon=True)
+        drain.start()
+        reached_eof = False
+        torn_bytes = 0
         try:
             while not self._cancel.is_set():
                 data = _read_exact(proc.stdout, fb)
                 if len(data) < fb:
+                    reached_eof = True
+                    torn_bytes = len(data)
                     break
+                if self._swap_views:
+                    data = _swap_packed_i420(
+                        data, m['canvas_w'], m['canvas_h'], self._packing)
                 yield data
         finally:
             try:
                 proc.stdout.close()
             except Exception:
                 pass
+            if reached_eof and not self._cancel.is_set():
+                # The pipe ended on its own: ffmpeg's verdict is now meaningful.
+                rc = _wait_quiet(proc, 20)
+                drain.join(timeout=2)
+                tail = b''.join(err_tail).decode('utf-8', 'replace').strip()[-400:]
+                if rc not in (0, None):
+                    self.error = (f'ffmpeg decode of the source failed (rc={rc})'
+                                  + (f': {tail}' if tail else ''))
+                elif torn_bytes:
+                    self.error = (f'source decode ended mid-frame ({torn_bytes} of '
+                                  f'{fb} bytes) — the stream is truncated or corrupt'
+                                  + (f': {tail}' if tail else ''))
+                elif tail:
+                    logger.warning('[EXPORT] ffmpeg decode reported: %s', tail)
             _kill(proc)
 
 
@@ -523,8 +935,9 @@ class MVHEVCAdapter(_BaseAdapter):
     def metadata(self):
         if self._meta:
             return self._meta
-        m = probe_metadata(self.path)
+        m = self._probe_metadata()
         # MV-HEVC stores each view natively: ffprobe dims ARE the per-view dims.
+        self._apply_hdr_policy(m)
         self._meta = self._finalise_meta(m, m['width'], m['height'], 1)
         return self._meta
 
@@ -542,7 +955,26 @@ class MVHEVCAdapter(_BaseAdapter):
                 m['colormatrix'] = cand
                 m['colorprim'] = _map_prim(mi.color_space)
         if mi.color_trc:
+            # The decoder outranks ffprobe on transfer, so the HDR verdict has
+            # to be re-taken here: ffprobe reporting 'unknown' on an HLG source
+            # would otherwise have let metadata()'s check pass, and this line
+            # would then have quietly restored the PQ/HLG signalling onto an
+            # 8-bit encode.
+            m['src_transfer'] = str(mi.color_trc).strip().lower()
             m['transfer'] = _map_trc(mi.color_trc)
+            self._apply_hdr_policy(m)
+        # Geometry from the DECODER, not ffprobe: the raw planes we are about
+        # to hstack are sized by the decoder, and a disagreement (container
+        # crop metadata vs. coded size) would surface as an unexplained
+        # 'adapter frame size != expected' abort at the first frame.
+        dw = int(getattr(mi, 'width', 0) or 0)
+        dh = int(getattr(mi, 'height', 0) or 0)
+        if dw > 0 and dh > 0 and (dw, dh) != (m['per_view_w'], m['per_view_h']):
+            logger.warning('[EXPORT] MV-HEVC per-view geometry: ffprobe said %dx%d, '
+                           'decoder says %dx%d — trusting the decoder',
+                           m['per_view_w'], m['per_view_h'], dw, dh)
+            m['width'], m['height'] = dw, dh
+            self._finalise_meta(m, dw, dh, 1)
 
     def frames(self):
         max_frames = self.opts.get('max_frames')
@@ -552,7 +984,8 @@ class MVHEVCAdapter(_BaseAdapter):
             if o is None:
                 break
             (yl, ul, vl), (yr, ur, vr), _pts = o
-            yield _pack_i420(yl, ul, vl, yr, ur, vr)
+            yield _pack_i420(
+                yl, ul, vl, yr, ur, vr, swap=self._swap_views)
             n += 1
             if max_frames and n >= max_frames:
                 break
@@ -590,9 +1023,10 @@ class MVCAdapter(_BaseAdapter):
             return self._meta
         # ffprobe reads the BASE H.264 view (full frame = per-view dims), fps,
         # colour, audio — it just can't DECODE the MVC dependent view.
-        m = probe_metadata(self.path)
+        m = self._probe_metadata()
         if not m['width'] or not m['height']:
             m['width'], m['height'] = 1920, 1080     # BD3D default
+        self._apply_hdr_policy(m)
         self._meta = self._finalise_meta(m, m['width'], m['height'], 1)
         return self._meta
 
@@ -728,7 +1162,9 @@ class MVCAdapter(_BaseAdapter):
             # prune stale deps that can no longer pair (older than what we emit)
             for k in [k for k in dep_pool if k < poc - 8]:
                 dep_pool.pop(k, None)
-            return _pack_i420(yl, ul, vl, right[0], right[1], right[2])
+            return _pack_i420(
+                yl, ul, vl, right[0], right[1], right[2],
+                swap=self._swap_views)
 
         while not self._cancel.is_set():
             ok, base, dep = self._dmx.read_next_frame_pair()
@@ -824,6 +1260,29 @@ def _read_exact(pipe, n):
     return bytes(buf)
 
 
+def _drain_stream(stream, sink, chunk=1024):
+    """Read `stream` to EOF into `sink` (a bounded deque). Runs on a daemon
+    thread: an undrained stderr pipe fills its OS buffer and blocks the child
+    forever, and we only ever want the tail of it anyway."""
+    try:
+        while True:
+            data = stream.read(chunk)
+            if not data:
+                break
+            sink.append(data)
+    except Exception:
+        pass
+
+
+def _wait_quiet(proc, timeout_s):
+    """proc.wait() bounded by `timeout_s`; returns the return code, or None if
+    the process was still running when the deadline expired."""
+    try:
+        return proc.wait(timeout=timeout_s)
+    except Exception:
+        return None
+
+
 def _kill(proc):
     """Terminate a child process without leaving a zombie."""
     if proc is None:
@@ -843,10 +1302,13 @@ def _kill(proc):
         pass
 
 
-# Audio codecs QuickTime accepts natively -> stream-copy; everything else -> AAC.
-_AUDIO_COPY = {'aac', 'ac3', 'eac3', 'alac'}
-_AUDIO_ELEMENTARY = {'aac': ('adts', 'aac'), 'ac3': ('ac3', 'ac3'),
-                     'eac3': ('eac3', 'eac3'), 'alac': ('ipod', 'm4a')}
+# Audio codecs stream-copied into the .mov; everything else -> AAC transcode.
+# Deliberately NOT ac3/eac3: QuickTime/MP4Box accept them in the container,
+# but visionOS playback of AC-3 in .mov is unreliable -- a Vision Pro export
+# that LOOKS complete can come back mute. AAC/ALAC are Apple-native and copy
+# losslessly; Dolby tracks are forced through the AAC transcode instead.
+_AUDIO_COPY = {'aac', 'alac'}
+_AUDIO_ELEMENTARY = {'aac': ('adts', 'aac'), 'alac': ('ipod', 'm4a')}
 
 
 # ===========================================================================
@@ -897,6 +1359,17 @@ class MVHEVCExporter(QThread):
         # for Tier 2, the layer-NAL survival counts (vcl_total, vcl_layer_gt0).
         self.mode = None
         self.layer_nal_counts = None
+        # Readable after completion. audio_status is 'copy'/'transcode->aac'/
+        # 'none'/'failed' — 'failed' used to be a log line only, so a movie
+        # could come back silent with the export still reported as a success.
+        self.audio_status = None
+        self.audio_error = None
+        self.frames_done = 0
+        self.frames_expected = 0
+        self._frames_done = 0
+        self._total = 0
+        self._x265_log = collections.deque(maxlen=64)
+        self._x265_fps = 0.0
 
     # ---- public API ----
     def cancel(self):
@@ -942,16 +1415,77 @@ class MVHEVCExporter(QThread):
         if self._cancelled.is_set():
             raise _Cancelled()
 
+    # ---- free-space preflight -------------------------------------------
+    # Running out of disk used to surface as whatever cryptic thing the stage
+    # in flight happened to raise, potentially an hour into an encode. Where
+    # the requirement is actually KNOWN (the remux tiers stage a verbatim copy
+    # of the source) we check it exactly; for a re-encode, whose output size
+    # is genuinely unpredictable, we only assert a floor — enough to catch a
+    # full volume up front without inventing a bitrate model.
+    _REENCODE_FLOOR = 512 * 1024 * 1024
+
+    @staticmethod
+    def _require_free(path, need_bytes, label):
+        try:
+            free = shutil.disk_usage(path).free
+        except OSError:
+            return          # unknown -> never block an export on a guess
+        if free < need_bytes:
+            raise RuntimeError(
+                f'not enough free space in the {label} ({path}): '
+                f'{free / (1 << 30):.2f} GiB available, '
+                f'~{need_bytes / (1 << 30):.2f} GiB needed')
+
+    def _source_bytes(self):
+        total = 0
+        for key in ('path', 'dep_path'):
+            p = self.source_desc.get(key)
+            try:
+                if p and os.path.isfile(p):
+                    total += os.path.getsize(p)
+            except OSError:
+                pass
+        return total
+
+    def _preflight_space(self):
+        src_size = self._source_bytes()
+        remux = (self.source_desc.get('kind') == 'mvhevc'
+                 and not self.opts.get('force_reencode'))
+        if remux:
+            # Tier 1 stages a full copy in the workdir, plus a second full-size
+            # file when the audio has to be transcoded; the destination then
+            # receives one more copy.
+            need_work, need_dest = int(src_size * 2.05), int(src_size * 1.05)
+        else:
+            need_work = need_dest = self._REENCODE_FLOOR
+        self._require_free(self._workdir, need_work, 'temporary working folder')
+        dest_dir = os.path.dirname(os.path.abspath(self.out_path)) or '.'
+        os.makedirs(dest_dir, exist_ok=True)
+        self._require_free(dest_dir, need_dest, 'destination folder')
+
     def _run_pipeline(self):
         if not tools_available():
             raise RuntimeError('required tool missing (x265/mp4box/ffmpeg/ffprobe)')
         self._workdir = tempfile.mkdtemp(prefix='sylc_mvhevc_')
         try:
+            self._preflight_space()
+            # A bitstream/container copy preserves the source eye mapping byte for
+            # byte.  If the caller explicitly requests right-first/manual swapping,
+            # only the decoded re-encode path can normalize view 0 to the left eye.
+            eye_swap_requested = effective_view_swap(
+                self.source_desc.get('eye_order'),
+                self.source_desc.get('swap_eyes'),
+                self.opts.get('swap_eyes'))
             if (self.source_desc.get('kind') == 'mvhevc'
-                    and not self.opts.get('force_reencode')):
+                    and not self.opts.get('force_reencode')
+                    and not eye_swap_requested):
                 self._ck()
                 if self._attempt_remux():
                     return
+            elif self.source_desc.get('kind') == 'mvhevc' and eye_swap_requested:
+                logger.info(
+                    '[EXPORT] MV-HEVC eye swap requested -> reencode required '
+                    '(remux would preserve the original mapping)')
             self._run_reencode()
         finally:
             if self._adapter is not None:
@@ -1036,6 +1570,7 @@ class MVHEVCExporter(QThread):
         if not codec or codec in _AUDIO_COPY:
             # No audio, or already QuickTime-safe: the verbatim copy IS the
             # Tier-1 output — untouched bytes, hvcC/lhvC guaranteed intact.
+            self.audio_status = 'none' if not codec else 'copy'
             return tmp_copy
 
         # Audio needs transcoding (TrueHD/DTS/...). A `-c:v copy` ffmpeg remux
@@ -1061,6 +1596,7 @@ class MVHEVCExporter(QThread):
         p2 = probe_mv_hevc_container(out_mov)
         if not (p2['has_hvcC'] and p2['has_lhvC']):
             raise RuntimeError('tier-1 audio remux dropped hvcC/lhvC')
+        self.audio_status = 'transcode->aac'
         return out_mov
 
     # ---- Tier 2: extract the video ES (layer NALs intact) -> MP4Box mux ----
@@ -1128,21 +1664,53 @@ class MVHEVCExporter(QThread):
         # source already carried vexu (Tier 1 copying an already-conformant
         # file with a vexu box, e.g. the reference sample -- no-op).
         from vexu_injector import inject_vexu
-        inject_vexu(tmp_mov)
-        self._validate(tmp_mov)
+        inject_vexu(tmp_mov, **self._vexu_kwargs())
+        self._validate(tmp_mov, mode)
         self._ck()
         self.mode = mode
         dst_dir = os.path.dirname(os.path.abspath(self.out_path)) or '.'
         os.makedirs(dst_dir, exist_ok=True)
-        if os.path.exists(self.out_path):
-            os.remove(self.out_path)
-        shutil.move(tmp_mov, self.out_path)
-        logger.info('[EXPORT] mode=%s output=%s', mode, self.out_path)
-        payload = {'step': 'done', 'mode': mode}
+        # Publish atomically. The old sequence was remove(out_path) then
+        # move(tmp) — which destroys the user's existing file FIRST and leaves
+        # them with nothing at all if the move then fails (full disk, the file
+        # open in a player, a network target going away). Staging beside the
+        # destination and swapping with os.replace() means the previous file
+        # survives every failure, and no reader can ever observe a half-written
+        # .mov at the final path.
+        staged = self.out_path + '.sylc-part'
+        try:
+            if os.path.exists(staged):
+                os.remove(staged)
+            shutil.move(tmp_mov, staged)
+            os.replace(staged, self.out_path)
+        except BaseException:
+            try:
+                if os.path.exists(staged):
+                    os.remove(staged)
+            except OSError:
+                pass
+            raise
+        logger.info('[EXPORT] mode=%s audio=%s output=%s', mode, self.audio_status,
+                    self.out_path)
+        payload = {'step': 'done', 'mode': mode, 'audio_status': self.audio_status}
         if done_extra:
             payload.update(done_extra)
         self.progress.emit(payload)
         self.exportFinished.emit(self.out_path)
+
+    def _vexu_kwargs(self):
+        """vexu parameters for this job. Defaults write the spatial profile;
+        `vexu_minimal` restores the reference-exact 78-byte box, and the two
+        geometry values are overridable because they are conventions (no
+        Blu-ray/packed source carries a real rig baseline or lens FOV)."""
+        import vexu_injector as vx
+        if self.opts.get('vexu_minimal'):
+            return {'baseline_um': None, 'hfov_mdeg': None, 'projection': None}
+        return {
+            'baseline_um': self.opts.get('baseline_um', vx.DEFAULT_BASELINE_UM),
+            'hfov_mdeg': self.opts.get('hfov_mdeg', vx.DEFAULT_HFOV_MDEG),
+            'projection': vx.PROJECTION_RECTANGULAR,
+        }
 
     # ---- Tier 3 / default: the UNCHANGED reencode pipeline (adapter -> x265
     # -> audio -> MP4Box), reached directly for packed/mvc sources, or as the
@@ -1176,10 +1744,30 @@ class MVHEVCExporter(QThread):
         cfg = os.path.join(self._workdir, 'mv.cfg')
         with open(cfg, 'w') as f:
             f.write('--num-views 2\n--format %d\n--input "-"\n' % meta['format'])
+        # GOP discipline for Vision Pro scrubbing: x265's defaults are a 250-
+        # frame keyint (>10s at 24fps) with open GOPs -- every seek then costs
+        # up to 10s of decode from the previous IDR, and open-GOP leading
+        # pictures reference across the cut. A 2-second closed-GOP cap
+        # (keyint + no-open-gop) is what the reference spatial workflows use;
+        # the bitrate cost at these CRFs is marginal.
+        #
+        # --min-keyint MUST be 1, never pinned to keyint: any scene cut the
+        # lookahead marks but is not allowed to promote to a keyframe trips
+        # an x265 --num-views bug where layer 1 (the right eye) encodes
+        # against a broken reference from the suppressed cut until the next
+        # IDR (heavy view-1-only macroblocking; view 0 stays clean). Even
+        # the default auto min-keyint suppresses a cut landing right after
+        # a forced IDR and reproduces it. With min-keyint 1 every detected
+        # cut becomes a both-layer-aligned IDR_N_LP and the encode is
+        # artifact-free (A/B-proven per burst on real scene-cut content).
+        fpsf = float(meta.get('fps_float') or 24.0)
+        keyint = max(24, int(round(2.0 * fpsf)))
         cmd = [X265, '--multiview-config', cfg, '--num-views', '2',
                '--input-res', f"{meta['per_view_w']}x{meta['per_view_h']}",
                '--fps', meta['fps_str'], '--input-csp', 'i420', '--input-depth', '8',
                '--profile', 'main',
+               '--keyint', str(keyint), '--min-keyint', '1',
+               '--no-open-gop',
                '--colorprim', meta['colorprim'], '--transfer', meta['transfer'],
                '--colormatrix', meta['colormatrix'],
                '--range', 'full' if meta['range_full'] else 'limited',
@@ -1197,14 +1785,28 @@ class MVHEVCExporter(QThread):
         if max_frames:
             total = min(total, max_frames) if total else max_frames
         self._total = total or 0
+        logger.info(
+            '[EXPORT] progress estimate: total_frames=%d nb_frames=%s '
+            'duration=%.3fs fps=%.6f max_frames=%s',
+            self._total, meta.get('nb_frames') or 0,
+            float(meta.get('duration_s') or 0.0),
+            float(meta.get('fps_float') or 0.0), max_frames)
 
-        # drain x265 stderr on a side thread (avoids pipe-buffer deadlock + captures log)
-        self._x265_log = []
+        # drain x265 stderr on a side thread (avoids pipe-buffer deadlock +
+        # captures log). BOUNDED: x265 emits a progress line per update, which
+        # over a feature-length encode is tens of MB we would otherwise hold in
+        # memory for the sake of the last 800 characters.
+        self._x265_log = collections.deque(maxlen=64)
         self._x265_fps = 0.0
         rd = threading.Thread(target=self._read_x265_stderr, args=(proc,), daemon=True)
         rd.start()
 
         self._frames_done = 0
+        self.progress.emit({
+            'step': 'encoding', 'mode': self.mode,
+            'frames_done': 0, 'total_frames': self._total,
+            'fps': 0.0, 'eta_s': -1,
+        })
         fb = meta['frame_bytes']
         t0 = time.monotonic()
         last_emit = 0.0
@@ -1244,11 +1846,50 @@ class MVHEVCExporter(QThread):
         log = ''.join(self._x265_log)
         if broken or rc != 0 or not (os.path.isfile(out_hevc) and os.path.getsize(out_hevc) > 0):
             raise RuntimeError(f'x265 failed (rc={rc}, frames={self._frames_done})\n{log[-800:]}')
+        # The encoder is happy — but the SOURCE side may have died quietly.
+        # Checked BEFORE the frame-count check: when the decoder failed outright
+        # its own message ("ffmpeg decode of the source failed (rc=...)") tells
+        # the user what went wrong, where "adapter produced no frames" only
+        # tells them something did.
+        adapter_error = getattr(self._adapter, 'error', None)
+        if adapter_error:
+            raise RuntimeError(f'source decode failed after {self._frames_done} '
+                               f'frame(s): {adapter_error}')
         if self._frames_done <= 0:
             raise RuntimeError('adapter produced no frames')
+        self._check_completeness(max_frames)
+        self.frames_done = self._frames_done
+        self.frames_expected = self._total
         self.progress.emit({'step': 'encoded', 'mode': self.mode, 'frames_done': self._frames_done,
                             'total_frames': self._total, 'fps': round(self._x265_fps, 2),
                             'eta_s': 0})
+
+    def _check_completeness(self, max_frames):
+        """Refuse an export that is silently far shorter than its source.
+
+        The precise detector for a dead decoder is the adapter's own error
+        (ffmpeg return code); this is the net under it, covering the adapters
+        that decode in-process (MV-HEVC, MVC) and have no return code to read.
+
+        Deliberately two-tier, because the reference itself is only as good as
+        the container's metadata: a GROSS shortfall (<90%) is a hard failure —
+        no legitimate source loses a tenth of its frames — while anything above
+        that is only logged, so a slightly-wrong nb_frames or a DPB tail of a
+        few frames can never block a good export."""
+        if max_frames:
+            return                       # deliberate slice (preview / tests)
+        expected, done = self._total, self._frames_done
+        if expected <= 0 or done >= expected:
+            return
+        ratio = done / expected
+        if ratio < 0.90:
+            raise RuntimeError(
+                f'source decode stopped early: {done} of ~{expected} frames '
+                f'({ratio * 100:.1f}%). The export would be truncated, so it has '
+                f'been refused rather than written out as if it were complete.')
+        logger.warning('[EXPORT] encoded %d frames for an estimated %d (%.1f%%) — '
+                       'within tolerance for container metadata, continuing',
+                       done, expected, ratio * 100)
 
     def _wait_bounded(self, proc, poll_s=0.5, max_wait_s=3600):
         """Cancel-aware bounded replacement for a raw `proc.wait()`: polls with
@@ -1300,6 +1941,7 @@ class MVHEVCExporter(QThread):
     def _extract_audio(self, meta, mode=None):
         codec = meta.get('audio_codec')
         if not codec:
+            self.audio_status = 'none'
             return None            # source has no audio (e.g. the MV-HEVC sample)
         if mode:
             # remux mode: step-based progress only (no frames/fps — self._frames_done
@@ -1334,10 +1976,16 @@ class MVHEVCExporter(QThread):
         if self._cancelled.is_set():
             raise _Cancelled()
         if proc.returncode != 0 or not (os.path.isfile(out) and os.path.getsize(out) > 0):
-            # audio is best-effort: log and continue video-only rather than abort
+            # Audio stays best-effort — a soundtrack we cannot convert must not
+            # cost the user a whole re-encode — but it is no longer SILENT:
+            # audio_status is surfaced in the completion payload, so a movie
+            # never comes back mute while the export claims total success.
+            self.audio_status = 'failed'
+            self.audio_error = (err or b'').decode('utf-8', 'replace').strip()[-300:]
             logger.warning('[EXPORT] audio extraction failed (%s) — muxing video-only: %s',
-                           codec, (err or b'').decode('utf-8', 'replace')[-300:])
+                           codec, self.audio_error)
             return None
+        self.audio_status = action
         return out
 
     # ---- stage 3: MP4Box mux (video + colr nclx + optional audio) ----
@@ -1366,9 +2014,52 @@ class MVHEVCExporter(QThread):
     # ---- post-export validation (spec §6): ffprobe view_ids_available + a
     # dogfood re-read with OUR OWN reader (LavfHevcSource), the same one a real
     # playback session would use to open the exported file ----
-    def _validate(self, mov):
+    def _validate(self, mov, mode=None):
         if self.opts.get('validate') is False:
             return
+        # Structural gate first: free (header-only box walk, no subprocess) and
+        # it names precisely what is missing. ffprobe's view_ids check below can
+        # pass on a file whose Apple-spatial signalling never made it in --
+        # MP4Box writing lhvC and inject_vexu writing vexu are the two steps
+        # that make this an Apple spatial file rather than "some HEVC", so both
+        # are asserted on the FINAL bytes, not assumed from their own return.
+        probe = probe_mv_hevc_container(mov)
+        if probe['sample_entry'] != 'hvc1':
+            raise RuntimeError(f"post-export validation: video sample entry is "
+                               f"{probe['sample_entry']!r}, expected 'hvc1'")
+        if not probe['has_hvcC'] or not probe['has_lhvC']:
+            raise RuntimeError(
+                f"post-export validation: missing "
+                f"{'hvcC' if not probe['has_hvcC'] else 'lhvC'} box — the second view's "
+                f"parameter sets are not described, so this is not a valid MV-HEVC file")
+        if not probe['has_vexu']:
+            raise RuntimeError('post-export validation: no vexu box — the file would '
+                               'not be recognised as Apple spatial video')
+        try:
+            from vexu_injector import read_vexu
+            vexu = read_vexu(mov)
+        except Exception as e:
+            raise RuntimeError(f'post-export validation: vexu box present but '
+                               f'unreadable: {e}') from None
+        if not (vexu.get('stri', 0) & 0x03) == 0x03:
+            raise RuntimeError(f'post-export validation: vexu stri=0x{vexu.get("stri", 0):02x} '
+                               f'does not declare both eye views present')
+        # hfov: hard requirement on the paths where WE wrote the spatial
+        # signalling (reencode / tier-2 mux + injection). Tier-1 keeps an
+        # authored file's own metadata untouched, so absence there is the
+        # source's statement, not our bug -- logged, never fatal.
+        want_hfov = self._vexu_kwargs().get('hfov_mdeg')
+        if want_hfov is not None:
+            got_hfov = vexu.get('hfov_mdeg')
+            if mode in ('reencode', 'remux-tier2') and got_hfov != want_hfov:
+                raise RuntimeError(
+                    f'post-export validation: hfov box missing or wrong '
+                    f'(got {got_hfov}, wanted {want_hfov}) — the Vision Pro '
+                    f'would fall back to a default field of view')
+            if got_hfov is None:
+                logger.info('[EXPORT] validation: authored file kept without '
+                            'hfov (tier-1 pass-through)')
+        logger.info('[EXPORT] validation: sample_entry=hvc1 hvcC+lhvC+vexu ok, vexu=%s', vexu)
         j = subprocess.run(
             [_ffprobe_path(), '-v', 'error', '-select_streams', 'v:0',
              '-show_entries', 'stream=view_ids_available', '-of', 'json', mov],

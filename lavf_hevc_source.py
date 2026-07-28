@@ -242,6 +242,17 @@ class MediaInfo:
     left_view_id: int | None = None
 
 
+def _copy_plane(ptr, linesize, h, w, bps):
+    """Copie INCONDITIONNELLE d'un plan de l'AVFrame vers numpy (bps=1|2).
+    np.array(copy=True), PAS ascontiguousarray — ce dernier est un no-op quand
+    linesize == w*bps (aucun padding, cas reel de tous les assets) et retournerait un
+    ALIAS du pool de frames avcodec. Helper module reutilise par
+    LavfHevcSource._copy_plane ET par decode_annexb_first_frame (chemin cast bit-exact)."""
+    buf = np.ctypeslib.as_array(ptr, shape=(h, linesize))
+    arr = np.array(buf[:, :w * bps], copy=True)
+    return arr.view(np.uint16).reshape(h, w) if bps == 2 else arr
+
+
 class LavfHevcSource:
     def __init__(self):
         self._ctx = ctypes.c_void_p()
@@ -823,13 +834,10 @@ class LavfHevcSource:
         return cs_name, trc_name
 
     def _copy_plane(self, ptr, linesize, h, w, bps):
-        """Copie INCONDITIONNELLE d'un plan de l'AVFrame vers numpy (bps=1|2).
-        np.array(copy=True), PAS ascontiguousarray — ce dernier est un no-op
-        quand linesize == w*bps (aucun padding, cas reel de tous les assets)
-        et retournerait un ALIAS du pool de frames avcodec."""
-        buf = np.ctypeslib.as_array(ptr, shape=(h, linesize))
-        arr = np.array(buf[:, :w * bps], copy=True)
-        return arr.view(np.uint16).reshape(h, w) if bps == 2 else arr
+        """Delegue au helper module `_copy_plane` (meme copie inconditionnelle
+        copy=True — jamais un alias du pool avcodec). Conserve comme methode pour les
+        appelants existants (self._copy_plane(...))."""
+        return _copy_plane(ptr, linesize, h, w, bps)
 
     def read_frame(self):
         """((Y,U,V), pts_ms) | None=EOF. >=5 erreurs consecutives -> failed=True."""
@@ -1017,3 +1025,288 @@ class LavfHevcSource:
                 self._mv_pending = None
                 return None
             self._mv_pending = nxt        # nxt devient le nouveau candidat en attente
+
+
+# ---------------------------------------------------------------------------
+# Annex-B elementary-stream decode (NO demuxer) — SyLC Cast bit-exactness gate.
+# ---------------------------------------------------------------------------
+# The cast path (SyLC Cast, task 3) proves NVENC-lossless is bit-exact by decoding the
+# encoder's HEVC Annex-B packets straight back with avcodec — no file, no container.
+# Annex-B is self-delimiting (start codes), so avcodec_send_packet / avcodec_receive_frame
+# consume it directly. Reuses the module _sign() bindings + _copy_plane (copy=True, so the
+# returned numpy arrays never alias the avcodec frame pool).
+
+def _extract_yuv420(frame_ptr, split_sbs):
+    """Copie les plans YUV420 (8- ou 10-bit) de l'AVFrame courant vers numpy. Retourne
+    (Y,U,V), ou ((Yl,Ul,Vl),(Yr,Ur,Vr)) avec split_sbs (frame SBS pleine largeur coupee
+    au milieu : Y colonne w/2, chroma colonne w/4)."""
+    fr = ctypes.cast(frame_ptr, ctypes.POINTER(AVFrame)).contents
+    fmt = fr.format
+    if fmt == _PIX["yuv420p"]:
+        bps = 1
+    elif fmt == _PIX["yuv420p10le"]:
+        bps = 2
+    else:
+        raise RuntimeError(f"decode_annexb: pix_fmt {fmt} hors perimetre (yuv420p/10le)")
+    w, h = fr.width, fr.height
+    y = _copy_plane(fr.data[0], fr.linesize[0], h, w, bps)
+    u = _copy_plane(fr.data[1], fr.linesize[1], h // 2, w // 2, bps)
+    v = _copy_plane(fr.data[2], fr.linesize[2], h // 2, w // 2, bps)
+    if not split_sbs:
+        return (y, u, v)
+    hw = w // 2          # 3840 -> 1920 luma split
+    hc = (w // 2) // 2   # 1920 -> 960 chroma split
+    # ascontiguousarray so each half is an independent, C-contiguous array (the column
+    # slices are views into the copied plane; callers compare them element-wise).
+    left  = (np.ascontiguousarray(y[:, :hw]),
+             np.ascontiguousarray(u[:, :hc]),
+             np.ascontiguousarray(v[:, :hc]))
+    right = (np.ascontiguousarray(y[:, hw:]),
+             np.ascontiguousarray(u[:, hc:]),
+             np.ascontiguousarray(v[:, hc:]))
+    return (left, right)
+
+
+def _decode_annexb(packets, split_sbs=False, max_frames=None):
+    """Decode une LISTE de paquets Annex-B HEVC (chacun une unite d'acces complete,
+    auto-delimitee par ses start codes) directement avec avcodec — sans demuxer.
+    Retourne la liste des frames decodees (forme: cf. _extract_yuv420). Leve
+    RuntimeError sur un echec de setup ; nettoyage best-effort dans tous les cas."""
+    _sign()
+    AC, AU = _lavf._AVCODEC, _lavf._AVUTIL
+    codec = AC.avcodec_find_decoder_by_name(b"hevc")
+    if not codec:
+        raise RuntimeError("decode_annexb: decodeur hevc absent")
+    dec = AC.avcodec_alloc_context3(codec)
+    if not dec:
+        raise RuntimeError("decode_annexb: avcodec_alloc_context3 a echoue")
+    pkt = AC.av_packet_alloc()
+    frame = AU.av_frame_alloc()
+    frames = []
+    keepalive = []   # garde chaque buffer d'entree vivant JUSQU'A la liberation du decodeur
+    try:
+        if not pkt or not frame:
+            raise RuntimeError("decode_annexb: av_packet_alloc/av_frame_alloc a echoue")
+        # Single-threaded decode (threads=1). NVENC emits one slice per frame with no WPP,
+        # so slice/WPP threading can't parallelize a single frame; frame-threading (threads=0
+        # -> one thread per core) only adds huge per-frame overhead on a big AU. The cast
+        # loopback feeds compressible content whose single-frame bitstream is small, so a
+        # single decode thread is both fastest and deterministic here.
+        AU.av_opt_set(dec, b"threads", b"1", 0)
+        if AC.avcodec_open2(dec, codec, None) < 0:
+            raise RuntimeError("decode_annexb: avcodec_open2 a echoue")
+        pkt_view = ctypes.cast(pkt, ctypes.POINTER(AVPacket))
+
+        def _drain():
+            """Sort toutes les frames disponibles ; retourne le rc du dernier
+            receive_frame (0 si arret sur max_frames, sinon EAGAIN/EOF)."""
+            while True:
+                r = AC.avcodec_receive_frame(dec, frame)
+                if r != 0:
+                    return r
+                frames.append(_extract_yuv420(frame, split_sbs))
+                AU.av_frame_unref(frame)
+                if max_frames is not None and len(frames) >= max_frames:
+                    return 0
+
+        for es in packets:
+            if not es:
+                continue                      # size 0 = flush sentinel; jamais en entree
+            if max_frames is not None and len(frames) >= max_frames:
+                break
+            buf = (ctypes.c_uint8 * len(es)).from_buffer_copy(es)
+            keepalive.append(buf)
+            pv = pkt_view.contents
+            pv.buf = None                     # non refcounte: le decodeur COPIE ce qu'il garde
+            pv.data = ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8))
+            pv.size = len(es)
+            pv.pts = _AV_NOPTS
+            pv.dts = _AV_NOPTS
+            s = AC.avcodec_send_packet(dec, pkt)
+            if s < 0 and s != _AVERROR_EAGAIN:
+                raise RuntimeError(f"decode_annexb: send_packet err {s}")
+            if _drain() == _AVERROR_EOF:
+                return frames
+        # Flush: NULL force la sortie de la (des) frame(s) retenue(s) (delai 1-frame).
+        if max_frames is None or len(frames) < max_frames:
+            AC.avcodec_send_packet(dec, None)
+            _drain()
+        return frames
+    finally:
+        # Libere frame/pkt/decodeur AVANT que `keepalive` ne tombe -> pas d'use-after-free.
+        if frame:
+            p = ctypes.c_void_p(frame); AU.av_frame_free(ctypes.byref(p))
+        if pkt:
+            p = ctypes.c_void_p(pkt); AC.av_packet_free(ctypes.byref(p))
+        if dec:
+            p = ctypes.c_void_p(dec); AC.avcodec_free_context(ctypes.byref(p))
+
+
+def decode_annexb_first_frame(es, split_sbs=False):
+    """Decode la PREMIERE frame d'un flux elementaire Annex-B HEVC (bytes) avec avcodec
+    — sans demuxer. Retourne les plans (Y,U,V), ou ((Yl,Ul,Vl),(Yr,Ur,Vr)) quand
+    split_sbs decoupe une frame SBS 3840x1080 (Y gauche=[:, :1920]/droite=[:, 1920:] ;
+    U/V gauche=[:, :960]/droite=[:, 960:]). Leve RuntimeError si rien ne decode."""
+    frames = _decode_annexb([bytes(es)], split_sbs=split_sbs, max_frames=1)
+    if not frames:
+        raise RuntimeError("decode_annexb_first_frame: aucune frame decodee")
+    return frames[0]
+
+
+def decode_annexb_frames(packets, split_sbs=False, max_frames=None):
+    """Decode une LISTE de paquets Annex-B HEVC (chacun une unite d'acces complete), un
+    avcodec_send_packet par paquet, et retourne TOUTES les frames decodees dans l'ordre
+    (meme forme par frame que decode_annexb_first_frame). Sert a verifier
+    frames-encodees-en-entree == frames-decodees-en-sortie pour le chemin cast lossless."""
+    return _decode_annexb([bytes(p) for p in packets], split_sbs=split_sbs,
+                          max_frames=max_frames)
+
+
+class AnnexbStreamDecoder:
+    """Persistent no-demuxer HEVC decode session — SyLC Cast STREAMING path (Task 7).
+
+    Feed access units IN ORDER via push(); each call returns whatever frames became
+    available (0..N). ONE avcodec HEVC decoder is opened in __init__ and kept ALIVE
+    across calls, so its reference-frame state persists and P-frames (which reference
+    prior frames) decode correctly. This is the ONE difference from decode_annexb_frames
+    / decode_and_split, which open a FRESH decoder per call and therefore only decode
+    self-contained IDR units — the live cast stream is IDR (frame 0, forced) then
+    P-frames (gopLength=INFINITE, frameIntervalP=1), so a fresh-per-unit decoder drops
+    every P-frame. The persistent session is what makes the continuous stream decodable.
+
+    Everything else is the EXACT machinery of _decode_annexb: single-thread deterministic
+    decode (threads=1), non-refcounted packets the decoder copies (pkt.buf=None), and
+    _extract_yuv420 + _copy_plane(copy=True) so returned numpy arrays never alias the
+    reused frame pool (safe to accumulate across pushes).
+
+        push(au, pts_ms=None) -> list of
+            (left, right, pts_ms)   if split_sbs   (left/right each = (Y, U, V))
+            ((Y, U, V), pts_ms)     otherwise
+    When pts_ms is given it is stamped on the packet and read back off the decoded frame,
+    so each returned frame carries ITS OWN true pts across the codec's 1-frame output
+    delay (a frame emitted by push N may belong to an earlier unit — its pts still travels
+    with it via avcodec's reorder queue). When omitted, a 0-based decode-order counter
+    stands in (mirrors decode_and_split's synthetic pts for standalone callers).
+    flush() drains the codec's retained tail frame(s) at end-of-stream (send NULL once) and
+    is TERMINAL: after it the session is EOF, so push() raises rather than feeding a drained
+    decoder -- call close() next, never push(). close() frees the decoder and is idempotent.
+    """
+
+    def __init__(self, split_sbs=False):
+        _sign()
+        self._split_sbs = bool(split_sbs)
+        self._n_out = 0            # decode-order counter (fallback pts when NOPTS)
+        self._buf = None           # keepalive for the in-flight packet's copied bytes
+        self._closed = False
+        self._flushed = False      # flush() is terminal: push() after it raises (footgun guard)
+        self._dec = None
+        self._pkt = None
+        self._frame = None
+        AC, AU = _lavf._AVCODEC, _lavf._AVUTIL
+        codec = AC.avcodec_find_decoder_by_name(b"hevc")
+        if not codec:
+            raise RuntimeError("AnnexbStreamDecoder: decodeur hevc absent")
+        dec = AC.avcodec_alloc_context3(codec)
+        if not dec:
+            raise RuntimeError("AnnexbStreamDecoder: avcodec_alloc_context3 a echoue")
+        try:
+            # Single-threaded decode (threads=1) — same rationale as _decode_annexb: NVENC
+            # emits one slice per frame (no WPP), the cast AU is small, single-thread is
+            # both fastest and deterministic, AND — crucial for a persistent session —
+            # frame-threading would add a MULTI-frame output delay (= thread count) on top
+            # of the codec's inherent 1-frame delay, stranding many frames until flush().
+            AU.av_opt_set(dec, b"threads", b"1", 0)
+            if AC.avcodec_open2(dec, codec, None) < 0:
+                raise RuntimeError("AnnexbStreamDecoder: avcodec_open2 a echoue")
+            self._pkt = AC.av_packet_alloc()
+            self._frame = AU.av_frame_alloc()
+            if not self._pkt or not self._frame:
+                raise RuntimeError("AnnexbStreamDecoder: av_packet_alloc/av_frame_alloc a echoue")
+            self._dec = dec
+        except Exception:
+            # A failed __init__ must leak nothing (frame/pkt/decoder) it managed to alloc.
+            if self._frame:
+                p = ctypes.c_void_p(self._frame); AU.av_frame_free(ctypes.byref(p)); self._frame = None
+            if self._pkt:
+                p = ctypes.c_void_p(self._pkt); AC.av_packet_free(ctypes.byref(p)); self._pkt = None
+            p = ctypes.c_void_p(dec); AC.avcodec_free_context(ctypes.byref(p))
+            raise
+
+    def _drain(self, out):
+        """Receive every currently-available frame into `out`; return on EAGAIN/EOF."""
+        AC, AU = _lavf._AVCODEC, _lavf._AVUTIL
+        while True:
+            r = AC.avcodec_receive_frame(self._dec, self._frame)
+            if r != 0:
+                return r
+            planes = _extract_yuv420(self._frame, self._split_sbs)   # copy=True: no alias
+            fr = ctypes.cast(self._frame, ctypes.POINTER(AVFrame)).contents
+            pts = fr.pts
+            pts_ms = self._n_out if pts == _AV_NOPTS else int(pts)
+            self._n_out += 1
+            AU.av_frame_unref(self._frame)
+            if self._split_sbs:
+                left, right = planes
+                out.append((left, right, pts_ms))
+            else:
+                out.append((planes, pts_ms))
+
+    def push(self, au, pts_ms=None):
+        """Feed ONE Annex-B HEVC access unit; return the frames it made available (0..N).
+        A push may legitimately yield 0 frames (parameter-set-only unit, or the codec's
+        1-frame startup delay). pts_ms, if given, rides the packet through to its frame."""
+        if self._closed:
+            raise RuntimeError("AnnexbStreamDecoder.push after close()")
+        if self._flushed:
+            raise RuntimeError("AnnexbStreamDecoder.push after flush() -- flush() is "
+                               "terminal; open a new decoder to decode more")
+        AC = _lavf._AVCODEC
+        out = []
+        if au:
+            data = bytes(au)
+            buf = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
+            self._buf = buf   # keepalive past send_packet (pkt.buf=None => decoder COPIES)
+            pv = ctypes.cast(self._pkt, ctypes.POINTER(AVPacket)).contents
+            pv.buf = None
+            pv.data = ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8))
+            pv.size = len(data)
+            pv.pts = _AV_NOPTS if pts_ms is None else int(pts_ms)
+            pv.dts = _AV_NOPTS if pts_ms is None else int(pts_ms)
+            s = AC.avcodec_send_packet(self._dec, self._pkt)
+            if s < 0 and s != _AVERROR_EAGAIN:
+                raise RuntimeError(f"AnnexbStreamDecoder: send_packet err {s}")
+            self._drain(out)
+        return out
+
+    def flush(self):
+        """Drain the codec's retained tail frame(s) at end-of-stream (one NULL packet, then
+        pull whatever remains). TERMINAL: after it the session is EOF (push() will raise) --
+        the next call should be close(). Best-effort (never raises) and idempotent: a second
+        flush() is a no-op returning []."""
+        if self._closed or self._dec is None or self._flushed:
+            return []
+        self._flushed = True
+        out = []
+        try:
+            _lavf._AVCODEC.avcodec_send_packet(self._dec, None)
+            self._drain(out)
+        except Exception:
+            logger.warning("[cast] AnnexbStreamDecoder.flush drain error", exc_info=True)
+        return out
+
+    def close(self):
+        """Free the decoder / packet / frame. Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
+        AC, AU = _lavf._AVCODEC, _lavf._AVUTIL
+        try:
+            if self._frame:
+                p = ctypes.c_void_p(self._frame); AU.av_frame_free(ctypes.byref(p)); self._frame = None
+            if self._pkt:
+                p = ctypes.c_void_p(self._pkt); AC.av_packet_free(ctypes.byref(p)); self._pkt = None
+            if self._dec:
+                p = ctypes.c_void_p(self._dec); AC.avcodec_free_context(ctypes.byref(p)); self._dec = None
+        except Exception:
+            pass
+        self._buf = None

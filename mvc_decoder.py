@@ -616,6 +616,53 @@ def _apply_bd_seek_tables(demuxer, filepath):
         logger.warning(f"[BD-SEEK] EP_map/SSIF seek-map load skipped: {e}")
 
 
+def _seek_landing_plan(true_kf_s, base_s, frame_time_s):
+    """Decide how to reconcile a seek with where decode ACTUALLY starts.
+
+    `base_s` is the anchor the audio was (or will be) seeked to — the seek
+    target. `true_kf_s` is the container PTS of the first frame decode really
+    starts from. On BD3D SSIF these differ by SECONDS (measured -4.1s to +5.5s
+    on a real disc): the exact-map seek snaps to the IDR at-or-before the
+    target, the interleaved unit begins even earlier, and the demuxer's
+    is_keyframe flag misses IDRs. Anchoring stamps and mpv at the target while
+    decoding from the landing installed a PERMANENT audio-lead/lag that the
+    stamp-based [SYNC-METER] could not see.
+
+      'preroll' — landed early: decode without presenting up to the target,
+                  then present from the target (position honoured exactly);
+      'rebase'  — landed late: cannot preroll backwards — re-anchor stamps AND
+                  audio (seekIDRFound) at the true landing;
+      'aligned' — within one frame: nothing to reconcile.
+    """
+    delta = true_kf_s - base_s
+    if delta < -frame_time_s:
+        return 'preroll'
+    if delta > frame_time_s:
+        return 'rebase'
+    return 'aligned'
+
+
+def _annexb_has_idr(data):
+    """True if the Annex-B access unit contains an IDR slice (NAL type 5).
+
+    Python-side rescue for the demuxer's per-frame is_keyframe flag, which
+    misses real IDRs after an SSIF seek (measured: first flagged keyframe up
+    to 8s after decodable IDRs started flowing). Only called while the
+    pipeline is waiting for a keyframe, so the linear scan cost is bounded
+    to the seek window.
+    """
+    buf = bytes(data)
+    pos = 0
+    n = len(buf)
+    while True:
+        pos = buf.find(b'\x00\x00\x01', pos)
+        if pos < 0 or pos + 3 >= n:
+            return False
+        if (buf[pos + 3] & 0x1F) == 5:
+            return True
+        pos += 3
+
+
 def create_demuxer(filepath):
     """Demuxer selection shared by MVCDecoderThread and ThumbnailService.
     Returns (unopened_demuxer, effective_path). effective_path differs from
@@ -1251,14 +1298,13 @@ class MVCDecoderThread(QThread):
     # ===================================================
 
     def adjust_timing_drift(self, drift_seconds):
-        """SOL 2D: Adjust frame timing to compensate for A/V drift.
-        Drift is negative if video lags behind audio (most common case).
+        """Deprecated external corrector retained as an ABI-compatible no-op.
+
+        V12 owns A/V synchronization inside the presenter. Allowing a second
+        caller to alter frame duration reintroduces the exact dual-controller
+        failure that produced the deterministic 19.98 fps cap.
         """
-        self._timing_adjustment_mutex.lock()
-        # Convert to milliseconds and clamp to avoid brutal speed swings
-        drift_ms = max(min(drift_seconds * 1000.0, 250.0), -250.0)
-        self._timing_drift_ms = drift_ms
-        self._timing_adjustment_mutex.unlock()
+        return
 
     def seek_to_timestamp(self, timestamp_seconds):
         """SOL 2E: Gentle seek to resync with audio."""
@@ -1354,15 +1400,14 @@ class MVCDecoderThread(QThread):
         if value_ts == 0.0:
             return None
 
-        # V43 FIX: Cap extrapolation to prevent the audio clock from racing ahead
-        # when updates stop arriving (e.g., MPV stalled). V53: cap raised 1.0->1.5s
-        # so a normal coarse ~1Hz time-pos step (plus jitter) is still bridged by
-        # extrapolation; only a genuine multi-second stall falls back to base_clock.
+        # V62 SYNC-FIX: MPV's audio-only time-pos may legitimately advance in
+        # coarse ~1 Hz steps. Allow one step plus scheduling jitter, then return
+        # None rather than the frozen base value. This keeps the V12 loop smooth
+        # on a live coarse clock while still entering free-run instead of railing
+        # the old +20% corrector (the former 19.98 fps cap) on a dead one.
         elapsed = time.time() - value_ts
         if elapsed > 1.5:
-            # Stale value (>1.5s old) - return base clock without extrapolation
-            # to prevent wild divergence. V12 sync will handle the drift.
-            return base_clock
+            return None
 
         # Extrapolate based on time elapsed since the value last changed
         return base_clock + elapsed
@@ -1898,10 +1943,16 @@ class MVCDecoderThread(QThread):
             # frame_buffer reorder (sort_key, REORDER_DEPTH). The existing
             # predrain/ENOBUFS machinery matches the MT drain-in-feeder contract.
             # 0 = legacy synchronous decode (env override to compare/rollback).
+            # Respect the topology-aware value supplied by the player. In
+            # particular, a 4C/8T handheld gets 3 workers so one physical core's
+            # worth of scheduling capacity remains for GUI/audio/presentation.
+            # The environment variable remains an explicit A/B override.
+            _threads_env = os.environ.get('SYLC_EDGE264_THREADS')
             try:
-                alloc_threads = int(os.environ.get('SYLC_EDGE264_THREADS', '4'))
-            except ValueError:
-                alloc_threads = 4
+                alloc_threads = (int(_threads_env) if _threads_env is not None
+                                 else int(self.num_threads))
+            except (TypeError, ValueError):
+                alloc_threads = int(self.num_threads or 1)
             alloc_threads = max(0, min(16, alloc_threads))
             self._alloc_threads = alloc_threads  # V51: remember threading mode to skip pointless async drain-retries
             logger.info(f"[MVC-THREAD] Alloc with {alloc_threads} thread(s)")
@@ -4191,7 +4242,53 @@ class MVCDecoderThread(QThread):
             self._consecutive_errors = 0
 
     def dump_debug_state(self):
-        pass
+        """Watchdog probe: report where the decode loop actually is.
+
+        Called from the GUI thread while the decode thread may be wedged, so it
+        only reads plain attributes — never takes a lock the stalled thread
+        could be holding, and never calls into the native decoder (a stalled
+        edge264 holds its own mutex; probing it would hang the GUI too).
+        """
+        try:
+            now = time.monotonic()
+            stage = getattr(self, '_dbg_stage', None)
+            stage_since = getattr(self, '_dbg_stage_ts', None)
+            stuck_for = f"{now - stage_since:.1f}s" if stage_since else "?"
+
+            ring = getattr(self, '_native_ring', None)
+            try:
+                ring_state = (f"size={ring.size}/{ring.capacity} "
+                              f"dropped={ring.dropped}") if ring else "none"
+            except Exception as exc:
+                ring_state = f"unavailable ({exc})"
+
+            logger.error(
+                "[DECODER-STATE] stage=%s for %s | au#=%s ts=%sms "
+                "base=%sB dep=%sB keyframe=%s",
+                stage, stuck_for,
+                getattr(self, '_dbg_au_index', '?'),
+                getattr(self, '_dbg_au_ts', '?'),
+                getattr(self, '_dbg_au_base_size', '?'),
+                getattr(self, '_dbg_au_dep_size', '?'),
+                getattr(self, '_dbg_au_keyframe', '?'))
+            logger.error(
+                "[DECODER-STATE] ring: %s | present_q=%d frame_buf=%d "
+                "frames_out=%d threads=%s",
+                ring_state,
+                len(getattr(self, 'presentation_queue', ()) or ()),
+                len(getattr(self, 'frame_buffer', ()) or ()),
+                getattr(self, 'frame_count', -1),
+                getattr(self, '_alloc_threads', '?'))
+            logger.error(
+                "[DECODER-STATE] flags: stop=%s cleanup=%s seek_req=%s "
+                "seek_prog=%s decodes_ok=%s decode_errors=%s dep_missing=%s",
+                self._stop_requested, self._cleanup_in_progress,
+                self._seek_requested, self._seek_in_progress,
+                getattr(self, '_dbg_decode_ok', '?'),
+                getattr(self, '_dbg_decode_err', '?'),
+                getattr(self, '_dbg_dep_missing', 0))
+        except Exception as exc:
+            logger.error(f"[DECODER-STATE] probe failed: {exc}")
 
     def _emit_single_frame(self, frame_data):
         """Helper to emit signals for a single frame dictionary."""
@@ -4699,11 +4796,11 @@ class MVCDecoderThread(QThread):
             def to_np(buf, width, height, stride):
                 if buf is None:
                     return np.zeros((height, width), dtype=np.uint8)
-                arr = np.array(buf, copy=False)
+                arr = np.asarray(buf)
                 if arr.size == 0:
                     return np.zeros((height, width), dtype=np.uint8)
                 arr = arr.reshape((height, stride))
-                return np.array(arr[:, :width], copy=True)
+                return arr[:, :width]
 
             def extract_uv_planes(view, width, height):
                 """Extract U and V planes from pybind view, handling side-by-side UV format.
@@ -4715,8 +4812,8 @@ class MVCDecoderThread(QThread):
                 UV buffer. Creating an array of that size would read past the end of the buffer!
                 Solution: Read from cb_plane (properly sized) and split into U and V halves.
                 """
-                cw = width // 2  # Chroma width
-                ch = height // 2  # Chroma height
+                cw = int(getattr(view, 'chroma_width', width // 2))
+                ch = int(getattr(view, 'chroma_height', height // 2))
                 sc = getattr(view, 'stride_c', 0)
 
                 # Check for side-by-side format: stride_c = 2 * chroma_width
@@ -4728,8 +4825,8 @@ class MVCDecoderThread(QThread):
                         if uv_arr.size >= ch * sc:
                             uv_arr = uv_arr.reshape((ch, sc))
                             # Split: first half = U (Cb), second half = V (Cr)
-                            u_raw = np.array(uv_arr[:, :cw], copy=True)
-                            v_raw = np.array(uv_arr[:, cw:], copy=True)
+                            u_raw = uv_arr[:, :cw]
+                            v_raw = uv_arr[:, cw:cw * 2]
                             
                             return u_raw, v_raw
 
@@ -4747,13 +4844,17 @@ class MVCDecoderThread(QThread):
             else:
                 y_r, u_r, v_r = y_l, u_l, v_l
 
-            if y_l.size > 0 and y_l.sum() == 0:
-                logger.warning("[MVC-THREAD] Left Y-plane is all black (sum is 0).")
-            if y_r.size > 0 and y_r.sum() == 0:
-                logger.warning("[MVC-THREAD] Right Y-plane is all black (sum is 0).")
+            # A full-frame sum on both 1080p views cost several milliseconds on
+            # handheld CPUs. Keep the diagnostic out of the release hot path.
+            if logger.isEnabledFor(logging.DEBUG):
+                if y_l.size > 0 and not np.any(y_l):
+                    logger.debug("[MVC-THREAD] Left Y-plane is all black.")
+                if y_r.size > 0 and not np.any(y_r):
+                    logger.debug("[MVC-THREAD] Right Y-plane is all black.")
 
             frame_data = {
-                'poc': getattr(frame, "frame_id", self.frame_count),
+                'poc': getattr(frame, "picture_order_cnt",
+                               getattr(frame, "frame_id", self.frame_count)),
                 'left': (y_l, u_l, v_l),
                 'right': (y_r, u_r, v_r)
             }
@@ -4796,15 +4897,20 @@ class MVCDecoderThread(QThread):
         if self._presenter_active and t is not None and t.is_alive():
             return
         self._presenter_active = True
-        # V56: tighten the GIL switch interval (default 5ms). With decode/presenter/GUI
-        # all contending for the single GIL, a 5ms interval let the decode/GUI threads
-        # hold the GIL long enough to starve the real-time presenter for tens of ms
-        # (the residual ~80ms freezes). A short interval lets the presenter reclaim the
-        # GIL promptly so it can keep its frame cadence.
+        # Keep the measured low-latency scheduling fix, but avoid the former
+        # unconditional 0.5 ms global interval on small/power-limited CPUs. A
+        # 1 ms default on <=8 logical CPUs halves needless GIL hand-offs while
+        # remaining far below Python's 5 ms default. Experts can override or
+        # disable the tweak with SYLC_GIL_SWITCH_INTERVAL (0 = leave unchanged).
         try:
             import sys as _sys
-            _sys.setswitchinterval(0.0005)
-        except Exception:
+            _logical = int(os.cpu_count() or 1)
+            _default_interval = 0.001 if _logical <= 8 else 0.0005
+            _switch_interval = float(os.environ.get(
+                'SYLC_GIL_SWITCH_INTERVAL', str(_default_interval)))
+            if _switch_interval > 0:
+                _sys.setswitchinterval(max(0.0005, min(0.01, _switch_interval)))
+        except (TypeError, ValueError, OSError):
             pass
         import threading
         self._presenter_thread = threading.Thread(
@@ -4906,10 +5012,12 @@ class MVCDecoderThread(QThread):
 
             time_since_last = current_time - self._last_display_time
 
-            # Get drift
-            self._timing_adjustment_mutex.lock()
-            drift_ms = self._timing_drift_ms
-            self._timing_adjustment_mutex.unlock()
+            # V62: one A/V authority. The former external PI corrector could add
+            # exactly 20% to every interval when fed a stale mpv clock. V12 below
+            # already compares timestamped frames with the audio clock, so the
+            # presenter cadence starts from the nominal duration and only V12's
+            # bounded liquid correction may steer it.
+            drift_ms = 0.0
 
             # V7b HARD RESYNC (Fire & Correct Strategy)
             # DEPRECATED: Replaced by "Hold & Catch-Up" strategy.
@@ -4917,21 +5025,7 @@ class MVCDecoderThread(QThread):
             if self._sync_pending:
                  self._sync_pending = False
 
-            # PLL Logic (PI Controller)
-            # Dead-zone: drift < 10ms is below perception threshold; correcting it
-            # creates continuous micro-jitter in frame pacing.
             adjusted_frame_time = self.target_frame_time
-            if abs(drift_ms) > 10.0:
-                Kp = 0.05
-                Ki = 0.001
-                max_integral = self.target_frame_time * 0.10
-                self._pll_integral += (drift_ms / 1000.0) * Ki
-                self._pll_integral = max(min(self._pll_integral, max_integral), -max_integral)
-                p_term = (drift_ms / 1000.0) * Kp
-                correction = p_term + self._pll_integral
-                max_correction = self.target_frame_time * 0.2
-                correction = max(min(correction, max_correction), -max_correction)
-                adjusted_frame_time += correction
 
             # DIAG: Log timing state
             if self._ppq_diag_count <= 50 or self._ppq_diag_count % 500 == 0:
@@ -5269,154 +5363,475 @@ class MVCDecoderThread(QThread):
         except Exception as e:
             logger.error(f"[MVC-THREAD] Error in presentation queue: {e}")
 
+    @staticmethod
+    def _native_edge264_thread_count(requested_threads, has_mvc, environ=None):
+        """Choose the native edge264 execution mode for this stream.
+
+        MVC uses the worker scheduler; flat single-view AVC stays synchronous
+        (no inter-view work to overlap, and a bounded decode call is easier to
+        stop). SYLC_EDGE264_THREADS overrides both.
+
+        Measured 2026-07-27 on a clean BD3D SSIF (Avatar, 1080p MVC, both views
+        decoded, access units preloaded so only decode is timed):
+
+            0 workers   63.2 fps    2 workers  103.9 fps
+            4 workers  140.2 fps    6 workers  150.0 fps
+
+        and 400 consecutive frames are BIT-EXACT between 0 and 4 workers, both
+        views. Over 62 s of continuous playback the pool never reached the fatal
+        state (busy=ffff pending=ffff ready=0000): every pool-full wait had a
+        worker running, so it was always signalled.
+
+        History worth keeping: workers were briefly disabled for every stream
+        after a hard freeze on a different disc. That disc's stream was damaged
+        (BD+ corruption left pictures with macroblocks no task owned, so they
+        never became ready and the pool saturated) -- an input-robustness
+        problem, not a scheduler bug. It is handled inside edge264 now, at the
+        wait sites, instead of by giving up 2.2x of throughput here.
+        """
+        env = os.environ if environ is None else environ
+        explicit = env.get('SYLC_EDGE264_THREADS')
+        try:
+            if explicit is not None:
+                value = int(explicit)
+            elif not has_mvc:
+                value = 0
+            else:
+                value = int(requested_threads)
+        except (TypeError, ValueError):
+            value = 0 if not has_mvc else int(requested_threads or 1)
+        return max(0, min(16, value))
+
     def _run_native_pipeline(self):
-        """Zero-copy path: demux -> C++ ring buffer -> C++ decoder."""
+        """Native MVC path: C++ demux/ring -> dynamically loaded edge264 C++."""
         if not self._native_decoder or not self._native_ring:
             logger.warning("[MVC-THREAD] Native decoder pipeline unavailable.")
             return False
 
+        # A flat AVC transport stream must not inherit the MVC worker policy.
+        # Besides wasting CPU, the edge264 worker build used by SyLC can wait
+        # indefinitely on a few legal Blu-ray GOP layouts in mono-view mode.
+        # The explicit environment override remains available for diagnostics.
+        native_has_mvc = True
         try:
-            if not self._native_decoder.init(self.num_threads):
-                err_msg = ""
-                try:
-                    err_msg = self._native_decoder.get_last_error()
-                except Exception:
-                    err_msg = ""
-                logger.error(f"[MVC-THREAD] Native decoder init failed: {err_msg}")
-                return False
+            if hasattr(self.demuxer, 'get_video_info'):
+                native_has_mvc = bool(
+                    getattr(self.demuxer.get_video_info(), 'hasMVC', True))
         except Exception as exc:
-            logger.error(f"[MVC-THREAD] Native decoder init failed: {exc}")
-            return False
+            logger.warning(
+                f"[MVC-NATIVE] Could not query stream topology; retaining "
+                f"MVC worker policy: {exc}")
+        alloc_threads = self._native_edge264_thread_count(
+            self.num_threads, native_has_mvc)
+        self._alloc_threads = alloc_threads
+        if alloc_threads == 0 and not native_has_mvc:
+            logger.info(
+                "[MVC-NATIVE] Flat AVC mono-view stream: synchronous edge264 "
+                "(bounded decode, no worker scheduler needed)")
 
-        eos = False
-        self.start_time = time.time()
-        self.last_stats_time = time.time()
+        def close_decoder():
+            try:
+                if self._native_decoder and self._native_decoder.is_initialized():
+                    with edge264_session_lock:
+                        self._native_decoder.close()
+            except Exception as exc:
+                logger.warning(f"[MVC-NATIVE] Decoder close warning: {exc}")
 
-        # Sync variables
-        video_clock = 0.0
-        last_frame_time = 0.0
+        def inject_headers():
+            if not hasattr(self.demuxer, 'get_codec_private'):
+                return True
+            try:
+                codec_private = self.demuxer.get_codec_private()
+                if not codec_private:
+                    return True
+                cp_bytes = bytes(codec_private)
+                if (cp_bytes[:4] == b'\x00\x00\x00\x01' or
+                        cp_bytes[:3] == b'\x00\x00\x01'):
+                    annexb_headers = cp_bytes
+                else:
+                    annexb_headers = self._convert_avcc_to_annexb(cp_bytes)
+                if not annexb_headers:
+                    return True
+                result = self._native_decoder.decode_annexb_stream(annexb_headers)
+                if result != 0:
+                    logger.error(
+                        f"[MVC-NATIVE] CodecPrivate rejected ({result}): "
+                        f"{self._native_decoder.get_last_error()}")
+                    return False
+                return True
+            except Exception as exc:
+                logger.error(f"[MVC-NATIVE] Header injection failed: {exc}")
+                return False
 
-        while not self._stop_requested and not self._cleanup_in_progress:
-            loop_start = time.time()
+        def recreate_decoder():
+            close_decoder()
+            try:
+                if hasattr(self._native_decoder, 'clear_abort'):
+                    self._native_decoder.clear_abort()
+                with edge264_session_lock:
+                    initialized = self._native_decoder.init(alloc_threads)
+                if not initialized:
+                    logger.error(
+                        f"[MVC-NATIVE] Init failed: "
+                        f"{self._native_decoder.get_last_error()}")
+                    return False
+                if not inject_headers():
+                    close_decoder()
+                    return False
+                logger.info(
+                    f"[MVC-NATIVE] edge264 C++ initialized with "
+                    f"{alloc_threads} worker(s)")
+                return True
+            except Exception as exc:
+                logger.error(f"[MVC-NATIVE] Decoder creation failed: {exc}")
+                close_decoder()
+                return False
 
-            # V14 GRACEFUL ENDING: Check cleanup flag at start of each loop
-            if self._cleanup_in_progress:
-                logger.info("[MVC-THREAD] V14: Cleanup in progress, exiting decode loop")
-                break
+        # A temporal seek may need to start decoding at an earlier IDR. Frames
+        # produced during that dependency pre-roll are consumed but never sent
+        # to the presenter; audio and visible video resume at the exact target.
+        preroll_target_s = None
+        preroll_source_until_ms = None
 
-            # --- 1. DECODING PHASE ---
-            # Feed the ring buffer and decode if we have space in presentation queue
-            # Don't decode too far ahead to save memory
-            if len(self.presentation_queue) < 10:
-                # Feed C++ ring buffer
-                if not eos:
+        def drain_frames(discard=False):
+            delivered = 0
+            while not self._stop_requested and not self._cleanup_in_progress:
+                got, frame_obj = self._native_decoder.get_frame()
+                if not got:
+                    break
+                if discard:
+                    del frame_obj
+                    delivered += 1
+                    # V60 SYNC-PTS: this frame consumed the earliest display
+                    # slot without being presented — burn its PTS heap entry
+                    # so the first PRESENTED frame gets the right stamp.
+                    self._pts_discard_credit += 1
+                    continue
+                # Synthetic fallback only: _repair_and_queue overwrites this
+                # with the true container PTS from the V60 heap.
+                timestamp = (self.base_timestamp +
+                             self.frame_count * self.target_frame_time)
+                self._deliver_pybind_frame(frame_obj, timestamp)
+                self.frame_count += 1
+                delivered += 1
+            return delivered
+
+        def prepare_seek(target):
+            nonlocal preroll_target_s, preroll_source_until_ms
+            logger.info(f"[MVC-NATIVE] Seeking to {target:.3f}s")
+            self._native_ring.clear()
+            self.frame_buffer.clear()
+            self.presentation_queue.clear()
+            self._reset_pts_pipeline()
+            self.frame_count = 0
+            self.epoch += 1
+            self.last_poc_ordered = -100
+            self.force_next_epoch = False
+            if hasattr(self.demuxer, 'set_external_duration_ms') and self._media_duration:
+                try:
+                    self.demuxer.set_external_duration_ms(
+                        int(float(self._media_duration) * 1000))
+                except Exception:
+                    pass
+            try:
+                success = bool(self.demuxer.seek(int(target * 1000)))
+            except Exception as exc:
+                logger.error(f"[MVC-NATIVE] Demuxer seek failed: {exc}")
+                success = False
+            actual = target
+            if success and hasattr(self.demuxer, 'getLastCueTimestamp'):
+                try:
+                    cue_ms = self.demuxer.getLastCueTimestamp()
+                    if cue_ms is not None and cue_ms >= 0:
+                        actual = cue_ms / 1000.0
+                except Exception:
+                    pass
+            self.base_timestamp = actual
+            self.start_time = time.time() - actual
+            preroll_target_s = (
+                target if actual + self.target_frame_time < target else None)
+            preroll_source_until_ms = None
+            return success and recreate_decoder()
+
+        try:
+            if self.base_timestamp > 0 and hasattr(self.demuxer, 'seek'):
+                try:
+                    self.demuxer.seek(int(self.base_timestamp * 1000))
+                except Exception as exc:
+                    logger.warning(f"[MVC-NATIVE] Initial seek warning: {exc}")
+            if not recreate_decoder():
+                return False
+
+            eos = False
+            waiting_for_keyframe = True
+            pending_seek_signal = False
+            consecutive_decode_errors = 0
+            # Read-lookahead headroom: stop reading 2 slots before the ring is
+            # full, because a push into a full ring silently drops the pair.
+            try:
+                ring_read_headroom = max(4, int(self._native_ring.capacity) - 2)
+            except Exception:
+                ring_read_headroom = 46
+            ring_dropped_seen = 0
+            self.start_time = time.time() - self.base_timestamp
+            self.last_stats_time = time.time()
+            self._ensure_presenter()
+
+            while not self._stop_requested and not self._cleanup_in_progress:
+                self.mutex.lock()
+                if self._seek_requested:
+                    target = float(self._seek_target)
+                    self._seek_requested = False
+                    self._seek_in_progress = True
+                else:
+                    target = None
+                self.mutex.unlock()
+
+                if target is not None:
+                    if not prepare_seek(target):
+                        self._seek_in_progress = False
+                        self.seekFinished.emit()
+                        logger.error("[MVC-NATIVE] Seek recovery failed")
+                        continue
+                    eos = False
+                    waiting_for_keyframe = True
+                    pending_seek_signal = True
+
+                # READ LOOKAHEAD: read into the ring BEFORE (and regardless of)
+                # the decode backpressure gate below. The old order stopped
+                # READING whenever 12 decoded frames were queued, so the demuxer
+                # ran barely ahead of the presentation clock — and since PGS
+                # blocks are collected at READ time, a subtitle cue was only
+                # seen when playback had already reached its PTS (measured on
+                # disc: subtitles showing 1.6-2.7s late once A/V was
+                # content-aligned; the lag was previously masked by the seek
+                # anchor bug that ran the clock ahead of the content).
+                # Reading ahead costs only compressed bytes in the ring's
+                # preallocated slots (~6s of stream at capacity 144). The
+                # headroom guard matters: read_next_into_ring silently DROPS
+                # the pair when the ring is full (the C++ binding ignores the
+                # push result), which would be a lost video frame.
+                if not eos and self._native_ring.size < ring_read_headroom:
+                    self._dbg_stage = 'demux-read'
+                    self._dbg_stage_ts = time.monotonic()
+                    read_ok = False
                     try:
-                        # Try to read a few packets to keep ring full
-                        for _ in range(2):
-                            if not self.demuxer.read_next_into_ring(self._native_ring):
-                                eos = True
-                                logger.info("[MVC-THREAD] End of stream detected from demuxer")
-                                break
+                        read_ok = bool(self.demuxer.read_next_into_ring(self._native_ring))
+                        if not read_ok:
+                            eos = True
+                            logger.info("[MVC-NATIVE] End of stream")
                     except Exception as exc:
-                        logger.error(f"[MVC-THREAD] Demuxer error (native path): {exc}")
+                        logger.error(f"[MVC-NATIVE] Demuxer read failed: {exc}")
                         eos = True
+                    if read_ok:
+                        # PGS subtitles: the demuxer queues reassembled blocks as it
+                        # reads, and SOMETHING has to drain that queue. The Python
+                        # pipeline does it after every read; this native path never
+                        # did, so every block sat in the C++ queue until it hit the
+                        # 512 cap and was dropped. Symptom: every stage of the
+                        # subtitle chain reports success and not one cue ever
+                        # reaches the screen.
+                        # Deliberately OUTSIDE the read's try: a subtitle failure
+                        # must never be mistaken for end-of-stream and stop
+                        # playback. Logged rather than swallowed -- the silent
+                        # `except: pass` on the Python path is exactly what made
+                        # this class of bug invisible for so long.
+                        try:
+                            self._poll_subtitles()
+                        except Exception as exc:
+                            logger.warning("[MVC-NATIVE] subtitle poll failed: %s", exc)
 
-                # Pop from ring and decode
-                # Process up to 2 frames per loop to catch up if needed, but usually 1
-                for _ in range(2):
-                    success, base_mv, dep_mv, ts_ms, is_keyframe, seq = self._native_ring.pop()
-                    if not success:
-                        if eos:
-                            # Handle EOS flush
-                            try:
-                                self._native_decoder.flush()
-                            except Exception as exc:
-                                logger.error(f"[MVC-THREAD] Native flush failed: {exc}")
+                if len(self.presentation_queue) >= 12:
+                    # Decode is backpressured; the loop keeps cycling so the
+                    # read above continues filling the ring (subtitle lookahead).
+                    time.sleep(0.001)
+                    continue
 
-                            # Drain remaining frames
-                            while True:
-                                got, frame_obj = self._native_decoder.get_frame()
-                                if not got: break
-                                self._deliver_pybind_frame(frame_obj, (ts_ms or 0) / 1000.0)
-                                self.frame_count += 1
+                self._dbg_stage = 'ring-pop'
+                self._dbg_stage_ts = time.monotonic()
+                success, base_mv, dep_mv, ts_ms, is_keyframe, seq = (
+                    self._native_ring.pop())
+                if not success:
+                    if eos:
+                        self._native_decoder.bump_frames()
+                        drain_frames()
+                        while self.frame_buffer:
+                            self._repair_and_queue(self.frame_buffer.pop(0)['data'])
+                        deadline = time.time() + min(
+                            3.0, len(self.presentation_queue) *
+                            self.target_frame_time + 0.25)
+                        while (self.presentation_queue and
+                               time.time() < deadline and
+                               not self._stop_requested and
+                               not self._cleanup_in_progress):
+                            time.sleep(0.002)
+                        self.decodingFinished.emit()
+                        return True
+                    time.sleep(0.0005)
+                    continue
 
-                            # Move buffer to presentation
-                            while self.frame_buffer:
-                                self._repair_and_queue(self.frame_buffer.pop(0)['data'])
+                if waiting_for_keyframe and not is_keyframe:
+                    # The demuxer's is_keyframe flag misses real IDRs after an
+                    # SSIF seek (measured: up to 8s of decodable stream skipped
+                    # while waiting for a flag) — rescue with a direct NAL scan
+                    # of the base view before discarding the AU.
+                    if not _annexb_has_idr(base_mv):
+                        del base_mv, dep_mv
+                        continue
+                    logger.info("[MVC-NATIVE] IDR unflagged by the demuxer — "
+                                "rescued by NAL scan")
+                if waiting_for_keyframe:
+                    waiting_for_keyframe = False
+                    true_kf_s = (ts_ms or 0) / 1000.0
+                    logger.info(
+                        f"[MVC-NATIVE] Decode starts at keyframe "
+                        f"{true_kf_s:.3f}s (anchor {self.base_timestamp:.3f}s)")
+                    if pending_seek_signal and preroll_target_s is not None:
+                        preroll_source_until_ms = (
+                            float(ts_ms or 0) +
+                            (preroll_target_s - self.base_timestamp) * 1000.0)
+                        logger.info(
+                            f"[MVC-NATIVE] Prerolling dependencies for "
+                            f"{max(0.0, preroll_target_s - self.base_timestamp):.3f}s "
+                            f"without presentation")
+                    else:
+                        # A/V LANDING RECONCILIATION: decode does NOT start at
+                        # the anchor the audio is seeked to — on BD3D SSIF the
+                        # landing is seconds away (exact-map snap <= target,
+                        # interleaved unit head, unflagged IDRs). Anchoring
+                        # stamps+audio at the target while decoding from the
+                        # landing installed a PERMANENT content offset (heard
+                        # audio ahead of or behind the picture) invisible to
+                        # the stamp-based SYNC-METER.
+                        plan = _seek_landing_plan(
+                            true_kf_s, self.base_timestamp,
+                            self.target_frame_time)
+                        if plan == 'preroll':
+                            # Landed early: decode silently up to the anchor so
+                            # picture AND audio start exactly at the target.
+                            preroll_target_s = self.base_timestamp
+                            preroll_source_until_ms = self.base_timestamp * 1000.0
+                            logger.info(
+                                f"[MVC-NATIVE] Landed "
+                                f"{self.base_timestamp - true_kf_s:.3f}s before "
+                                f"the anchor — prerolling to "
+                                f"{self.base_timestamp:.3f}s")
+                        elif plan == 'rebase':
+                            # Landed late: cannot preroll backwards — re-anchor
+                            # presentation AND audio at the true landing.
+                            logger.info(
+                                f"[MVC-NATIVE] Landed "
+                                f"{true_kf_s - self.base_timestamp:.3f}s after "
+                                f"the anchor — re-anchoring A/V at "
+                                f"{true_kf_s:.3f}s")
+                            self.base_timestamp = true_kf_s
+                            self.start_time = time.time() - true_kf_s
+                            self.seekIDRFound.emit(true_kf_s)
+                            if pending_seek_signal:
+                                self.seekFinished.emit()
+                                self._seek_in_progress = False
+                                pending_seek_signal = False
+                        elif pending_seek_signal:
+                            self.seekIDRFound.emit(self.base_timestamp)
+                            self.seekFinished.emit()
+                            self._seek_in_progress = False
+                            pending_seek_signal = False
 
-                            # Emit remaining
-                            # V14 GRACEFUL ENDING: Also check cleanup flag to exit early
-                            while self.presentation_queue and not self._stop_requested and not self._cleanup_in_progress:
-                                self._emit_single_frame(self.presentation_queue.popleft())
-                                try:
-                                    time.sleep(self.target_frame_time)
-                                except Exception:
-                                    pass
+                self._dbg_au_index = getattr(self, '_dbg_au_index', 0) + 1
+                self._dbg_au_ts = ts_ms
+                self._dbg_au_keyframe = is_keyframe
+                try:
+                    self._dbg_au_base_size = base_mv.nbytes
+                    self._dbg_au_dep_size = dep_mv.nbytes
+                    if not self._dbg_au_dep_size:
+                        # A base-only AU leaves edge264's dependent output queue
+                        # empty; get_frame only ever emits complete MVC pairs, so
+                        # such an AU permanently retains a DPB slot.
+                        self._dbg_dep_missing = getattr(
+                            self, '_dbg_dep_missing', 0) + 1
+                except AttributeError:
+                    self._dbg_au_base_size = self._dbg_au_dep_size = -1
+                self._dbg_stage = 'edge264-decode'
+                self._dbg_stage_ts = time.monotonic()
+                try:
+                    result = self._native_decoder.decode_access_unit_pair(
+                        base_mv, dep_mv)
+                    self._dbg_decode_ok = getattr(self, '_dbg_decode_ok', 0) + 1
+                except Exception as exc:
+                    logger.error(f"[MVC-NATIVE] Decode exception: {exc}")
+                    self._dbg_decode_err = getattr(self, '_dbg_decode_err', 0) + 1
+                    result = -1
+                finally:
+                    # Releases the ring slot. Compressed slice lifetime is now
+                    # owned by MVCDecoder through edge264's unref callback.
+                    del base_mv, dep_mv
 
-                            self.decodingFinished.emit()
-                            return True
-                        break  # Ring empty, stop trying to decode this loop
+                if result != 0:
+                    consecutive_decode_errors += 1
+                    logger.warning(
+                        f"[MVC-NATIVE] AU decode error {result}: "
+                        f"{self._native_decoder.get_last_error()}")
+                    if consecutive_decode_errors >= 8:
+                        logger.error(
+                            "[MVC-NATIVE] Repeated decode failures; "
+                            "returning to the validated ctypes path")
+                        try:
+                            self.demuxer.seek(
+                                int(max(0.0, self.base_timestamp) * 1000))
+                        except Exception:
+                            pass
+                        return False
+                else:
+                    consecutive_decode_errors = 0
+                    # V60 SYNC-PTS (native path): register the fed AU's true
+                    # container PTS. Emission then stamps container time via
+                    # _assign_emit_pts instead of the synthetic base+n*ft
+                    # chain, so any anchor error shows up in (and is corrected
+                    # by) the V12 sync engine instead of persisting silently.
+                    self._push_pts_value((ts_ms or 0) / 1000.0)
 
-                    # CRITICAL FIX: Use synthetic timestamp to avoid aliasing input timestamps to output frames
-                    # The demuxer returns the timestamp of the NAL unit just read (Decode Order).
-                    # The decoder outputs frames in Display Order.
-                    # Due to H.264 reordering (B-frames), the input NAL timestamp != output frame timestamp.
-                    # Passing the input timestamp causes "future" timestamps to be assigned to current frames,
-                    # leading to false "video ahead" detection and permanent slowdown (drift).
-                    # We use the robust synthetic calculation: base + count * duration.
-                    synthetic_timestamp = self.base_timestamp + (self.frame_count * self.target_frame_time)
+                crossing_preroll_target = (
+                    preroll_source_until_ms is not None and
+                    ts_ms is not None and
+                    float(ts_ms) >= preroll_source_until_ms)
+                if crossing_preroll_target:
+                    # Timestamp the first visible decoded output from the
+                    # requested position, not from the dependency IDR.
+                    self.base_timestamp = float(preroll_target_s)
+                    self.start_time = time.time() - self.base_timestamp
+                    self.frame_count = 0
+                    drain_frames(discard=False)
+                    if pending_seek_signal:
+                        self.seekIDRFound.emit(self.base_timestamp)
+                        self.seekFinished.emit()
+                        self._seek_in_progress = False
+                        pending_seek_signal = False
+                    preroll_target_s = None
+                    preroll_source_until_ms = None
+                else:
+                    self._dbg_stage = 'drain-frames'
+                    self._dbg_stage_ts = time.monotonic()
+                    drain_frames(discard=preroll_source_until_ms is not None)
 
-                    # Retrieve decoded frames
-                    got_any = False
+                now = time.time()
+                if now - self.last_stats_time > 1.0:
+                    elapsed = max(0.001, now - self.start_time)
+                    self.fps_update.emit(self.frame_count / elapsed)
+                    self.last_stats_time = now
+                    # A dropped ring push = a silently lost video frame. The
+                    # headroom guard should make this impossible — say so
+                    # loudly if it ever happens anyway.
                     try:
-                        while True:
-                            got, frame_obj = self._native_decoder.get_frame()
-                            # logger.debug(f"[MVC-THREAD] get_frame returned: {got}")
-                            if not got: break
-                            got_any = True
-                            
-                            # Use synthetic timestamp for sync
-                            self._deliver_pybind_frame(frame_obj, synthetic_timestamp)
-                            self.frame_count += 1
-                            
-                            # Increment timestamp for next frame in this batch (rare but possible)
-                            synthetic_timestamp += self.target_frame_time
-                            
-                    except Exception as exc:
-                        logger.error(f"[MVC-THREAD] Native get_frame exception: {exc}")
+                        _drops = int(self._native_ring.dropped)
+                        if _drops > ring_dropped_seen:
+                            logger.warning(
+                                f"[MVC-NATIVE] Ring dropped "
+                                f"{_drops - ring_dropped_seen} frame pair(s) "
+                                f"(total {_drops}) — lookahead headroom breached")
+                            ring_dropped_seen = _drops
+                    except Exception:
+                        pass
 
-                    # FORCE TRANSFER: Ensure frames move from buffer to presentation queue immediately
-                    # The reordering logic in _queue_frame_for_display buffers frames.
-                    # We must ensure that if the buffer has enough frames, they are moved.
-                    # _queue_frame_for_display already handles this if REORDER_DEPTH is reached.
-                    # However, if we are stuck, we might need to force it.
-                    # BUT WAIT, checking _queue_frame_for_display implementation:
-                    # It only pops if len > REORDER_DEPTH.
-                    # If REORDER_DEPTH is high (e.g. 4) and we have 3 frames, nothing happens.
-                    # We should probably not change this behavior unless we want low latency.
-                    # The issue might be REORDER_DEPTH is too high or frames aren't reaching it.
-                    # Let's double check if _deliver_pybind_frame calls _queue_frame_for_display.
-                    # Yes it does.
-                    # So frames ARE going into frame_buffer.
-                    # If frame_buffer grows indefinitely, it means they are not being popped.
-                    # They are popped if len > REORDER_DEPTH.
-                    # So if we are looping, we must have > REORDER_DEPTH frames.
-                    # Unless REORDER_DEPTH is huge.
-                    # Let's verify REORDER_DEPTH.
-
-                    # If we got a frame, we can stop decoding for this iteration to check presentation
-                    if got_any:
-                        break
-
-            # --- 2. PRESENTATION PHASE ---
-            self._process_presentation_queue()
-
-            # Stats update
-            current_sys_time = time.time()
-            if current_sys_time - self.last_stats_time > 1.0:
-                fps = self.frame_count / (current_sys_time - self.start_time) if (
-                                                                                             current_sys_time - self.start_time) > 0 else 0
-                self.fps_update.emit(fps)
-                self.last_stats_time = current_sys_time
-
-        return True
+            return True
+        finally:
+            close_decoder()

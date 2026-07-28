@@ -6,6 +6,8 @@ renderer, ensuring subtitles appear and disappear at the correct times.
 """
 
 import logging
+import os
+import time
 from typing import Optional, Callable, Tuple
 from PySide6.QtCore import QObject, Signal, Slot, QTimer
 
@@ -48,6 +50,16 @@ class SubtitleManager(QObject):
 
         # Streaming mode flag
         self._streaming_mode: bool = False
+
+        # Display-event trace. One line per subtitle appearance/disappearance,
+        # with the clock that caused it -- the only way to tell a parser problem
+        # (no cue) from a clock problem (cue skipped over) apart, after the fact.
+        # Capped so a long film cannot flood the log; SYLC_PGS_TRACE=1 lifts it.
+        self._events_logged: int = 0
+        self._event_cap: int = -1 if os.environ.get('SYLC_PGS_TRACE') == '1' else 60
+        self._last_event_time: float = -1.0
+        self._last_clock: float = -1.0
+        self._clock_jump: float = 0.0
 
     def load_subtitle_file(self, filepath: str) -> bool:
         """
@@ -127,6 +139,26 @@ class SubtitleManager(QObject):
         self._last_img_key = None
         self.subtitle_cleared.emit()
 
+    def _trace_event(self, kind: str, clock: float, pts: float):
+        """Log one subtitle display event (bounded).
+
+        `dt` is how long the previous state lasted, `jump` how far the clock
+        moved since the previous update_time() call, and `fed` how far the
+        parser has been fed. A caption that vanishes after ~0.5s shows up here
+        as CLEAR with a small dt; whether the cause is a missing cue or a clock
+        that leapt past it is then readable from `jump` and `fed`.
+        """
+        if self._event_cap >= 0 and self._events_logged >= self._event_cap:
+            return
+        self._events_logged += 1
+        dt = (clock - self._last_event_time) if self._last_event_time >= 0 else -1.0
+        jump = getattr(self, '_clock_jump', 0.0)
+        self._last_event_time = clock
+        fed = getattr(self._parser, '_fed_until', float('nan'))
+        logger.info("[PGS-EVENT] %-5s clock=%8.2fs pts=%8.2fs dt=%6.2fs jump=%+.3fs "
+                    "sets=%d fed=%.2fs", kind, clock, pts, dt, jump,
+                    len(getattr(self._parser, 'display_sets', ()) or ()), fed)
+
     @Slot(float)
     def update_time(self, time_seconds: float):
         """
@@ -154,8 +186,30 @@ class SubtitleManager(QObject):
         # Apply time offset
         adjusted_time = time_seconds + self._time_offset
 
+        # How far the clock moved since the previous call. update_time() is fed by
+        # several sources (raw mpv time-pos, clamped UI time, the extrapolating
+        # position poller); a caption skipped over by a forward leap and one that
+        # genuinely ended look identical without this number.
+        self._clock_jump = (adjusted_time - self._last_clock) if self._last_clock >= 0 else 0.0
+        self._last_clock = adjusted_time
+
         # Get subtitle for current time
         display_set = self._parser.get_subtitle_at_time(adjusted_time)
+
+        # PGS health line (INFO, throttled to ~5s). "No subtitles" has three
+        # indistinguishable causes -- no data arriving, data arriving but not
+        # parsing, or parsing fine while the clock never reaches a cue -- and
+        # every one of them used to be silent or DEBUG-only. These four numbers
+        # separate them on the first playback, without a debug build.
+        if self._streaming_mode:
+            now = time.monotonic()
+            if now - getattr(self, '_health_last_log', 0.0) >= 5.0:
+                self._health_last_log = now
+                known = len(getattr(self._parser, 'display_sets', ()) or ())
+                logger.info(
+                    "[PGS-HEALTH] clock=%.2fs blocks_in=%d display_sets=%d match=%s",
+                    adjusted_time, getattr(self, '_blocks_in', 0), known,
+                    'YES' if display_set is not None else 'no')
 
         # Debug: Log subtitle lookup periodically
         if int(adjusted_time * 2) % 20 == 0:  # Every 10 seconds
@@ -165,6 +219,9 @@ class SubtitleManager(QObject):
         if display_set is None:
             # No subtitle at this time
             if self._current_display_set is not None:
+                if self._streaming_mode:
+                    self._trace_event('CLEAR', adjusted_time,
+                                      self._current_display_set.pts)
                 self._current_display_set = None
                 self._last_update_pts = -1.0
                 self._last_img_key = None
@@ -186,6 +243,8 @@ class SubtitleManager(QObject):
                     if img_key == getattr(self, '_last_img_key', None):
                         return  # same subtitle re-sent -> already displayed, no re-render
                     self._last_img_key = img_key
+                    if self._streaming_mode:
+                        self._trace_event('SHOW', adjusted_time, display_set.pts)
                     x = display_set.render_x
                     y = display_set.render_y
                     h, w = img.shape[:2]
@@ -215,6 +274,8 @@ class SubtitleManager(QObject):
         self._last_update_pts = -1.0
         self._last_img_key = None
         self._last_time_seconds = -1.0  # reset monotonic clock so the post-seek time is honored
+        self._last_clock = -1.0         # a seek is not a clock "jump" -- don't report it as one
+        self._last_event_time = -1.0
 
         # Clear streaming buffer if in streaming mode
         if self._streaming_mode and self._parser:
@@ -266,8 +327,16 @@ class SubtitleManager(QObject):
             pts: Presentation timestamp in seconds
         """
         if not self._streaming_mode or not self._parser:
-            logger.debug(f"[SubtitleManager] on_pgs_data IGNORED: streaming_mode={self._streaming_mode}, parser={self._parser is not None}")
+            # Was DEBUG-only: a receiver silently dropping every block is the
+            # single most confusing way for subtitles to fail, so say it once.
+            if not getattr(self, '_ignored_logged', False):
+                self._ignored_logged = True
+                logger.warning(
+                    "[SubtitleManager] PGS blocks are ARRIVING but being DROPPED: "
+                    "streaming_mode=%s parser=%s (start_streaming() was not called, "
+                    "or was undone)", self._streaming_mode, self._parser is not None)
             return
+        self._blocks_in = getattr(self, '_blocks_in', 0) + 1
 
         try:
             # Check for zlib compression (MKV often uses zlib for PGS subtitles)

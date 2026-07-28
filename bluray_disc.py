@@ -14,7 +14,7 @@ the proper Blu-ray "main title" heuristic:
   3. The longest one is the feature; return its main clip's SSIF.
   4. Fallback: if no playlist resolves, the largest SSIF on the disc.
 
-Pure standard-library; safe to import anywhere.
+No third-party dependencies; safe to import anywhere.
 """
 import os
 import struct
@@ -22,8 +22,11 @@ import glob
 import time
 import subprocess
 
-__all__ = ["is_bluray_path", "resolve_bdmv_root", "find_feature_3d_ssif", "find_feature",
-           "parse_mpls", "is_iso", "mount_iso", "dismount_iso", "get_iso_mount_drive"]
+from stereo_eye_order import LEFT_FIRST, RIGHT_FIRST, UNKNOWN
+
+__all__ = ["is_bluray_path", "resolve_bdmv_root", "find_feature_3d_ssif",
+           "find_feature", "find_feature_stable", "parse_mpls", "is_iso",
+           "mount_iso", "dismount_iso", "get_iso_mount_drive"]
 
 
 def resolve_bdmv_root(path):
@@ -75,6 +78,31 @@ def is_bluray_path(path):
 _DECOY_REPLAY_RATIO = 1.5
 
 
+def _mpls_eye_order(data):
+    """Return the MVC base-view eye from an MPLS AppInfoPlayList block.
+
+    Blu-ray stores ``MVC_Base_view_R_flag`` in the high nibble of the flags
+    byte following the UO mask: 0 means the AVC base view is left, 1 means it
+    is right.  The parser is intentionally length/bounds checked because MPLS
+    data comes from removable media.
+    """
+    try:
+        if len(data) < 57 or data[0:4] != b"MPLS":
+            return UNKNOWN
+        playlist_start = struct.unpack(">I", data[8:12])[0]
+        app_start = 40
+        app_len = struct.unpack(">I", data[app_start:app_start + 4])[0]
+        app_end = app_start + 4 + app_len
+        flag_offset = app_start + 16
+        if (app_len < 13 or flag_offset >= len(data)
+                or flag_offset >= app_end
+                or playlist_start <= flag_offset):
+            return UNKNOWN
+        return RIGHT_FIRST if data[flag_offset] & 0x10 else LEFT_FIRST
+    except (IndexError, struct.error, TypeError):
+        return UNKNOWN
+
+
 def _parse_mpls_full(path):
     """Parse a .mpls PlayList. Returns a dict with 'duration_s', the ordered 'segments'
     [(clip, in_45k, out_45k), ...] (repeats preserved) and 'clips' [names], or None."""
@@ -102,7 +130,8 @@ def _parse_mpls_full(path):
         total_45k = sum(o - i for _, i, o in segments)
         return {"duration_s": total_45k / 45000.0,
                 "segments": segments,
-                "clips": [c for c, _, _ in segments]}
+                "clips": [c for c, _, _ in segments],
+                "eye_order": _mpls_eye_order(data)}
     except Exception:
         return None
 
@@ -349,7 +378,8 @@ def find_feature(path):
     info = {"bdmv": None, "method": None, "duration_s": 0.0, "playlist": None,
             "clip": None, "kind": None, "candidates_ssif": 0, "candidates_m2ts": 0,
             "candidates_playlists": 0, "decoys_filtered": 0, "feature_clips": [],
-            "segments": [], "ssif_interleave_missing": False, "dual_file_pair": None}
+            "segments": [], "ssif_interleave_missing": False, "dual_file_pair": None,
+            "eye_order": UNKNOWN}
     bdmv = resolve_bdmv_root(path)
     info["bdmv"] = bdmv
     if not bdmv:
@@ -429,15 +459,19 @@ def find_feature(path):
     for dur, segments, name in ranked:
         seq = _resolvable_sequence(segments, ssif_set)
         if seq:
+            parsed_playlist = _parse_mpls_full(os.path.join(playlist_dir, name))
             info.update(method="mpls", duration_s=dur, playlist=name, clip=seq[0]["clip"],
-                        kind="ssif", feature_clips=[s["clip"] for s in seq], segments=seq)
+                        kind="ssif", feature_clips=[s["clip"] for s in seq], segments=seq,
+                        eye_order=(parsed_playlist or {}).get("eye_order", UNKNOWN))
             return seq[0]["path"], info
     # Phase 2 (2D): longest non-decoy playlist whose clips resolve to M2TS.
     for dur, segments, name in ranked:
         seq = _resolvable_sequence(segments, m2ts_set)
         if seq:
+            parsed_playlist = _parse_mpls_full(os.path.join(playlist_dir, name))
             info.update(method="mpls", duration_s=dur, playlist=name, clip=seq[0]["clip"],
-                        kind="m2ts", feature_clips=[s["clip"] for s in seq], segments=seq)
+                        kind="m2ts", feature_clips=[s["clip"] for s in seq], segments=seq,
+                        eye_order=(parsed_playlist or {}).get("eye_order", UNKNOWN))
             _maybe_set_dual_file_pair(info, playlist_dir, m2ts_set)
             return seq[0]["path"], info
 
@@ -457,6 +491,86 @@ def find_feature(path):
         _maybe_set_dual_file_pair(info, playlist_dir, m2ts_set)
         return p, info
     return None, info
+
+
+def find_feature_stable(path, *, fresh_mount=False, timeout_s=30.0,
+                        poll_s=1.0, stable_samples=3, on_poll=None,
+                        _clock=time.monotonic, _sleep=time.sleep):
+    """Wait for a mounted UDF volume to expose a stable Blu-ray inventory.
+
+    Windows can publish a freshly-mounted ISO drive letter while PLAYLIST and
+    STREAM are still being populated. A single ``find_feature`` call may then
+    select a tiny bonus/title from the first visible files. Keep scanning until
+    the selected feature and all candidate counts agree for several samples.
+
+    A fresh mount also gets a bounded minimum settling window. During that
+    window we retain the best result seen (3D first, then longest duration), so
+    a transient 8-second title cannot beat the real feature that appears later.
+    Existing/manual mounts do not pay that minimum delay.
+    """
+    timeout_s = max(0.0, float(timeout_s))
+    poll_s = max(0.05, float(poll_s))
+    stable_samples = max(1, int(stable_samples))
+    min_settle_s = min(timeout_s, 10.0) if fresh_mount else 0.0
+    started = _clock()
+    deadline = started + timeout_s
+    last_signature = None
+    stable_count = 0
+    best = (None, None)
+    best_score = (-1, -1.0, -1)
+    latest = (None, None)
+
+    while True:
+        feature, info = find_feature(path)
+        info = info or {}
+        latest = (feature, info)
+        signature = (
+            os.path.normcase(os.path.abspath(feature)) if feature else None,
+            info.get("playlist"),
+            info.get("kind"),
+            round(float(info.get("duration_s") or 0.0), 3),
+            int(info.get("candidates_playlists") or 0),
+            int(info.get("candidates_ssif") or 0),
+            int(info.get("candidates_m2ts") or 0),
+            tuple(info.get("dual_file_pair") or ()),
+        )
+        if signature == last_signature:
+            stable_count += 1
+        else:
+            last_signature = signature
+            stable_count = 1
+
+        if feature:
+            score = (
+                1 if info.get("kind") == "ssif" else 0,
+                float(info.get("duration_s") or 0.0),
+                int(info.get("candidates_playlists") or 0)
+                + int(info.get("candidates_ssif") or 0)
+                + int(info.get("candidates_m2ts") or 0),
+            )
+            if score > best_score:
+                best = (feature, info)
+                best_score = score
+
+        now = _clock()
+        elapsed = now - started
+        duration = float(info.get("duration_s") or 0.0)
+        # A playlist shorter than one minute is almost certainly a transient
+        # partial-enumeration result for a "main feature" scan. Keep waiting.
+        plausible = duration <= 0.0 or duration >= 60.0
+        if (feature and plausible and elapsed >= min_settle_s
+                and stable_count >= stable_samples):
+            return feature, info
+        if now >= deadline:
+            break
+        if on_poll is not None:
+            try:
+                on_poll()
+            except Exception:
+                pass
+        _sleep(min(poll_s, max(0.0, deadline - now)))
+
+    return best if best[0] else latest
 
 
 def find_feature_3d_ssif(path):

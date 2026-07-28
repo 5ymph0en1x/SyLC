@@ -1,5 +1,5 @@
 @echo off
-REM === SyLC 3D Player - standalone no-console build (Nuitka) ===
+REM === SyLC 3D Player v5.0.0 - standalone no-console build (Nuitka) ===
 REM Prereqs: a Python 3.14 venv with: requirements.txt + nuitka (run from the activated venv)
 REM          + MSVC 2022 build tools. Run from this folder.
 cd /d "%~dp0"
@@ -16,7 +16,6 @@ python -m nuitka SyLC_3D_Player.py ^
   --include-module=thumbnail_service ^
   --include-package=native_renderer ^
   --include-data-files=edge264.dll=edge264.dll ^
-  --include-data-files=libwinpthread-1.dll=libwinpthread-1.dll ^
   --include-data-files=mpv-2.dll=mpv-2.dll ^
   --include-data-files=ffprobe.exe=ffprobe.exe ^
   --include-data-files=avcodec-62.dll=avcodec-62.dll ^

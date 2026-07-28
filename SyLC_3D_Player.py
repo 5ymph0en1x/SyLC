@@ -15,24 +15,26 @@ Version: V7b - V7a + CRITICAL MEMORY LEAK FIX
 """
 
 import sys
-import io
 
-# Fix encoding for Unicode characters
-if sys.stdout:
-    try:
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    except AttributeError:
-        pass # sys.stdout might be None or a custom object in GUI mode
-
-if sys.stderr:
-    try:
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
-    except AttributeError:
-        pass # sys.stderr might be None or a custom object in GUI mode
+# Fix encoding for Unicode characters without replacing/closing the stream object.
+# Re-wrapping ``sys.stdout.buffer`` broke pytest capture and could close a host
+# application's underlying descriptor when the wrapper was garbage-collected.
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None:
+        try:
+            _stream.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError, OSError):
+            # GUI builds may expose None or a custom stream without reconfigure().
+            pass
 
 import os
 import re
 import struct
+
+from stereo_eye_order import (
+    LEFT_FIRST, RIGHT_FIRST, UNKNOWN, classify_stereo_value,
+    eye_order_from_stereo_value, normalise_eye_order,
+)
 
 # CRITICAL HDR FIX: Disable Windows Fullscreen Optimizations
 # This prevents Windows from detecting borderless fullscreen and switching HDR off
@@ -158,6 +160,32 @@ def _setup_nuitka_paths():
 
 APP_BASE_DIR = _setup_nuitka_paths()
 
+
+def _activate_pending_native_renderer():
+    """Atomically promote a validated native-renderer rebuild on next launch.
+
+    Windows locks imported ``.pyd`` files for the lifetime of the process. A
+    running SyLC instance therefore cannot be patched in place; staging beside
+    the module and promoting before the first import gives us an atomic,
+    crash-safe hand-off after restart. Failure is harmless and retried next time.
+    """
+    if sys.platform != 'win32':
+        return
+    try:
+        module_dir = os.path.dirname(os.path.abspath(__file__))
+        current = os.path.join(
+            module_dir, 'mvc_demuxer_cpp.cp314-win_amd64.pyd')
+        pending = current + '.pending'
+        if not os.path.isfile(pending):
+            return
+        os.replace(pending, current)
+        print("[STARTUP] Activated pending native renderer update")
+    except OSError as exc:
+        print(f"[STARTUP] Native renderer update pending (module still locked): {exc}")
+
+
+_activate_pending_native_renderer()
+
 import subprocess
 import json
 import tempfile
@@ -167,8 +195,10 @@ import glob
 import ctypes
 import multiprocessing
 import logging
+from logging.handlers import RotatingFileHandler
 import traceback
 import threading
+import atexit
 from enum import Enum, auto
 from dataclasses import dataclass
 from typing import Optional
@@ -183,16 +213,61 @@ from PySide6.QtWidgets import (
     QDialog, QProgressBar
 )
 
-logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+_SYLC_LOG_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
+    "SyLC3DPlayer", "logs")
+_log_handlers = []
+try:
+    os.makedirs(_SYLC_LOG_DIR, exist_ok=True)
+    _log_handlers.append(RotatingFileHandler(
+        os.path.join(_SYLC_LOG_DIR, "sylc-player.log"),
+        maxBytes=8 * 1024 * 1024, backupCount=5, encoding="utf-8"))
+except OSError:
+    # Read-only/locked profile: retain console logging when one exists.
+    pass
+if sys.stderr is not None:
+    _log_handlers.append(logging.StreamHandler())
+# INFO by default; SYLC_LOG_LEVEL raises (or lowers) it without touching the code.
+# Several diagnostics that answer "is data actually flowing?" are logged at DEBUG
+# because they sit in per-frame hot loops -- [POLL-SUBS] on the PGS path is the
+# prime example. Without this override they could only be seen by editing this
+# file, which is exactly the wrong thing to ask of someone chasing a bug.
+_log_level = getattr(logging, os.environ.get('SYLC_LOG_LEVEL', 'INFO').upper(), logging.INFO)
+logging.basicConfig(
+    level=_log_level,
+    format='%(asctime)s [%(levelname)s] %(threadName)s %(name)s: %(message)s',
+    handlers=_log_handlers or None)
 logger = logging.getLogger(__name__)
+if _log_level != logging.INFO:
+    logger.info("[STARTUP] log level = %s (SYLC_LOG_LEVEL)",
+                logging.getLevelName(_log_level))
+
+
+def _recommended_edge264_threads():
+    """Leave CPU capacity for GUI/audio/render work on small handheld APUs.
+
+    ``SYLC_EDGE264_THREADS`` remains the authoritative expert override inside
+    MVCDecoderThread. This value is the safe automatic default only.
+    """
+    logical = max(1, int(multiprocessing.cpu_count() or 1))
+    if logical <= 4:
+        return max(1, logical - 1)
+    if logical <= 8:
+        return 3
+    return 4
+
 
 # --- FLUIDITY FIX: Force Windows High Resolution Timer (1ms) ---
 if sys.platform == 'win32':
     try:
         from ctypes import windll
         timeBeginPeriod = windll.winmm.timeBeginPeriod
-        timeBeginPeriod(1)
-        logger.info("[FLUIDITY] Windows High Resolution Timer enabled (1ms).")
+        timeEndPeriod = windll.winmm.timeEndPeriod
+        if timeBeginPeriod(1) == 0:
+            atexit.register(timeEndPeriod, 1)
+            logger.info("[FLUIDITY] Windows High Resolution Timer enabled (1ms).")
+        else:
+            logger.warning("[FLUIDITY] Windows rejected the 1ms timer request.")
     except Exception as e:
         logger.warning(f"[FLUIDITY] Failed to set high resolution timer: {e}")
 
@@ -511,6 +586,13 @@ if _LAVF_AVAILABLE:
                                                '.wmv', '.webm', '.mpg', '.mpeg',
                                                '.h264', '.264', '.avc')
 print(f"[STARTUP] LAVF (MP4/AVI/raw via edge264) = {_LAVF_AVAILABLE}")
+
+
+def _edge264_startup_timeout_ms(video_info):
+    """Bound the black-screen window while preserving slower optical MVC startup."""
+    info = video_info if isinstance(video_info, dict) else {}
+    return 25000 if info.get('is_3d') else 12000
+
 
 # Native C++ D3D11 renderer availability — the SOLE video render path since the
 # Directive 2 cutover (Qt RHI removed). edge264 routing requires it; without it,
@@ -891,7 +973,6 @@ APP_STYLE = """
         height: 14px;
         border-radius: 7px;
         margin: -5px 0;
-        box-shadow: 0 0 5px rgba(0,0,0,0.5);
     }
     QSlider::handle:horizontal:hover {
         background: #007ACC;
@@ -1033,7 +1114,13 @@ def _classify_stereo_mode(mode_str):
     if not mode_str:
         return None
 
-    mode = mode_str.strip().lower()
+    # Covers the normative numeric Matroska StereoMode values too (notably
+    # 11=right-first SBS and 13/14=MVC left/right first).
+    classified, _order = classify_stereo_value(mode_str)
+    if classified:
+        return classified
+
+    mode = str(mode_str).strip().lower()
     mode = mode.replace('-', '_').replace(' ', '_')
 
     if mode in ('mono', 'left', 'right', 'both', '2d'):
@@ -1064,7 +1151,8 @@ def _classify_stereo_mode(mode_str):
     return None
 
 
-def _promote_stereo_mode(result_dict, mode, mark_mvc=False):
+def _promote_stereo_mode(result_dict, mode, mark_mvc=False,
+                         eye_order=UNKNOWN, eye_order_source=None):
     """Updates the 3D detection result with priority."""
     if not mode:
         return
@@ -1074,6 +1162,10 @@ def _promote_stereo_mode(result_dict, mode, mark_mvc=False):
 
     if priority >= current_priority:
         result_dict['stereo_mode'] = mode
+        order = normalise_eye_order(eye_order)
+        if order != UNKNOWN:
+            result_dict['eye_order'] = order
+            result_dict['eye_order_source'] = eye_order_source
 
     result_dict['is_3d'] = True
 
@@ -1170,6 +1262,11 @@ class Video3DAnalyzer:
             'is_3d': False,
             'stereo_mode': 'none',
             'has_mvc_track': False,
+            # Never silently collapse "not signalled" into "left first".
+            # The Apple exporter prompts for an explicit choice when this stays
+            # unknown; playback remains backward-compatible.
+            'eye_order': UNKNOWN,
+            'eye_order_source': None,
             'width': 0,
             'height': 0,
             'analysis_error': None,
@@ -1253,7 +1350,7 @@ class Video3DAnalyzer:
                 except ValueError:
                     pass
 
-            for stream in data.get('streams', []):
+            for stream_index, stream in enumerate(data.get('streams', [])):
                 if stream.get('codec_type') == 'video':
                     result['width'] = stream.get('width', 0)
                     result['height'] = stream.get('height', 0)
@@ -1296,6 +1393,18 @@ class Video3DAnalyzer:
                         if 'stereo' in profile or 'mvc' in profile:
                             _promote_stereo_mode(result, 'mvc', mark_mvc=True)
 
+                    # Some ffprobe builds expose Matroska StereoMode directly on
+                    # AVStream instead of under tags/side_data_list.
+                    for field_name in ('stereo_mode', 'stereo_mode_name'):
+                        raw_stereo = stream.get(field_name)
+                        classified = _classify_stereo_mode(raw_stereo)
+                        if classified:
+                            _promote_stereo_mode(
+                                result, classified,
+                                mark_mvc=(classified == 'mvc'),
+                                eye_order=eye_order_from_stereo_value(raw_stereo),
+                                eye_order_source=f'ffprobe stream {stream_index}.{field_name}')
+
                     disposition = stream.get('disposition') or {}
                     if isinstance(disposition, dict) and disposition.get('dependent'):
                         _promote_stereo_mode(result, 'mvc', mark_mvc=True)
@@ -1303,11 +1412,12 @@ class Video3DAnalyzer:
                     if not is_framepacked:
                         for side_data in stream.get('side_data_list', []):
                             side_type = (
-                                    side_data.get('type')
-                                    or side_data.get('side_data_type')
+                                    side_data.get('side_data_type')
+                                    or side_data.get('type')
                                     or ''
                             ).lower()
-                            if 'stereo3d' in side_type or 'stereo_3d' in side_type:
+                            if ('stereo3d' in side_type or 'stereo_3d' in side_type
+                                    or 'stereo 3d' in side_type):
                                 detected = (
                                         side_data.get('stereo_mode')
                                         or side_data.get('type')
@@ -1316,17 +1426,33 @@ class Video3DAnalyzer:
                                         or ''
                                 )
                                 classified = _classify_stereo_mode(detected)
+                                inverted_flag = side_data.get('inverted')
+                                order = eye_order_from_stereo_value(
+                                    detected, inverted=inverted_flag)
                                 if classified == 'mvc':
-                                    _promote_stereo_mode(result, 'mvc', mark_mvc=True)
+                                    _promote_stereo_mode(
+                                        result, 'mvc', mark_mvc=True,
+                                        eye_order=order,
+                                        eye_order_source=(
+                                            f'ffprobe stream {stream_index} Stereo3D'))
                                 elif classified:
-                                    _promote_stereo_mode(result, classified)
+                                    _promote_stereo_mode(
+                                        result, classified,
+                                        eye_order=order,
+                                        eye_order_source=(
+                                            f'ffprobe stream {stream_index} Stereo3D'))
 
                         tags = stream.get('tags') or {}
                         for key, value in tags.items():
                             if key.lower().startswith('stereo'):
                                 classified = _classify_stereo_mode(value)
                                 if classified:
-                                    _promote_stereo_mode(result, classified)
+                                    _promote_stereo_mode(
+                                        result, classified,
+                                        mark_mvc=(classified == 'mvc'),
+                                        eye_order=eye_order_from_stereo_value(value),
+                                        eye_order_source=(
+                                            f'ffprobe stream {stream_index} tag {key}'))
 
             if not result['has_mvc_track']:
                 for stream in data.get('streams', []):
@@ -2128,16 +2254,16 @@ class MVHEVCExportDialog(QDialog):
     host (PlayerWindow) owns the MVHEVCExporter and the completion/failure toasts.
     """
 
-    _STEP_FR = {
-        'probe': "Analyse de la source…",
-        'copy': "Copie sans réencodage…",
-        'extracting': "Extraction du flux vidéo…",
-        'audio': "Traitement de la piste audio…",
-        'muxing': "Assemblage du conteneur .mov…",
-        'validating': "Validation de la sortie…",
-        'encoding': "Encodage x265…",
-        'encoded': "Encodage terminé, finalisation…",
-        'done': "Terminé.",
+    _STEP_LABELS = {
+        'probe': "Analyzing source…",
+        'copy': "Copying without re-encoding…",
+        'extracting': "Extracting video stream…",
+        'audio': "Processing audio track…",
+        'muxing': "Building .mov container…",
+        'validating': "Validating output…",
+        'encoding': "Encoding with x265…",
+        'encoded': "Encoding complete, finalizing…",
+        'done': "Done.",
     }
 
     def __init__(self, player, out_path, reencode_hint=True, parent=None):
@@ -2145,7 +2271,9 @@ class MVHEVCExportDialog(QDialog):
         self.player = player
         self.out_path = out_path
         self._done = False
-        self.setWindowTitle("Exporter en MV-HEVC")
+        self._total_frames = 0
+        self._audio_status = None
+        self.setWindowTitle("Export to MV-HEVC")
         self.setModal(False)
         self.setMinimumWidth(460)
         try:
@@ -2164,13 +2292,13 @@ class MVHEVCExportDialog(QDialog):
         title.setObjectName("title")
         root.addWidget(title)
 
-        self.subtitle = QLabel("Réencodage x265…" if reencode_hint
-                               else "Copie sans réencodage…")
+        self.subtitle = QLabel("Re-encoding with x265…" if reencode_hint
+                               else "Copying without re-encoding…")
         self.subtitle.setObjectName("subtitle")
         self.subtitle.setWordWrap(True)
         root.addWidget(self.subtitle)
 
-        self.status = QLabel("Préparation…")
+        self.status = QLabel("Preparing…")
         self.status.setObjectName("source")
         self.status.setWordWrap(True)
         root.addWidget(self.status)
@@ -2191,10 +2319,10 @@ class MVHEVCExportDialog(QDialog):
 
         footer = QHBoxLayout()
         footer.addStretch(1)
-        self.cancel_btn = QPushButton("Annuler")
+        self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setObjectName("danger")
         self.cancel_btn.clicked.connect(self._cancel)
-        self.close_btn = QPushButton("Fermer")
+        self.close_btn = QPushButton("Close")
         self.close_btn.clicked.connect(self.accept)
         self.close_btn.hide()
         footer.addWidget(self.cancel_btn)
@@ -2220,13 +2348,21 @@ class MVHEVCExportDialog(QDialog):
             return
         step = d.get('step', '')
         mode = d.get('mode')
+        if d.get('audio_status'):
+            # Emitted with the terminal 'done' payload; kept so set_finished()
+            # can warn when the soundtrack silently didn't make it (the export
+            # deliberately continues video-only rather than losing the encode).
+            self._audio_status = d['audio_status']
         if mode == 'reencode':
-            self.subtitle.setText("Réencodage x265…")
+            self.subtitle.setText("Re-encoding with x265…")
         elif mode in ('remux-tier1', 'remux-tier2'):
-            self.subtitle.setText("Copie sans réencodage…")
-        self.status.setText(self._STEP_FR.get(step, step or "…"))
+            self.subtitle.setText("Copying without re-encoding…")
+        self.status.setText(self._STEP_LABELS.get(step, step or "…"))
         if step == 'encoding':
-            total = int(d.get('total_frames') or 0)
+            reported_total = int(d.get('total_frames') or 0)
+            if reported_total > 0:
+                self._total_frames = reported_total
+            total = self._total_frames
             done = int(d.get('frames_done') or 0)
             if total > 0:
                 self.bar.setRange(0, total)
@@ -2235,9 +2371,13 @@ class MVHEVCExportDialog(QDialog):
                 self.bar.setRange(0, 0)
             fps = d.get('fps') or 0.0
             eta = d.get('eta_s', -1)
+            # Defense in depth: older/background exporters may omit eta_s while
+            # still supplying total+fps.  The dialog can derive the same value.
+            if (eta is None or eta < 0) and total > done and fps > 0:
+                eta = int((total - done) / fps)
             self.detail.setText(
-                f"{done}/{total if total else '?'} images · {fps:.1f} fps · "
-                f"reste {self._fmt_eta(eta)}")
+                f"{done}/{total if total else '?'} frames · {fps:.1f} fps · "
+                f"{self._fmt_eta(eta)} remaining")
         else:
             self.bar.setRange(0, 0)     # step-based (remux) / non-frame steps: busy
             self.detail.setText("")
@@ -2246,9 +2386,11 @@ class MVHEVCExportDialog(QDialog):
         self._done = True
         self.bar.setRange(0, 100)
         self.bar.setValue(100)
-        self.status.setText("Export terminé.")
-        self.subtitle.setText(f"Fichier créé : {out_path}")
-        self.detail.setText("")
+        self.status.setText("Export complete.")
+        self.subtitle.setText(f"File created: {out_path}")
+        self.detail.setText(
+            "⚠ The audio track could not be converted — the file is video-only."
+            if self._audio_status == 'failed' else "")
         self.cancel_btn.hide()
         self.close_btn.show()
 
@@ -2257,10 +2399,10 @@ class MVHEVCExportDialog(QDialog):
         self.bar.setRange(0, 100)
         self.bar.setValue(0)
         if reason == 'annule':
-            self.status.setText("Export annulé.")
-            self.subtitle.setText("Fichiers temporaires purgés.")
+            self.status.setText("Export cancelled.")
+            self.subtitle.setText("Temporary files removed.")
         else:
-            self.status.setText("Échec de l'export.")
+            self.status.setText("Export failed.")
             self.subtitle.setText(str(reason))
         self.detail.setText("")
         self.cancel_btn.hide()
@@ -2269,8 +2411,8 @@ class MVHEVCExportDialog(QDialog):
     def _cancel(self):
         job = getattr(self.player, '_export_job', None)
         self.cancel_btn.setEnabled(False)
-        self.cancel_btn.setText("Annulation…")
-        self.status.setText("Annulation en cours…")
+        self.cancel_btn.setText("Cancelling…")
+        self.status.setText("Cancellation in progress…")
         if job is not None:
             try:
                 job.cancel()
@@ -2287,6 +2429,70 @@ class MVHEVCExportDialog(QDialog):
             except Exception:
                 pass
         super().closeEvent(event)
+
+
+# Per-source render parameters a Dual Projector eye window must inherit when it
+# is built mid-playback: the same four attributes _try_start_hevc writes on the
+# embedded/framepack pair at load time.
+_EYE_INHERITED_RENDER_PARAMS = ('plane_scale', 'source_aspect',
+                                'yuv_matrix_sel', 'transfer_sel')
+
+
+def _select_stereo_presentation_targets(embedded, framepacking_window, active,
+                                        eye_windows=None):
+    """Return ``[(widget, vsync), ...]`` for one decoded stereo frame.
+
+    With `eye_windows` set (Dual Projector), the two eye outputs REPLACE the
+    framepack window: they are the same picture cut in two, so presenting both
+    would upload every frame twice for nothing. The left eye is the timing
+    authority; the right eye and the main-window preview follow with interval 0,
+    because two vsync-blocking swapchains on two projectors can halve the
+    decoder cadence -- the same hazard the framepack/preview pair already
+    documents.
+    """
+    selected = []
+    seen = set()
+
+    def _visible(widget):
+        try:
+            return widget is not None and widget.isVisible()
+        except Exception:
+            return False
+
+    def _add(widget, vsync):
+        if widget is None or id(widget) in seen:
+            return
+        seen.add(id(widget))
+        selected.append((widget, bool(vsync)))
+
+    eye_widgets = []
+    for window in (eye_windows or ()):
+        widget = getattr(window, 'display_widget', None)
+        if _visible(window) and widget is not None:
+            eye_widgets.append(widget)
+
+    if eye_widgets:
+        for index, widget in enumerate(eye_widgets):
+            _add(widget, index == 0)
+        if _visible(embedded):
+            _add(embedded, False)
+        return selected
+
+    fp_widget = (getattr(framepacking_window, 'display_widget', None)
+                 if framepacking_window is not None else None)
+    fp_visible = _visible(framepacking_window) and fp_widget is not None
+
+    # Present the timing authority first. The main-window copy follows with
+    # interval 0, so the second swapchain cannot halve the decoder cadence.
+    if fp_visible:
+        _add(fp_widget, True)
+    if _visible(embedded):
+        _add(embedded, not fp_visible)
+
+    # During construction/visibility transitions, keep the active renderer warm.
+    if not selected:
+        _add(active, True)
+    return selected
 
 
 class PlayerWindow(QMainWindow):
@@ -2363,8 +2569,11 @@ class PlayerWindow(QMainWindow):
         # MVC related
         self.demuxer = None
         self.mvc_decoder_thread = None
+        self._mvc_leaked = []
+        self._mvc_shutdown_blocked = False
         self.mvc_mode_active = False
         self.framepacking_window = None  # Will be created when needed
+        self.eye_windows = None   # Dual Projector: (left, right) while active
 
         # V14b: State flags for graceful shutdown
         self._playback_ended = False
@@ -2495,9 +2704,16 @@ class PlayerWindow(QMainWindow):
         self._framepacking_visible = False
         self._last_stats_log_ts = 0.0
         self._last_decoder_activity_ts = time.monotonic()
+        self._last_watchdog_dump_ts = 0.0
         self._stall_watchdog = QTimer(self)
         self._stall_watchdog.setInterval(3000)
         self._stall_watchdog.timeout.connect(self._check_decoder_stall)
+        self._edge264_startup_timer = QTimer(self)
+        self._edge264_startup_timer.setSingleShot(True)
+        self._edge264_startup_timer.timeout.connect(self._on_edge264_startup_timeout)
+        self._edge264_waiting_for_first_frame = False
+        self._edge264_mpv_handoff_done = False
+        self._edge264_pre_handoff_widget = None
         # Do not start the watchdog now - it will be started when the MVC decoder starts
 
         # State
@@ -2506,6 +2722,7 @@ class PlayerWindow(QMainWindow):
         self.is_3d_enabled = False
         self.current_stereo_mode = 'auto'
         self.video_3d_info = None
+        self._bd_eye_order = UNKNOWN
         self.current_video_fps = 24.0
         self.current_file_path = None
         self._archiving = False  # True while a disc→ISO image runs (locks playback)
@@ -2513,6 +2730,11 @@ class PlayerWindow(QMainWindow):
         # live playback: the exporter uses its own detached decode instances).
         self._export_job = None
         self._export_dialog = None
+        # SyLC Cast (Task 13): the live cast session (CastController) or None when idle.
+        self._cast = None
+        self._cast_connected = False
+        self._cast_transport = None       # 'wifi' | 'usb' while a session is up (status lights)
+        self._cast_10bit_warned = False   # latch: notify once that 10-bit cast is v1-unsupported
         # EX-4 fix #2: ISO mount(s) whose dismount was skipped because a running
         # export job was still reading from that drive; retried when the job ends.
         self._deferred_iso_dismounts = []
@@ -2816,6 +3038,8 @@ class PlayerWindow(QMainWindow):
         # EX-4: MV-HEVC export entries of the unified « Sauvegarde / Export » menu.
         self.controls_overlay.export_mvhevc_requested.connect(self.start_mvhevc_export)
         self.controls_overlay.export_menu.aboutToShow.connect(self._update_export_menu_state)
+        # SyLC Cast (Task 13): « Diffuser vers Quest » (Wi-Fi/USB-C) toggles a cast session.
+        self.controls_overlay.cast_requested.connect(self._on_cast_requested)
         self.controls_overlay.mode_3d_toggled.connect(self.toggle_3d_mode)
         self.controls_overlay.stereo_mode_changed.connect(self.change_stereo_mode)
         self.controls_overlay.audio_track_changed.connect(self.change_audio_track)
@@ -2944,6 +3168,18 @@ class PlayerWindow(QMainWindow):
         if getattr(self, '_is_seeking', False):
             return
         self._is_seeking = True
+
+        # The cast audio is decoded independently from the same media. Seek it
+        # through its thread-safe request API at the same instant as mpv/video;
+        # otherwise it would race through every intermediate audio packet and
+        # flood the receiver after a large timeline jump.
+        _cast = getattr(self, '_cast', None)
+        if _cast is not None and getattr(_cast, 'is_active', False):
+            try:
+                _cast.seek_audio(round(float(time_pos) * 1000.0))
+            except Exception:
+                logger.exception("[CAST] Unable to align AudioTap with player seek")
+
         self.controls_overlay.time_slider.set_busy(True)
 
         # Clear PGS subtitle during seek
@@ -3106,6 +3342,24 @@ class PlayerWindow(QMainWindow):
         self._last_ui_time = target_time
         self._current_precise_time = target_time
 
+        # PGS subtitles: EVERY queue-driven seek must reset the subtitle state
+        # (visible set + streaming buffer + the parser's _fed_until watermark).
+        # This used to live only in _handle_seek_request, which the seek QUEUE
+        # path never traverses — after a BACKWARD disc seek the max-updated
+        # watermark stayed at the pre-seek position (log: 'fed=173.76s' frozen
+        # while clock replayed 138→170s), silently disabling the anti-flicker
+        # bridge for that whole window and briefly showing a pre-seek set.
+        if self._subtitle_manager:
+            try:
+                self._subtitle_manager.on_seek()
+            except Exception:
+                logger.exception("[SEEK] subtitle on_seek failed")
+        if self._text_sub_active and self._text_subtitle_renderer:
+            try:
+                self._text_subtitle_renderer.clear()
+            except Exception:
+                pass
+
     def _on_seek_completed_logic(self):
         """Called when seek finishes."""
         self._is_seeking = False
@@ -3253,6 +3507,37 @@ class PlayerWindow(QMainWindow):
         if not self._controls_shown():
             self.show_controls()
 
+    def _cursor_on_our_window(self):
+        """True only if the top-level window actually UNDER the cursor belongs
+        to this app. frameGeometry().contains() alone is blind to z-order: with
+        the player lying BEHIND the user's work window, every mouse move over
+        that shared screen area popped the (Tool-window) nav bar above the
+        other app — 'the player keeps putting itself on top every few seconds'.
+        WindowFromPoint sees the real stacking; GetCursorPos gives physical
+        pixels so no DPI conversion of QCursor.pos() is needed."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            pt = wintypes.POINT()
+            if not user32.GetCursorPos(ctypes.byref(pt)):
+                return True
+            user32.WindowFromPoint.argtypes = [wintypes.POINT]
+            user32.WindowFromPoint.restype = wintypes.HWND
+            hwnd = user32.WindowFromPoint(pt)
+            if not hwnd:
+                return False
+            GA_ROOT = 2
+            user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+            user32.GetAncestor.restype = wintypes.HWND
+            root = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
+            # Covers the main window AND every other top-level of ours (nav bar,
+            # framepack output, eye windows...) — mpv's embedded child resolves
+            # to the main window via GA_ROOT.
+            return QWidget.find(int(root)) is not None
+        except Exception:
+            return True     # non-Windows / API failure: keep legacy behavior
+
     def _nav_poll_tick(self):
         """SINGLE source of truth for the nav bar: show on movement inside the window,
         hide after 3 s (playing) / 5 s (paused) of no movement inside the window."""
@@ -3270,7 +3555,8 @@ class PlayerWindow(QMainWindow):
             moved = (pos - self._nav_last_cursor).manhattanLength() > 1
             self._nav_last_cursor = pos
             inside = (self.isVisible() and not self.isMinimized()
-                      and self.frameGeometry().contains(pos))
+                      and self.frameGeometry().contains(pos)
+                      and self._cursor_on_our_window())
             if moved and inside:
                 self._mark_activity()
                 return
@@ -3498,9 +3784,19 @@ class PlayerWindow(QMainWindow):
             self._last_timeline_update_time = time.monotonic()
             return
 
+        # HEVC native: _on_hevc_position (the decode thread's own pts) is the
+        # ONE authoritative UI clock. The mpv time-pos cache is frozen for
+        # no-audio media and the synthetic counter runs on a different origin;
+        # feeding either alongside the pts made _set_ui_time alternate between
+        # clocks more than 1 s apart (the backward filter treats >1 s as a
+        # seek) — the slider snapped back and forth at up to ~8 Hz.
+        if getattr(self, '_hevc_mode_active', False):
+            self._last_timeline_update_time = time.monotonic()
+            return
+
         try:
             new_time = None
-            
+
             # 1. Try MVC Timestamp (most accurate for SINGLE-clip video). For a multi-segment
             # (seamless-branching) feature the decoder's frame timestamp is per-clip and snaps
             # back at each segment junction, so we use mpv's continuous GLOBAL edl:// clock
@@ -3593,9 +3889,10 @@ class PlayerWindow(QMainWindow):
         if getattr(self, '_mpv_transition_in_progress', False):
             return
         # Schedule UI updates on main thread to avoid timer threading issues
-        QTimer.singleShot(0, lambda: self._handle_pause_change(is_paused))
+        QTimer.singleShot(0, lambda: self._handle_pause_change(is_paused,
+                                                              from_observer=True))
 
-    def _handle_pause_change(self, is_paused):
+    def _handle_pause_change(self, is_paused, from_observer=False):
         """Handle pause state change in main Qt thread"""
         try:
             # CRITICAL FIX V2: If playback has ended, ignore MPV callbacks
@@ -3607,6 +3904,19 @@ class PlayerWindow(QMainWindow):
             # V14b: Ignore callbacks during MPV transition to prevent exceptions
             if getattr(self, '_mpv_transition_in_progress', False):
                 logger.info("[PAUSE CHANGE] Ignored - MPV transition in progress")
+                return
+
+            # HEVC native + a file mpv has NOTHING of (no audio track, vid=no):
+            # the mpv shell then pauses BY ITSELF a few seconds in, and that
+            # spontaneous report used to freeze the whole transport (is_playing
+            # False, timeline timer stopped, hevc thread paused) while the
+            # native video kept playing. mpv's own reports carry no meaning for
+            # such a file — drop them; user intent still arrives through the
+            # direct calls (toggle_play, seek queue, cast).
+            if (from_observer and getattr(self, '_hevc_mode_active', False)
+                    and getattr(self, '_mpv_shell_inert', False)):
+                logger.info("[PAUSE CHANGE] Ignored - inert mpv shell (no audio), "
+                            "HEVC native drives the transport")
                 return
 
             # Robust boolean conversion for MPV property
@@ -3621,12 +3931,14 @@ class PlayerWindow(QMainWindow):
                 # V14b RENDER HEARTBEAT: Stop heartbeat when paused
                 if self._render_heartbeat_timer.isActive():
                     self._render_heartbeat_timer.stop()
-                # V7b FIX: In MVC mode, keep the timer active even when paused so the cursor progresses
-                if not (self.mvc_mode_active or getattr(self, '_mvc_file_detected', False)):
+                # V7b FIX: In MVC mode — and HEVC native mode, same native-transport
+                # situation — keep the timer active even when paused so the cursor progresses
+                if not (self.mvc_mode_active or getattr(self, '_mvc_file_detected', False)
+                        or getattr(self, '_hevc_mode_active', False)):
                     self._playback_timer.stop()  # Stop the timeline update
                     logger.info(f"[TIMELINE] Timer stopped (MVC: {self.mvc_mode_active}, detected: {getattr(self, '_mvc_file_detected', False)})")
                 else:
-                    logger.info(f"[TIMELINE] Timer kept active (MVC: {self.mvc_mode_active}, detected: {getattr(self, '_mvc_file_detected', False)})")
+                    logger.info(f"[TIMELINE] Timer kept active (MVC: {self.mvc_mode_active}, detected: {getattr(self, '_mvc_file_detected', False)}, hevc: {getattr(self, '_hevc_mode_active', False)})")
                 self.show_controls()
                 # Notify decoder
                 if self.mvc_decoder_thread:
@@ -3675,24 +3987,56 @@ class PlayerWindow(QMainWindow):
     def toggle_play(self):
         if getattr(self, '_archiving', False):
             return  # playback is locked while a disc image is being written
+        # REPLAY: after an end of stream the pipelines are torn down and a bare
+        # un-pause has nothing to drive (_handle_pause_change ignores it while
+        # _playback_ended is set; the 2D mpv EOF goes through stop_playback,
+        # which drops has_media). In both end states the last file path is
+        # still known — pressing play relaunches it from the start instead of
+        # doing nothing. Also covers play-after-Stop, the same dead state.
+        last = getattr(self, 'current_file_path', None)
+        if last and (getattr(self, '_playback_ended', False) or not self.has_media):
+            if getattr(self, '_is_loading_file', False):
+                return  # a (re)load is already in flight — ignore double-clicks
+            logger.info(f"[REPLAY] play pressed after end/stop — reloading {last}")
+            self.play_file(last)
+            return
         if self.has_media and self.player:
             try:
-                # Normalize MPV property which might be string or None
-                raw_pause = self.player.pause
-                current_pause = raw_pause is True or raw_pause == 'yes' or raw_pause == 'true'
-                
-                new_pause = not current_pause
+                # self.is_playing is the pause state's single source of truth, not
+                # self.player.pause. In MVC mode the native decoder drives the
+                # picture while mpv is deliberately kept paused (see "keeping MPV
+                # paused until decoder ready"), so mpv.pause reads True during
+                # playback. Deriving the toggle from it computed the wrong
+                # direction on the first click -- it "un-paused" an already
+                # playing stream (the visible micro-glitch is resume()'s clock
+                # reset), and only the second click actually paused. is_playing is
+                # kept correct across the 2D (mpv observer), MVC and HEVC paths by
+                # _handle_pause_change, so it toggles right in every mode.
+                new_pause = self.is_playing
+
                 self._safe_mpv_set_pause(new_pause)
-                
+
                 # CRITICAL FIX: Directly handle pause change to ensure immediate video stop
                 # Relying solely on MPV callback can be unreliable if MPV thread is busy
                 self._handle_pause_change(new_pause)
             except:
                 pass
 
+    def _set_playback_stopped_ui(self):
+        """Synchronously reset transport state; never wait for an MPV callback."""
+        self.is_playing = False
+        overlay = getattr(self, 'controls_overlay', None)
+        if overlay is not None:
+            overlay.set_playback_stopped()
+
     def stop_playback(self):
         """Stops playback, resets position, and clears decoder state."""
-        if not self.has_media: return
+        # Do this before every early return. During teardown MPV pause callbacks
+        # are intentionally ignored, so they cannot be the source of truth for
+        # the button's stopped appearance.
+        self._set_playback_stopped_ui()
+        if not self.has_media:
+            return
 
         # If MVC EOS handler already ran, the decoder is being / was already torn
         # down via its own 300ms timer. Re-running the full sequence here would
@@ -3708,12 +4052,16 @@ class PlayerWindow(QMainWindow):
         # VISUAL FIX: Hide windows IMMEDIATELY to prevent strobe of old frame
         if hasattr(self, 'framepacking_window') and self.framepacking_window:
             self.framepacking_window.hide()
-            if hasattr(self.framepacking_window.display_widget, 'clear_textures'):
-                self.framepacking_window.display_widget.clear_textures()
-                
+
+        # Clear EVERY display widget, not just the framepack/preview pair: Dual
+        # Projector's eye windows are not hidden by Stop (they stay open until
+        # the user leaves the mode), so an uncleared one holds the last decoded
+        # frame frozen on its projector indefinitely.
+        for _w in self._display_widgets():
+            if hasattr(_w, 'clear_textures'):
+                _w.clear_textures()
         if hasattr(self, 'mvc_embedded_widget') and self.mvc_embedded_widget:
             if hasattr(self.mvc_embedded_widget, 'clear_textures'):
-                self.mvc_embedded_widget.clear_textures()
                 self.mvc_embedded_widget.update()
 
         self._playback_timer.stop()  # Stop the timeline update
@@ -3927,7 +4275,6 @@ class PlayerWindow(QMainWindow):
                 self.framepacking_window.display_widget.set_stereo_mode('framepack')
                 self.framepacking_window.enter_fake_fullscreen()
                 self.framepacking_window.raise_()
-                self.framepacking_window.activateWindow()
 
             logger.info(f"[FULLSCREEN-WIN32] Entered fake fullscreen {mon_w}x{mon_h} (HDR preserved)")
 
@@ -4208,8 +4555,35 @@ class PlayerWindow(QMainWindow):
                 else:
                     self.show_3d_notification("2D File", success=True, permanent=True)
 
+    def _display_widgets(self):
+        """Every live display widget: the embedded preview, the framepack
+        window's, and — in Dual Projector mode — each eye window's.
+        Several call sites used to hardcode the first two as a pair, which
+        silently excluded the eye windows from subtitles and from every
+        per-source render parameter."""
+        seen = set()
+        windows = (getattr(self, 'framepacking_window', None),
+                   *(getattr(self, 'eye_windows', None) or ()))
+        for widget in (getattr(self, 'mvc_embedded_widget', None),
+                       *(getattr(w, 'display_widget', None) for w in windows)):
+            if widget is None or id(widget) in seen:
+                continue
+            seen.add(id(widget))
+            yield widget
+
     def change_stereo_mode(self, mode):
         self.current_stereo_mode = mode
+        # Dual Projector owns the detached output while selected; any other
+        # presentation gives it back to the framepack/main-window paths.
+        # The `has_media and is_3d_enabled` conjunction mirrors the guard the
+        # sibling enforcement site in configure_3d_output applies: picking this
+        # presentation while 3D is OFF used to open two windows that no frame
+        # would ever reach (the combo stays enabled for any 3D content,
+        # independently of the 3D toggle) -- two black rectangles on the
+        # projectors. `mode == 'dual'` is evaluated first, so for every other
+        # presentation the call is False exactly as before.
+        self._set_dual_projector_enabled(
+            mode == 'dual' and self.has_media and self.is_3d_enabled)
         # I3: live stereo-mode switch for the HEVC path — the decode thread splits packed
         # frames per its _mode, so push the new mode and it takes effect on the NEXT frame
         # (no decoder restart). configure_3d_output below drives the MVC/native paths.
@@ -4231,14 +4605,11 @@ class PlayerWindow(QMainWindow):
                 mi = getattr(self, 'hevc_media_info', None)
                 if mi is not None and getattr(self, '_hevc_half', False):
                     aspect = float(mi.width) / float(mi.height)
-                    for _w in (getattr(self, 'mvc_embedded_widget', None),
-                               getattr(getattr(self, 'framepacking_window', None),
-                                       'display_widget', None)):
-                        if _w is not None:
-                            try:
-                                _w.source_aspect = aspect
-                            except Exception:
-                                pass
+                    for _w in self._display_widgets():
+                        try:
+                            _w.source_aspect = aspect
+                        except Exception:
+                            pass
             except Exception:
                 pass
         if self.has_media and self.is_3d_enabled:
@@ -4349,6 +4720,15 @@ class PlayerWindow(QMainWindow):
                     label = _friendly_track_label(track, 'audio', lang_map)
                     audio_tracks.append((track_id, label, ''))  # label is already complete
             print(f"Audio tracks found: {len(audio_tracks)}")
+            # In the native modes mpv exists ONLY to play the audio. With no
+            # audio track it has literally nothing to do (vid=no) and its
+            # spontaneous pause/EOF reports are noise — flag it so
+            # _handle_pause_change ignores observer-side reports.
+            self._mpv_shell_inert = not audio_tracks
+            if self._mpv_shell_inert and (self.mvc_mode_active
+                                          or getattr(self, '_hevc_mode_active', False)):
+                logger.info("[TRANSPORT] no audio track: mpv shell marked inert "
+                            "(native pipeline drives the transport)")
             self.controls_overlay.update_audio_tracks(audio_tracks)
         except Exception as e:
             print(f"Error fetching audio tracks: {e}")
@@ -4642,18 +5022,17 @@ class PlayerWindow(QMainWindow):
 
     def _connect_subtitle_to_widget(self, widget=None):
         """Connect SubtitleManager signals to EVERY active MVC display widget — the embedded
-        2D view in the main window AND the separate 3D FramePack window — so PGS subtitles
-        appear on both, not only the active one (in 3D mode the embedded 2D view stays
-        visible for sync, so it needs the overlay too)."""
+        2D view in the main window, the separate 3D FramePack window AND, in Dual Projector
+        mode, each eye window — so PGS subtitles appear on all of them, not only the active
+        one (in 3D mode the embedded 2D view stays visible for sync, so it needs the overlay
+        too)."""
         if not self._subtitle_manager:
             return
 
         try:
             # Gather every display widget that can render a subtitle overlay (dedup, keep order)
             widgets = []
-            for w in (getattr(self, 'mvc_embedded_widget', None),
-                      getattr(getattr(self, 'framepacking_window', None), 'display_widget', None),
-                      widget):
+            for w in (*self._display_widgets(), widget):
                 if (w is not None and w not in widgets
                         and hasattr(w, 'set_subtitle') and hasattr(w, 'clear_subtitle')):
                     widgets.append(w)
@@ -4795,9 +5174,10 @@ class PlayerWindow(QMainWindow):
     @Slot(float)
     def _on_pg_depth_changed(self, disparity):
         """Apply the BD3D per-GOP authored PG depth to every display widget."""
-        for w in (getattr(self, 'active_mvc_widget', None),
-                  getattr(self, 'mvc_embedded_widget', None),
-                  getattr(getattr(self, 'framepacking_window', None), 'display_widget', None)):
+        # Latched so an eye window opened LATER (Dual Projector is picked mid-film)
+        # starts at the depth currently in force instead of waiting for the next GOP.
+        self._pg_depth_last = disparity
+        for w in (getattr(self, 'active_mvc_widget', None), *self._display_widgets()):
             if w is not None and hasattr(w, 'set_subtitle_depth'):
                 w.set_subtitle_depth(disparity)
         if not getattr(self, '_pg_depth_logged', False):
@@ -4822,9 +5202,7 @@ class PlayerWindow(QMainWindow):
             return
         try:
             widgets = []
-            for w in (getattr(self, 'active_mvc_widget', None),
-                      getattr(self, 'mvc_embedded_widget', None),
-                      getattr(getattr(self, 'framepacking_window', None), 'display_widget', None)):
+            for w in (getattr(self, 'active_mvc_widget', None), *self._display_widgets()):
                 if (w is not None and w not in widgets
                         and hasattr(w, 'set_subtitle') and hasattr(w, 'clear_subtitle')):
                     widgets.append(w)
@@ -5160,6 +5538,40 @@ class PlayerWindow(QMainWindow):
         logger.info("[ARCHIVE] playback lock released")
 
     # ===================== MV-HEVC export (EX-4) =====================
+    def _export_eye_order_override(self):
+        """Return the explicit export-menu choice, or ``unknown`` for Auto."""
+        ov = getattr(self, 'controls_overlay', None)
+        try:
+            if ov.export_eye_left_action.isChecked():
+                return LEFT_FIRST
+            if ov.export_eye_right_action.isChecked():
+                return RIGHT_FIRST
+        except Exception:
+            pass
+        return UNKNOWN
+
+    def _export_desc_with_eye_order(self, desc, detected_order, source):
+        """Attach an auditable eye-order decision to an exporter descriptor."""
+        override = self._export_eye_order_override()
+        detected = normalise_eye_order(detected_order)
+        if override != UNKNOWN:
+            desc['eye_order'] = override
+            desc['eye_order_source'] = 'user override'
+        else:
+            desc['eye_order'] = detected
+            desc['eye_order_source'] = source if detected != UNKNOWN else 'not signalled'
+        # The exporter probes duration itself, but the player already has a
+        # container-duration verdict.  Preserve it as a fallback for optical or
+        # unusual demuxers whose ffprobe AVStream fields are empty.
+        info = getattr(self, 'video_3d_info', None) or {}
+        try:
+            duration_hint = float(info.get('duration') or 0.0)
+        except (TypeError, ValueError):
+            duration_hint = 0.0
+        if duration_hint > 0.0:
+            desc['duration_s'] = duration_hint
+        return desc
+
     def _is_half_packed_source(self):
         """True if the currently loaded packed-stereo (sbs/tab) source is
         HALF-packed (each eye squeezed anamorphically into half the packed frame,
@@ -5192,9 +5604,10 @@ class PlayerWindow(QMainWindow):
         (hevc_media_info.multiview) is resolved BEFORE the generic MVC branch,
         and the dual-file pair before the single-file MVC branch. Shapes mirror
         mvhevc_exporter.build_adapter / tests\\export\\test_exporter.py:
-          packed  -> {'path','kind':'packed','packing':'sbs'|'tab'}
-          mvhevc  -> {'path','kind':'mvhevc'}
-          mvc     -> {'path','kind':'mvc'[, 'mvc_container':'dual','dep_path']}
+          packed  -> {'path','kind':'packed','packing':'sbs'|'tab','eye_order'}
+          mvhevc  -> {'path','kind':'mvhevc','eye_order'}
+          mvc     -> {'path','kind':'mvc','eye_order'
+                      [, 'mvc_container':'dual','dep_path']}
         """
         if not self._content_is_3d():
             return None
@@ -5204,25 +5617,55 @@ class PlayerWindow(QMainWindow):
         # 1) native MV-HEVC (avcodec / LavfHevcSource multiview) — remux fast-path
         mi = getattr(self, 'hevc_media_info', None)
         if mi is not None and getattr(mi, 'multiview', False):
-            return {'path': path, 'kind': 'mvhevc'} if path else None
+            if not path:
+                return None
+            # LavfHevcSource already returns a semantic (left,right) pair using
+            # left_view_id.  "right first" here is therefore only a deliberate
+            # user override and forces the exporter out of the remux fast-path.
+            return self._export_desc_with_eye_order(
+                {'path': path, 'kind': 'mvhevc'}, LEFT_FIRST,
+                'MV-HEVC left_view_id mapping')
 
         sm = info.get('stereo_mode')
         # 2) MVC (BD dual-file / SSIF / single-file MKV-M2TS)
         if sm == 'mvc' or info.get('has_mvc_track'):
+            mvc_order = normalise_eye_order(
+                getattr(self, '_bd_eye_order', UNKNOWN))
+            mvc_source = 'Blu-ray MPLS MVC_Base_view_R_flag'
+            if mvc_order == UNKNOWN:
+                mvc_order = normalise_eye_order(info.get('eye_order'))
+                mvc_source = info.get('eye_order_source') or 'Matroska StereoMode'
             pair = getattr(self, '_bd_dual_file_pair', None)
             if getattr(self, '_bd_dual_active', False) and pair and len(pair) == 2:
                 base, dep = pair[0], pair[1]
                 if base and dep and os.path.isfile(base) and os.path.isfile(dep):
-                    return {'path': base, 'kind': 'mvc',
-                            'mvc_container': 'dual', 'dep_path': dep}
-            return {'path': path, 'kind': 'mvc'} if path else None
+                    return self._export_desc_with_eye_order(
+                        {'path': base, 'kind': 'mvc',
+                         'mvc_container': 'dual', 'dep_path': dep},
+                        mvc_order, mvc_source)
+            if not path:
+                return None
+            return self._export_desc_with_eye_order(
+                {'path': path, 'kind': 'mvc'}, mvc_order, mvc_source)
 
         # 3) packed Full-SBS / Full-TAB (H.264 or HEVC) — HALF-packed sources are
         # refused (v1 export spec is Full only; see _is_half_packed_source).
         if sm in ('sbs', 'tab'):
             if self._is_half_packed_source():
                 return None
-            return {'path': path, 'kind': 'packed', 'packing': sm} if path else None
+            if not path:
+                return None
+            packed_order = normalise_eye_order(info.get('eye_order'))
+            packed_source = info.get('eye_order_source') or 'container metadata'
+            # The avcodec HEVC path has the authoritative AVStereo3D flag even
+            # when this ffprobe build omitted it from Video3DAnalyzer.
+            if (mi is not None and not getattr(mi, 'multiview', False)
+                    and getattr(mi, 'stereo_hint', None) == sm):
+                packed_order = (RIGHT_FIRST if mi.stereo_inverted else LEFT_FIRST)
+                packed_source = 'AVStereo3D side data'
+            return self._export_desc_with_eye_order(
+                {'path': path, 'kind': 'packed', 'packing': sm},
+                packed_order, packed_source)
 
         return None
 
@@ -5258,7 +5701,7 @@ class PlayerWindow(QMainWindow):
                       and not getattr(self, '_archiving', False))
             ov.iso_action.setEnabled(iso_ok)
             ov.iso_action.setToolTip(
-                "" if iso_ok else "Disponible uniquement pour un disque Blu-ray inséré.")
+                "" if iso_ok else "Available only for an inserted Blu-ray disc.")
         except Exception:
             pass
         # --- « Exporter en MV-HEVC » ---
@@ -5267,35 +5710,303 @@ class PlayerWindow(QMainWindow):
             desc = self._current_export_source_desc()
             missing = self._export_tools_missing()
             busy = self._export_job is not None and self._export_job.isRunning()
-            title = "Exporter en MV-HEVC (.mov)"
+            title = "Export to MV-HEVC (.mov)"
             if desc is None:
                 enabled = False
                 if self._is_half_packed_source():
-                    tip = ("Format half (demi-résolution) non exportable en "
-                           "MV-HEVC (v1 : Full-SBS/Full-TAB uniquement).")
+                    tip = ("Half-resolution formats cannot be exported to MV-HEVC "
+                           "(v1 supports Full-SBS/Full-TAB only).")
                 else:
-                    tip = ("Aucune source 3D exportable — chargez un fichier MVC, "
-                           "MV-HEVC, Full-SBS ou Full-TAB.")
+                    tip = ("No exportable 3D source — load an MVC, MV-HEVC, "
+                           "Full-SBS or Full-TAB file.")
             elif missing:
                 enabled = False
-                tip = ("Outil d'export manquant : " + ", ".join(missing)
-                       + " (tools\\x265 + tools\\gpac ; ffmpeg/ffprobe sur le PATH).")
+                tip = ("Missing export tool: " + ", ".join(missing)
+                       + " (tools\\x265 + tools\\gpac; ffmpeg/ffprobe on PATH).")
             elif busy:
                 enabled = False
-                tip = "Un export MV-HEVC est déjà en cours."
+                tip = "An MV-HEVC export is already running."
             else:
                 enabled = True
                 tip = ""
-                if desc.get('kind') == 'mvhevc':
-                    title = "Exporter en MV-HEVC (copie sans réencodage)"
+                if (desc.get('kind') == 'mvhevc'
+                        and normalise_eye_order(desc.get('eye_order')) != RIGHT_FIRST):
+                    title = "Export to MV-HEVC (no re-encoding)"
             sub.setTitle(title)
             sub.setEnabled(enabled)
+            eye_menu = getattr(ov, 'export_eye_order_menu', None)
+            if eye_menu is not None:
+                order = normalise_eye_order(
+                    desc.get('eye_order') if desc else UNKNOWN)
+                order_label = {
+                    LEFT_FIRST: "Left first",
+                    RIGHT_FIRST: "Right first",
+                    UNKNOWN: "Ask on export",
+                }[order]
+                eye_menu.setTitle(f"Source eye order  ·  {order_label}")
+                eye_menu.setEnabled(desc is not None and not busy)
             ma = sub.menuAction()
             if ma is not None:
                 ma.setEnabled(enabled)
                 ma.setToolTip(tip)
         except Exception as e:
             logger.debug(f"[EXPORT] menu state refresh failed: {e}")
+        # --- « Diffuser vers Quest » : live 3D session + NVENC cast pipeline ---
+        try:
+            cast_sub = getattr(ov, 'cast_menu', None)
+            if cast_sub is not None:
+                if self._cast is not None:
+                    # Already casting -> keep it enabled so the user can toggle it off.
+                    cast_ok, ctip = True, ""
+                else:
+                    renderer = self._cast_renderer()
+                    # A 3D session is either the classic edge264/MVC path (mvc_mode_active)
+                    # OR the HEVC 3D path (_hevc_mode_active) — the latter never sets
+                    # mvc_mode_active, so gate on both (repo idiom, see :3356). _cast_renderer()
+                    # resolves the framepack display renderer for both.
+                    session_3d = (getattr(self, 'mvc_mode_active', False)
+                                  or getattr(self, '_hevc_mode_active', False))
+                    if not session_3d or renderer is None:
+                        cast_ok = False
+                        ctip = ("Available during 3D playback "
+                                "(MultiView / Framepack mode).")
+                    else:
+                        try:
+                            avail = bool(renderer.cast_available())
+                        except Exception:
+                            avail = False
+                        cast_ok = avail
+                        ctip = "" if avail else (
+                            "Streaming unavailable — no NVENC encoder "
+                            "(NVIDIA GPU) was found.")
+                cast_sub.setEnabled(cast_ok)
+                cma = cast_sub.menuAction()
+                if cma is not None:
+                    cma.setEnabled(cast_ok)
+                    cma.setToolTip(ctip)
+        except Exception as e:
+            logger.debug(f"[CAST] menu state refresh failed: {e}")
+
+    # ===== SyLC Cast (Task 13): « Diffuser vers Quest » ================================
+    class _DemuxerStreamTapSource:
+        """Cast-audio source for optical discs: serves the SSIF demuxer's
+        stream tap — bytes the demuxer ALREADY pulls off the disc — so the
+        cast's AudioTap demuxes audio with ZERO additional disc readers (a
+        third reader on the optical head froze playback: 8.4s+ single demux
+        reads measured). Duck-typed for AudioTap's stream mode: read(n) ->
+        bytes (b'' when none pending, never blocking), close() detaches the
+        tee (called by AudioTap.stop() once its worker is joined)."""
+
+        def __init__(self, demuxer, label):
+            self._demuxer = demuxer
+            self.name = label
+
+        def read(self, n):
+            try:
+                return self._demuxer.read_stream_tap(n)
+            except Exception:
+                return b""
+
+        def close(self):
+            try:
+                self._demuxer.disable_stream_tap()
+            except Exception:
+                pass
+
+    def _is_optical_class_source(self, path):
+        """True when `path` sits on an optical-class volume — physical disc OR
+        player-mounted ISO. The class where ONE MORE concurrent reader breaks
+        playback: the single optical head already serves the video demuxer AND
+        mpv's audio; a third reader causes the measured 45-120s seek thrash
+        (same policy, same detection as the thumbnail gate)."""
+        if not path:
+            return False
+        try:
+            import disc_archiver as da
+            optical = set(da.list_optical_drives())
+        except Exception:
+            optical = set()
+        try:
+            _mode, is_optical = _decide_thumbs_mode(
+                path, self._mounted_iso_letters(), optical, None)
+            return bool(is_optical)
+        except Exception:
+            return False
+
+    def _cast_media_path(self):
+        """Audio source for the cast's independent AudioTap decode.
+
+        Regular files: the file path (AudioTap opens its own avformat reader —
+        harmless on HDD/SSD). Optical-class sources (physical disc / mounted
+        ISO): NEVER a path — a third concurrent reader on the single optical
+        head froze playback (8.4s+ single demux reads measured). Instead, the
+        SSIF demuxer TEES the bytes it already reads (enable_stream_tap) and
+        AudioTap demuxes the audio from that stream: full disc audio on the
+        headset, zero additional disc I/O. If no tappable demuxer is up
+        (shouldn't happen during 3D disc playback), the cast degrades to
+        video-only rather than ever touching the head."""
+        p = getattr(self, 'current_file_path', None)
+        if not p:
+            return None
+        if not self._is_optical_class_source(p):
+            return p
+        demux = getattr(getattr(self, 'mvc_decoder_thread', None), 'demuxer', None)
+        if demux is not None and hasattr(demux, 'enable_stream_tap'):
+            try:
+                if demux.enable_stream_tap(32 * 1024 * 1024):
+                    logger.info("[CAST] optical source: cast audio demuxed from the "
+                                "demuxer's stream tap (no extra disc reader)")
+                    return self._DemuxerStreamTapSource(demux, os.path.basename(p))
+            except Exception:
+                logger.exception("[CAST] enable_stream_tap failed")
+        logger.info("[CAST] optical-class source without a tappable demuxer "
+                    "-> video-only cast")
+        return None
+
+    def _cast_renderer(self):
+        """The NativeRenderer the cast encodes from.
+
+        Preferred source: the framepack DISPLAY widget's renderer (Task 13, the
+        user's « option a »: share the display's renderer/upload — the framepack
+        surface is guaranteed genuine L+R stereo, so the zero-re-upload path
+        applies). FALLBACK: the embedded preview widget's renderer, so casting
+        no longer requires the framepack window to have been opened. On that
+        renderer the frame handler's identity check naturally reports
+        frame_already_uploaded=False (the preview only holds one eye), so
+        CastController.push() uploads BOTH eyes itself — full stereo on the
+        headset either way, at the cost of the ~6 MiB/frame upload the shared
+        framepack path avoids. Subtitles follow too: the preview widget receives
+        the same PGS/uniform state as every display widget."""
+        for holder in (getattr(getattr(self, 'framepacking_window', None),
+                               'display_widget', None),
+                       getattr(self, 'mvc_embedded_widget', None)):
+            r = getattr(holder, '_r', None) if holder is not None else None
+            if r is not None and r is not False:
+                return r
+        return None
+
+    def _on_cast_requested(self, transport):
+        """« Diffuser vers Quest » clicked (transport 'wifi'|'usb'). Toggles the cast
+        session: a request while already casting tears the current session down."""
+        # Already casting -> toggle OFF (idempotent stop; clear the reference).
+        if self._cast is not None:
+            try:
+                self._cast.stop()
+            except Exception:
+                logger.exception("[CAST] stop failed")
+            self._cast = None
+            self._cast_connected = False
+            self._cast_transport = None
+            self.controls_overlay.set_cast_transport_state(None)
+            self.show_3d_notification("Streaming to Quest stopped.", success=True)
+            return
+
+        # Defense in depth (the menu gate already enforces this): a live 3D session
+        # and an NVENC-capable renderer are required.
+        renderer = self._cast_renderer()
+        session_3d = (getattr(self, 'mvc_mode_active', False)
+                      or getattr(self, '_hevc_mode_active', False))
+        if renderer is None or not session_3d:
+            self.show_3d_notification(
+                "Streaming unavailable — start 3D playback first.", success=False)
+            return
+        try:
+            if not renderer.cast_available():
+                self.show_3d_notification(
+                    "Streaming unavailable — no NVENC encoder (NVIDIA GPU) was found.",
+                    success=False)
+                return
+        except Exception:
+            logger.exception("[CAST] cast_available() check failed")
+            self.show_3d_notification("Streaming unavailable.", success=False)
+            return
+        try:
+            from cast_sender.cast_controller import CastController
+        except Exception as e:
+            logger.exception("[CAST] CastController import failed")
+            self.show_3d_notification(f"Streaming unavailable: {e}", success=False)
+            return
+
+        self._cast_connected = False
+        self._cast_10bit_warned = False   # fresh session -> allow the 10-bit notice once
+        cast = CastController(renderer,
+                              media_path_provider=self._cast_media_path,
+                              clock_ms=self._mpv_time_pos_ms,
+                              reuse_uploaded_frame=True)
+        cast.seekRequested.connect(self._on_cast_seek)
+        cast.pauseRequested.connect(self._on_cast_pause)
+        cast.statusChanged.connect(self._on_cast_status)
+        # Publish BEFORE start(): start() brings up the IO thread and start() itself is
+        # slow-ish; a frame tap firing meanwhile calls push(), which no-ops safely while
+        # the loop is still coming up. If start() fails it self-tears-down -> is_active
+        # is False and we drop the dead reference.
+        self._cast = cast
+        # HDR cast: a 10-bit PQ HEVC source goes out as Main10/P010 with its PQ
+        # signalling; everything else keeps the 8-bit SDR session. (The Quest's
+        # panels are not true HDR, but its compositor's contrast enhancement
+        # reads the PQ declaration — and correctness beats guessing.)
+        main10 = bool(getattr(self, '_hevc_mode_active', False)
+                      and getattr(self, '_hevc_pq10', False))
+        if main10:
+            logger.info("[CAST] 10-bit PQ source -> HEVC Main10 HDR cast session")
+        cast.start(transport, quality="auto", main10=main10)
+        if not cast.is_active:
+            self._cast = None      # start() failed; _on_cast_status already surfaced why
+            return
+        self._cast_transport = transport
+        # Status light: session up on this transport, Quest not attached yet
+        # (orange). Turns green from _on_cast_status when the client connects.
+        self.controls_overlay.set_cast_transport_state(transport, False)
+        label = "Wi-Fi" if transport == "wifi" else "USB-C"
+        if cast.audio_active:
+            self.show_3d_notification(f"Streaming to Quest ({label})…", success=True)
+        else:
+            self.show_3d_notification(
+                f"Streaming to Quest ({label})… video only (no audio source).",
+                success=True)
+
+    def _on_cast_seek(self, pos_ms):
+        """Cast client asked to seek: drive the player's normal seek path (ms -> s)."""
+        try:
+            self.on_seek(int(pos_ms) / 1000.0)
+        except Exception:
+            logger.exception("[CAST] seek from client failed")
+
+    def _on_cast_pause(self, paused):
+        """Cast client asked to pause/resume: mirror the play/pause button path so mpv,
+        the decoder and the UI all follow (same two calls toggle_play() makes)."""
+        try:
+            self._safe_mpv_set_pause(bool(paused))
+            self._handle_pause_change(bool(paused))
+        except Exception:
+            logger.exception("[CAST] pause from client failed")
+
+    def _on_cast_status(self, status):
+        """Light cast status handler: surface errors + the first client connect, log
+        the rest. Called ~1/s while casting (throttled by the controller)."""
+        try:
+            err = status.get('error') if isinstance(status, dict) else None
+            if err:
+                self.show_3d_notification(f"Streaming to Quest: {err}", success=False)
+                logger.warning("[CAST] %s", err)
+                # An errored session tears itself down -> lights off.
+                self._cast_transport = None
+                self.controls_overlay.set_cast_transport_state(None)
+                return
+            connected = bool(status.get('connected'))
+            if connected and not self._cast_connected:
+                self.show_3d_notification("Quest connected — streaming.", success=True)
+            self._cast_connected = connected
+            # Status light: green while the Quest is attached, orange while the
+            # session waits for it (incl. the paused-on-client-lost state), off
+            # once no session is active.
+            active = (self._cast is not None
+                      and getattr(self._cast, 'is_active', False))
+            self.controls_overlay.set_cast_transport_state(
+                self._cast_transport if active else None, connected)
+            logger.debug("[CAST] status: %s", status)
+        except Exception:
+            pass
 
     def _resolve_export_out_path(self, src_path):
         """Default output = <source_basename>_MVHEVC.mov beside the source. For a
@@ -5316,10 +6027,46 @@ class PlayerWindow(QMainWindow):
         if writable and not on_optical:
             return os.path.join(src_dir, name)
         out_dir = QFileDialog.getExistingDirectory(
-            self, "Exporter en MV-HEVC — dossier de destination", os.path.expanduser('~'))
+            self, "Export to MV-HEVC — destination folder", os.path.expanduser('~'))
         if not out_dir:
             return None
         return os.path.join(out_dir, name)
+
+    def _resolve_unknown_export_eye_order(self, desc):
+        """Require an explicit decision when the source carries no eye mapping."""
+        if normalise_eye_order(desc.get('eye_order')) != UNKNOWN:
+            return True
+        if desc.get('kind') == 'mvc':
+            subject = "the MVC base view"
+        elif desc.get('packing') == 'tab':
+            subject = "the first (top) packed image"
+        else:
+            subject = "the first (left) packed image"
+        reply = QMessageBox.question(
+            self, "Source eye order",
+            "This source does not contain trustworthy left/right eye metadata.\n\n"
+            f"Is {subject} the LEFT eye?\n\n"
+            "Yes = left eye first   •   No = right eye first",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes)
+        if reply not in (QMessageBox.StandardButton.Yes,
+                          QMessageBox.StandardButton.No):
+            return False
+        order = (LEFT_FIRST if reply == QMessageBox.StandardButton.Yes
+                 else RIGHT_FIRST)
+        desc['eye_order'] = order
+        desc['eye_order_source'] = 'user confirmation (metadata absent)'
+        try:
+            action = (self.controls_overlay.export_eye_left_action
+                      if order == LEFT_FIRST
+                      else self.controls_overlay.export_eye_right_action)
+            action.setChecked(True)
+        except Exception:
+            pass
+        logger.info("[EXPORT] ambiguous source eye order resolved by user: %s", order)
+        return True
 
     def start_mvhevc_export(self, quality='quality'):
         """EX-4 entry point: launch a background MV-HEVC export of the CURRENT 3D
@@ -5328,7 +6075,7 @@ class PlayerWindow(QMainWindow):
         so playback of the same (or any) file continues undisturbed. One export
         job at a time (a second request is politely refused)."""
         if self._export_job is not None and self._export_job.isRunning():
-            self.show_3d_notification("Un export MV-HEVC est déjà en cours.", success=False)
+            self.show_3d_notification("An MV-HEVC export is already running.", success=False)
             return
         desc = self._current_export_source_desc()
         if desc is None:
@@ -5338,17 +6085,19 @@ class PlayerWindow(QMainWindow):
             # same specific reason rather than the generic "no source" message.
             if self._is_half_packed_source():
                 self.show_3d_notification(
-                    "Format half (demi-résolution) non exportable en MV-HEVC "
-                    "(v1 : Full-SBS/Full-TAB uniquement).", success=False)
+                    "Half-resolution formats cannot be exported to MV-HEVC "
+                    "(v1 supports Full-SBS/Full-TAB only).", success=False)
             else:
                 self.show_3d_notification(
-                    "Aucune source 3D exportable (MVC / MV-HEVC / Full-SBS / Full-TAB).",
+                    "No exportable 3D source (MVC / MV-HEVC / Full-SBS / Full-TAB).",
                     success=False)
             return
         missing = self._export_tools_missing()
         if missing:
             self.show_3d_notification(
-                "Export impossible — outil manquant : " + ", ".join(missing), success=False)
+                "Cannot export — missing tool: " + ", ".join(missing), success=False)
+            return
+        if not self._resolve_unknown_export_eye_order(desc):
             return
         out_path = self._resolve_export_out_path(desc['path'])
         if not out_path:
@@ -5356,8 +6105,8 @@ class PlayerWindow(QMainWindow):
         if os.path.exists(out_path):
             # Fix #3: the export silently overwrote an existing out_path — confirm first.
             reply = QMessageBox.question(
-                self, "Exporter en MV-HEVC",
-                f"Écraser {os.path.basename(out_path)} ?",
+                self, "Export to MV-HEVC",
+                f"Overwrite {os.path.basename(out_path)}?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No)
             if reply != QMessageBox.StandardButton.Yes:
@@ -5365,7 +6114,7 @@ class PlayerWindow(QMainWindow):
         try:
             import mvhevc_exporter as me
         except Exception as e:
-            self.show_3d_notification(f"Export indisponible : {e}", success=False)
+            self.show_3d_notification(f"Export unavailable: {e}", success=False)
             return
         opts = {'quality': 'fast' if quality == 'fast' else 'quality'}
         job = me.MVHEVCExporter(desc, out_path, opts)
@@ -5379,8 +6128,10 @@ class PlayerWindow(QMainWindow):
         job.finished.connect(lambda j=job: self._export_cleanup(j))
         dlg.show()          # NON-modal: playback + the rest of the UI stay live
         job.start()
-        logger.info(f"[EXPORT] started: kind={desc.get('kind')} quality={opts['quality']} "
-                    f"-> {out_path}")
+        logger.info(
+            "[EXPORT] started: kind=%s quality=%s eye_order=%s eye_source=%s -> %s",
+            desc.get('kind'), opts['quality'], desc.get('eye_order'),
+            desc.get('eye_order_source'), out_path)
         self._update_export_menu_state()
 
     def _on_export_finished(self, out_path):
@@ -5389,7 +6140,16 @@ class PlayerWindow(QMainWindow):
                 self._export_dialog.set_finished(out_path)
             except Exception:
                 pass
-        self.show_3d_notification(f"Export MV-HEVC terminé : {out_path}", success=True)
+        job = getattr(self, '_export_job', None)
+        if getattr(job, 'audio_status', None) == 'failed':
+            # Video-only is a deliberate, non-fatal fallback in the exporter —
+            # but it must never be silent, or the user discovers a mute movie
+            # after an hour-long encode they were told had succeeded.
+            self.show_3d_notification(
+                f"MV-HEVC export complete, but WITHOUT audio (the source track "
+                f"could not be converted): {out_path}", success=False)
+        else:
+            self.show_3d_notification(f"MV-HEVC export complete: {out_path}", success=True)
         logger.info(f"[EXPORT] finished -> {out_path}")
 
     def _on_export_failed(self, reason):
@@ -5399,9 +6159,9 @@ class PlayerWindow(QMainWindow):
             except Exception:
                 pass
         if reason == 'annule':
-            self.show_3d_notification("Export MV-HEVC annulé.", success=False)
+            self.show_3d_notification("MV-HEVC export cancelled.", success=False)
         else:
-            self.show_3d_notification(f"Échec de l'export MV-HEVC : {reason}", success=False)
+            self.show_3d_notification(f"MV-HEVC export failed: {reason}", success=False)
         logger.info(f"[EXPORT] failed: {reason}")
 
     def _export_cleanup(self, job):
@@ -5754,6 +6514,19 @@ class PlayerWindow(QMainWindow):
             except Exception:
                 pass
         self._stop_mvc_decoder()
+        # Release libmpv before dismounting an ISO.
+        _closing_player = getattr(self, 'player', None)
+        self.player = None
+        if _closing_player is not None:
+            try:
+                try:
+                    _closing_player.command('stop')
+                    time.sleep(0.150)
+                except Exception:
+                    pass
+                _closing_player.terminate()
+            except Exception:
+                logger.exception("[MPV] Core termination failed during window close")
         # Release any Blu-ray ISO we mounted, so no phantom drive is left behind.
         try:
             import bluray_disc
@@ -5772,6 +6545,30 @@ class PlayerWindow(QMainWindow):
         self.metrics_overlay.close()
         if self.framepacking_window:
             self.framepacking_window.close()
+        # Dual Projector's two eye windows are parentless top-level windows too --
+        # without this, closing the main window leaves them alive and able to
+        # keep the process running after the user thinks they've quit.
+        self._set_dual_projector_enabled(False)
+
+        # A third-party decoder that is still executing native code must never
+        # reach QObject destruction: Qt deliberately aborts the process when a
+        # live QThread wrapper is deleted. Normal shutdown is graceful; this
+        # last-resort branch is used only after the cooperative stop and five
+        # second join above have both failed.
+        live_native_threads = []
+        for thread in getattr(self, '_mvc_leaked', []):
+            try:
+                if thread.isRunning():
+                    live_native_threads.append(thread)
+            except RuntimeError:
+                pass
+        if live_native_threads:
+            logger.critical(
+                "[MVC CLEANUP] Native decoder remained blocked during application "
+                "shutdown; using clean process exit before Qt can destroy a live "
+                "QThread")
+            logging.shutdown()
+            os._exit(0)
         super().closeEvent(event)
 
     def eventFilter(self, watched, event):
@@ -5887,8 +6684,17 @@ class PlayerWindow(QMainWindow):
         an index.bdmv, or any folder containing a BDMV. In that case the feature film
         ("main title") SSIF is auto-detected (duration-based, robust to decoy playlists).
         """
+        original_request = file_path
         if getattr(self, '_archiving', False):
             self.show_3d_notification("ISO copy in progress — playback unavailable", success=False)
+            return
+        # Retry the ORIGINAL request before mounting anything. The former check
+        # happened after ISO resolution and retried the temporary D:\... feature
+        # path, losing ownership of the mount on the second call.
+        if not self.player:
+            print("Player not ready, retrying...")
+            requested_path = file_path
+            QTimer.singleShot(100, lambda p=requested_path: self.play_file(p))
             return
         # Reset multi-segment (seamless-branching) feature state for every load; set below
         # only when a disc feature spans several SSIF segments (an edl:// URI, no temp file).
@@ -5903,12 +6709,15 @@ class PlayerWindow(QMainWindow):
         # is missing but find_feature paired the separate views; routes the MVC
         # pipeline through open_dual instead of the mpv-2D fallback. Reset per load.
         self._bd_dual_file_pair = None
+        self._bd_eye_order = UNKNOWN
+        resolved_disc_feature = None
         try:
             import bluray_disc
             from PySide6.QtWidgets import QApplication
             self._pending_iso_mount = None
             # Blu-ray ISO: mount it (no admin needed) and treat the mount as the disc.
             if bluray_disc.is_iso(file_path):
+                already_mounted = bluray_disc.get_iso_mount_drive(file_path)
                 try:
                     self.show_3d_notification("Mounting Blu-ray ISO…", success=True)
                     QApplication.processEvents()
@@ -5919,6 +6728,40 @@ class PlayerWindow(QMainWindow):
                     self._pending_iso_mount = (file_path, drive)
                     logger.info(f"[DISC] Mounted ISO {file_path} -> {drive}")
                     file_path = drive  # detect the feature on the mounted drive
+                    # A drive letter is published before a large UDF filesystem has
+                    # necessarily enumerated all PLAYLIST/STREAM entries. Accepting
+                    # the first visible playlist selected an 8-second title on the
+                    # Avatar ISO; manually reopening the settled drive then found the
+                    # 9702-second SSIF. Require a stable inventory and retain the best
+                    # candidate observed during the bounded settling window.
+                    try:
+                        from PySide6.QtCore import QEventLoop
+
+                        def _pump_iso_mount_ui():
+                            QApplication.processEvents(
+                                QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
+                        resolved_disc_feature = bluray_disc.find_feature_stable(
+                            drive,
+                            fresh_mount=not bool(already_mounted),
+                            timeout_s=30.0,
+                            poll_s=1.0,
+                            stable_samples=3,
+                            on_poll=_pump_iso_mount_ui,
+                        )
+                        _stable_feat, _stable_info = resolved_disc_feature
+                        logger.info(
+                            "[DISC] Stable ISO inventory: playlists=%s, "
+                            "feature=%s, duration=%.0fs",
+                            (_stable_info or {}).get('candidates_playlists'),
+                            _stable_feat,
+                            float((_stable_info or {}).get('duration_s') or 0.0),
+                        )
+                    except Exception as stable_error:
+                        resolved_disc_feature = None
+                        logger.warning(
+                            f"[DISC] Stable ISO scan failed; using regular scan: "
+                            f"{stable_error}")
                 elif drive:
                     bluray_disc.dismount_iso(file_path)
                     self.show_3d_notification("ISO has no Blu-ray (BDMV) structure", success=False)
@@ -5932,7 +6775,10 @@ class PlayerWindow(QMainWindow):
                     QApplication.processEvents()
                 except Exception:
                     pass
-                feat, info = bluray_disc.find_feature(file_path)
+                if resolved_disc_feature is not None:
+                    feat, info = resolved_disc_feature
+                else:
+                    feat, info = bluray_disc.find_feature(file_path)
                 # Freshly-mounted ISO second chance: a large UDF volume can become
                 # browsable a moment after the mount readiness wait gives up —
                 # one bounded retry beats dismounting a perfectly good disc.
@@ -5955,6 +6801,7 @@ class PlayerWindow(QMainWindow):
                     # paired by find_feature -> play as REAL 3D via the dual-source
                     # demuxer (open_dual). Only honoured when the interleave is missing.
                     self._bd_dual_file_pair = info.get('dual_file_pair') if self._bd_ssif_interleave_missing else None
+                    self._bd_eye_order = normalise_eye_order(info.get('eye_order'))
                     # DF-FINAL FIX 4: only claim the dual-file MVC label when the
                     # same gate analyze_and_configure_3d uses to actually promote
                     # the session (MVC_SUPPORT_AVAILABLE and NATIVE_RENDER_AVAILABLE)
@@ -6018,16 +6865,16 @@ class PlayerWindow(QMainWindow):
             return
 
         if not os.path.exists(file_path):
-            print(f"File not found: {file_path}")
+            logger.error(f"[LOAD] Resolved feature disappeared or is not ready: {file_path}")
+            self._dismount_pending_iso()
+            self.show_3d_notification(
+                "The Blu-ray feature is not readable after mounting the ISO.",
+                success=False,
+            )
             return
 
         # SSIF/M2TS (Blu-ray 3D raw streams) are now supported via the native demuxer.
         file_ext = os.path.splitext(file_path)[1].lower()
-
-        if not self.player:
-            print("Player not ready, retrying...")
-            QTimer.singleShot(100, lambda: self.play_file(file_path))
-            return
 
         # CRITICAL: Prevent multiple simultaneous file loads
         if hasattr(self, '_is_loading_file') and self._is_loading_file:
@@ -6037,6 +6884,10 @@ class PlayerWindow(QMainWindow):
         # CRITICAL FIX V2: Reset playback ended flag when loading new file
         # This allows MPV callbacks to work normally again
         self._playback_ended = False
+
+        # New file: trust mpv's pause reports again until _fetch_audio_tracks
+        # re-establishes whether the shell actually has audio to play.
+        self._mpv_shell_inert = False
 
         # V14b: Reset MPV transition flag - new file load starts fresh
         self._mpv_transition_in_progress = False
@@ -6097,6 +6948,19 @@ class PlayerWindow(QMainWindow):
         # to the NEXT file (which would override that file's own auto-detection, e.g. force
         # a 2D or MVC clip into SBS). Reset to 'auto' so detection wins on a fresh load.
         self.current_stereo_mode = 'auto'
+        # This reset bypasses change_stereo_mode (direct attribute assignment), so it
+        # must carry its own Dual Projector teardown: without this, a pair left open
+        # from the PREVIOUS file survives into the new one, desyncing eye_windows from
+        # (now non-'dual') current_stereo_mode -- the new file's combo shows MultiView/
+        # SBS/TAB but the old projector windows keep receiving whatever the decoder
+        # emits next.
+        self._set_dual_projector_enabled(False)
+        # Eye-order overrides are per source.  A right-first choice for one MVC
+        # must never silently carry into the next movie.
+        try:
+            self.controls_overlay.export_eye_auto_action.setChecked(True)
+        except Exception:
+            pass
         self._edge264_consecutive_crashes = 0  # fresh source: reset edge264 crash streak
         self._update_archive_button_state()  # archive button lights up only for a Blu-ray disc
 
@@ -6245,6 +7109,14 @@ class PlayerWindow(QMainWindow):
         else:
             logger.warning(f"[PGS STARTUP] File path mismatch: expected {self.current_file_path}, got {file_path}")
 
+    def _mpv_source_for(self, file_path):
+        """Return the source MPV should open for this file.
+
+        Multi-segment features play through an EDL so audio stays continuous on
+        one timeline; everything else plays the file directly.
+        """
+        return getattr(self, '_feature_edl_uri', None) or file_path
+
     def _configure_and_start_playback(self, file_path):
         """Configure 3D mode and start playback (called after PGS extraction for MVC files)."""
         logger.info(f"[LOAD] _configure_and_start_playback called for {file_path}")
@@ -6261,7 +7133,7 @@ class PlayerWindow(QMainWindow):
             # self.metrics_overlay.show() # Disabled to remove top-left artifact
             # Multi-segment feature: mpv plays the EDL (continuous audio across all segments
             # on one timeline); the decoder plays the matching SSIF sequence (SequenceDemuxer).
-            _mpv_src = getattr(self, '_feature_edl_uri', None) or file_path
+            _mpv_src = self._mpv_source_for(file_path)
             self.player.play(_mpv_src)
             self.player.pause = True
             # V7b FIX: FORCE the timer to stay active even when paused for MVC mode
@@ -6277,6 +7149,20 @@ class PlayerWindow(QMainWindow):
             # Update timeline with MPV duration and THEN start playback to ensure correct scale
             def _update_timeline_and_start_playback(retry_count=0):
                 try:
+                    # PROVISIONAL RANGE, first tick: give the slider the ffprobe
+                    # duration IMMEDIATELY instead of leaving an empty bar for
+                    # the up-to-4 s mpv-duration retry dance (a no-audio file
+                    # never provides one at all). mpv's value, when it lands,
+                    # simply overwrites this with the same number.
+                    if retry_count == 0:
+                        try:
+                            _ffd = float((self.video_3d_info or {}).get('duration') or 0)
+                        except (TypeError, ValueError):
+                            _ffd = 0.0
+                        if _ffd > 0 and self.current_file_path:
+                            self.controls_overlay.set_duration(_ffd)
+                            self.controls_overlay.time_slider.set_video_file(self.current_file_path, _ffd)
+                            logger.info(f"[TIMELINE] Provisional range from ffprobe: {_ffd}s")
                     mpv_duration = 0
                     if hasattr(self, 'player') and self.player:
                         try:
@@ -6331,8 +7217,29 @@ class PlayerWindow(QMainWindow):
                         delay = 150 if retry_count < 3 else 500  # Fast retries first, then slower
                         QTimer.singleShot(delay, lambda: _update_timeline_and_start_playback(retry_count + 1))
                     else:
-                        # Fallback: start playback anyway with ffprobe duration
+                        # Fallback: start playback anyway with ffprobe duration.
+                        # ACTUALLY APPLY it: this branch used to only log the
+                        # intent — with a no-audio file (mpv shell has nothing
+                        # to play, duration never appears) the slider range
+                        # stayed at 0 and the timeline was an empty bar.
                         logger.warning("[TIMELINE] MPV duration not available, starting with ffprobe duration")
+                        ff_dur = 0
+                        try:
+                            ff_dur = float((self.video_3d_info or {}).get('duration') or 0)
+                        except (TypeError, ValueError):
+                            pass
+                        if ff_dur > 0 and self.current_file_path:
+                            self.controls_overlay.set_duration(ff_dur)
+                            self.controls_overlay.time_slider.set_video_file(self.current_file_path, ff_dur)
+                            logger.info(f"[TIMELINE] Updated range from ffprobe: {ff_dur}s")
+                            if getattr(self, '_thumb_service', None):
+                                self._thumb_service.set_duration(ff_dur)
+                                QTimer.singleShot(1000, self._thumb_service.arm)
+                            if getattr(self, 'mvc_decoder_thread', None):
+                                try:
+                                    self.mvc_decoder_thread.set_media_duration(ff_dur)
+                                except Exception:
+                                    pass
                         # Explicitly force UI to playing state (Pause Icon) immediately
                         self.controls_overlay.set_paused(False)
                         
@@ -6443,7 +7350,7 @@ class PlayerWindow(QMainWindow):
         if self.video_3d_info['is_3d'] and self.video_3d_info['stereo_mode'] != 'none':
             stereo_mode = self.video_3d_info['stereo_mode']
             # Index mapping: 0=MVC, 1=Side-by-Side, 2=Top-Bottom
-            mode_index = {'mvc': 0, 'sbs': 1, 'tab': 2}.get(stereo_mode, 0)
+            mode_index = {'mvc': 0, 'sbs': 1, 'tab': 2, 'dual': 3}.get(stereo_mode, 0)
             self.controls_overlay.stereo_mode_combo.setCurrentIndex(mode_index)
             mode_names = {'mvc': 'MultiView', 'sbs': 'Side-by-Side', 'tab': 'Top-Bottom'}
             self.show_3d_notification(f"3D File: {mode_names.get(stereo_mode, stereo_mode.upper())}", success=True,
@@ -6513,11 +7420,10 @@ class PlayerWindow(QMainWindow):
             self.show_3d_notification("2D content detected", success=True, permanent=True)
 
             # === 2D-via-edge264 path ===
-            # For H.264 in MKV containers, route through MVCDecoderThread anyway.
-            # The C++ demuxer (mvc_matroska_demuxer.cpp:214) sets hasMVC=true
-            # optimistically for any single-track AVC, and the Python decoder
-            # duplicates the left view when samples_mvc[0] is NULL. So a 2D H.264
-            # file flows through the same pipeline, just with both eyes identical.
+            # Route supported H.264 containers through the shared edge264 thread.
+            # Each demuxer must report MVC from explicit metadata/bitstream evidence;
+            # an ordinary M2TS runs in base-view-only mode, and the Python decoder
+            # duplicates the decoded left view only at presentation time.
             # This gives us: HDR via D3D11 widget, consistent codec path, and
             # MPV stays audio-only (no more MPV vo glitches on 2D files).
             codec = (self.video_3d_info.get('codec_name') or '').lower()
@@ -6529,13 +7435,9 @@ class PlayerWindow(QMainWindow):
                            and codec == 'h264'
                            and ext in EDGE264_CONTAINERS
                            and NATIVE_RENDER_AVAILABLE
-                           # MakeMKV 3D backup with no SSIF interleave: the base m2ts is a
-                           # single-view stream, but the M2TS demuxer force-assumes a dual-PID
-                           # SSIF (mvcPid=0x1012) and buffers base frames forever waiting for a
-                           # dependent view that lives in a SEPARATE file — it emits nothing and
-                           # hangs. Keep this class OFF the edge264/MVC path; mpv plays the base
-                           # view in 2D reliably. Tightly scoped: only set for the .ssif.smap-
-                           # without-.ssif signature, so real 3D (.ssif) and plain 2D BDs are unaffected.
+                           # A MakeMKV 3D backup whose eyes live in separate .m2ts files
+                           # is handled by the explicit dual-file route above. If the pair
+                           # could not be resolved, do not silently decode only one eye here.
                            and not getattr(self, '_bd_ssif_interleave_missing', False))
             if eligible_2d:
                 logger.info(f"[2D-EDGE264] Routing 2D H.264 ({ext}) through edge264 decoder")
@@ -6552,7 +7454,7 @@ class PlayerWindow(QMainWindow):
                     # edge264 first, mpv only on failure (unified fallback path).
                     self._fallback_from_edge264(reason=f"2D edge264 init failed: {e}")
             else:
-                # 2D not edge264-eligible (non-h264, or non-.mkv: .mp4/.avi/.m2ts/VC-1…).
+                # 2D not edge264-eligible (non-H.264 or unsupported container).
                 # HEVC (spec 2026-07-21) is probed here, AFTER the H.264 paths and BEFORE
                 # the mpv fallback; open() refuses non-HEVC so H.264/VC-1 fall straight
                 # through to mpv, which plays them natively as before.
@@ -6570,6 +7472,19 @@ class PlayerWindow(QMainWindow):
         if getattr(self, '_hevc_mode_active', False):
             self._configure_3d_output_hevc(enable_3d, stereo_mode)
             return
+
+        # Fix round 1 (bidirectional): enforce the `eye_windows is non-None iff
+        # current_stereo_mode == 'dual'` invariant on EVERY call, in both directions --
+        # closing the pair when 3D goes off (the 3D button bypasses the presentation
+        # combo entirely) and REOPENING it when 3D comes back on while the combo still
+        # reads 'dual' (a one-directional close-only helper left the combo showing
+        # "Dual Projector" while the screen silently fell back to MultiView). Placed
+        # BEFORE the `if not self.player` guard below on purpose: that guard is itself a
+        # second way to leak the pair open (3D-off returning early because mpv already
+        # died during a dual session), and this call touches no mpv state, so running it
+        # first closes that hole too. _set_dual_projector_enabled is idempotent in both
+        # directions, so calling it unconditionally here is safe.
+        self._set_dual_projector_enabled(enable_3d and stereo_mode == 'dual')
 
         if not self.player: return
 
@@ -6645,7 +7560,14 @@ class PlayerWindow(QMainWindow):
                     self._start_mvc_decoder(start_time=current_pos)
 
                 # Configure output based on requested mode
-                if stereo_mode == 'mvc':
+                # 'dual' routes into the SAME branch as 'mvc' (fix round 1, Finding 3):
+                # Dual Projector needs the identical decoder configuration as MultiView --
+                # the decoder must deliver an L/R pair to the routing dispatch in
+                # _on_mvc_frame_yuv_ready. Only the PRESENTATION differs, and that is
+                # already handled separately by eye_windows (which _select_stereo_
+                # presentation_targets prioritises over the framepack window) plus the
+                # _show_framepacking_output guard, so no duplicate branch is needed here.
+                if stereo_mode in ('mvc', 'dual'):
                     # --- Detached 3D FramePack Mode ---
                     if hasattr(self, 'mvc_embedded_widget') and self.framepacking_window:
                         # V7b SYNC: Embedded stays in 2D (left eye), Framepack window in framepack mode
@@ -6668,8 +7590,7 @@ class PlayerWindow(QMainWindow):
                         if self._text_sub_active:
                             self._connect_text_subtitle_to_widget()
 
-                        self.framepacking_window.showNormal()
-                        self.framepacking_window.activateWindow()
+                        self._show_framepacking_output()
 
                 elif stereo_mode in ('sbs', 'tab'):
                     # --- SBS/TAB Mode in MAIN WINDOW ---
@@ -6712,6 +7633,22 @@ class PlayerWindow(QMainWindow):
                 mode_name = "Side-by-Side" if is_sbs else "Top-Bottom"
                 self.show_3d_notification(f"3D Mode: {mode_name} (Native)", success=True)
             else:
+                # Dual Projector is fed exclusively by the native decoder's frame
+                # dispatch (_on_mvc_frame_yuv_ready). mpv renders into its own
+                # window and cannot feed the eye windows at all, so a source that
+                # lands here would leave two permanently black rectangles on the
+                # projectors with nothing in the log to explain them. Close the
+                # pair and say why. The invariant enforcement at the top of this
+                # function may reopen it on the next call, but that call ends here
+                # again, so the settled state is always "closed" for such a source.
+                if getattr(self, 'eye_windows', None):
+                    logger.warning(
+                        "[DUAL-PROJECTOR] this source plays through mpv, which cannot "
+                        "feed the eye windows - closing them")
+                    self._set_dual_projector_enabled(False)
+                    self.show_3d_notification(
+                        "Dual Projector needs the native decoder — not available "
+                        "for this source", success=False)
                 self._fallback_to_mpv_mvc()
 
     def _make_display_widget(self):
@@ -6750,6 +7687,14 @@ class PlayerWindow(QMainWindow):
         print(f"[SYNC] Decoder start position: {actual_start_time:.3f}s")
 
         self._stop_mvc_decoder()
+        if getattr(self, '_mvc_shutdown_blocked', False):
+            logger.error(
+                "[MVC INIT] Previous native decoder still owns resources; refusing "
+                "to start a concurrent edge264 instance and falling back to mpv."
+            )
+            self._mvc_restarting = False
+            self._fallback_to_mpv_mvc()
+            return
 
         print(f"[MVC INIT] Starting MVC decoder initialization")
 
@@ -6821,14 +7766,22 @@ class PlayerWindow(QMainWindow):
                 )
                 self.framepacking_window.visibilityChanged.connect(self._on_framepacking_visibility_changed)
 
-            # 3. Initial State: 2D Embedded (Show MVC widget in stack)
+            # 3. Initial State: prepare the native widget, but keep MPV visible
+            # until edge264 has produced a validated first frame. This makes the
+            # renderer handoff transactional: a failed probe never creates a
+            # black-screen gap and MPV remains an immediately usable fallback.
             if self.mvc_embedded_widget.parent() != self.video_stack_container:
                 # If it was detached, bring it back
                 self.video_stack.addWidget(self.mvc_embedded_widget)
 
-            self.video_stack.setCurrentWidget(self.mvc_embedded_widget)
+            try:
+                self._edge264_pre_handoff_widget = self.video_stack.currentWidget()
+            except Exception:
+                self._edge264_pre_handoff_widget = getattr(self, 'video_widget', None)
             self.mvc_embedded_widget.set_stereo_mode('2d')
             self.active_mvc_widget = self.mvc_embedded_widget
+            self._edge264_waiting_for_first_frame = True
+            self._edge264_mpv_handoff_done = False
 
             # V57 BLACK-SCREEN-ON-RELOAD FIX: _stop_mvc_decoder() (called above) paused
             # the REUSED display widgets (pause_rendering → _rendering_paused=True, which
@@ -6860,7 +7813,7 @@ class PlayerWindow(QMainWindow):
                 use_gpu_yuv_conversion=USE_GPU_YUV_CONVERSION,
                 store_frame_struct_for_gpu=STORE_FRAME_STRUCT_FOR_GPU,
                 start_position=actual_start_time,
-                threads=4,  # V7b FIX: Reduced to 4 to prevent edge264 deadlock (starvation)
+                threads=_recommended_edge264_threads(),
                 media_duration=(self.player.duration or self.video_3d_info.get('duration') if self.video_3d_info else None),
                 feature_segments=getattr(self, '_pending_feature_segments', None),
                 # DF-4: dual-file BD3D pair -> MVCSSIFDemuxer.open_dual(base, dep).
@@ -6939,7 +7892,7 @@ class PlayerWindow(QMainWindow):
             # CRITICAL: Let OpenGL initialize before starting decoding
             # Start the thread after a short delay to avoid race conditions
             print(f"[MVC INIT] Starting decoder thread in 100ms...")
-            QTimer.singleShot(100, lambda: self._delayed_start_decoder(disable_mpv=True))
+            QTimer.singleShot(100, lambda: self._delayed_start_decoder(disable_mpv=False))
 
             # SYNC TIMER: Periodically push audio clock to decoder thread
             self._sync_timer = QTimer(self)
@@ -6974,11 +7927,7 @@ class PlayerWindow(QMainWindow):
                 self.loading_overlay.hide_loading()
                 print("[MVC INIT] Loading overlay hidden")
 
-            self.show_3d_notification(
-                "Edge264 MVC Decoder Active - Put on your 3D glasses",
-                success=True,
-                permanent=True
-            )
+            self.show_3d_notification("Initializing edge264 video...", success=True)
         except Exception:
             if decoder_started:
                 self._stop_mvc_decoder()
@@ -7124,6 +8073,57 @@ class PlayerWindow(QMainWindow):
         except Exception as e:
             logger.warning(f"[2D-MPV] present-via-mpv failed: {e}")
 
+    def _commit_edge264_video_handoff(self):
+        """Atomically replace MPV video only after edge264 delivered a real frame."""
+        if not getattr(self, '_edge264_waiting_for_first_frame', False):
+            return True
+        if not self.mvc_mode_active or not self.mvc_decoder_thread:
+            return False
+
+        timer = getattr(self, '_edge264_startup_timer', None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+
+        # Release MPV's D3D11 chain immediately before the first native upload.
+        # Until this point MPV remained visible and fully recoverable.
+        if not self._disable_mpv_video_output():
+            self._edge264_waiting_for_first_frame = False
+            self._fallback_from_edge264(
+                reason="could not release MPV video output for the edge264 renderer")
+            return False
+
+        try:
+            self.video_stack.setCurrentWidget(self.mvc_embedded_widget)
+        except Exception as e:
+            self._edge264_waiting_for_first_frame = False
+            self._fallback_from_edge264(reason=f"native video handoff failed: {e}")
+            return False
+
+        self._edge264_waiting_for_first_frame = False
+        self._edge264_mpv_handoff_done = True
+        self._edge264_pre_handoff_widget = None
+        logger.info("[EDGE264-HANDOFF] First decoded frame validated; MPV -> native D3D11 committed")
+        if isinstance(self.video_3d_info, dict) and self.video_3d_info.get('is_3d'):
+            self.show_3d_notification(
+                "Edge264 MultiView decoder active", success=True, permanent=True)
+        else:
+            self.show_3d_notification(
+                "Edge264 H.264 decoder active", success=True, permanent=True)
+        return True
+
+    def _on_edge264_startup_timeout(self):
+        """Fail open to MPV when edge264 cannot produce its first frame in time."""
+        if (not getattr(self, '_edge264_waiting_for_first_frame', False)
+                or not self.mvc_mode_active):
+            return
+        timeout_ms = _edge264_startup_timeout_ms(self.video_3d_info)
+        logger.error(
+            f"[EDGE264-STARTUP] No valid frame within {timeout_ms / 1000:.0f}s; "
+            "restoring MPV video")
+        self._edge264_waiting_for_first_frame = False
+        self._fallback_from_edge264(
+            reason=f"no decoded frame within {timeout_ms / 1000:.0f}s")
+
     def _fallback_from_edge264(self, reason=""):
         """edge264 could not handle this H.264 stream -> degrade gracefully to mpv.
 
@@ -7136,6 +8136,12 @@ class PlayerWindow(QMainWindow):
         """
         if reason:
             logger.warning(f"[EDGE264-FALLBACK] {reason}")
+        timer = getattr(self, '_edge264_startup_timer', None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+        self._edge264_waiting_for_first_frame = False
+        self._edge264_mpv_handoff_done = False
+        self._edge264_pre_handoff_widget = None
         # Review fix #2: capture BEFORE any teardown/state change below, mirroring
         # _on_hevc_failed's `was_multiview` gate (~L6785, same idea, edge264 side). A
         # genuinely-3D session (MVC/SBS/TAB via edge264) that silently degrades to mpv's
@@ -7149,6 +8155,7 @@ class PlayerWindow(QMainWindow):
         # (e.g. a queued decoder-seek or a subsequent load-state check).
         self._bd_dual_active = False
         self._bd_dual_file_pair = None
+        self._bd_eye_order = UNKNOWN
         try:
             self.controls_overlay.clear_format_badge()  # edge264 didn't adapt → drop the badge
         except Exception:
@@ -7328,7 +8335,7 @@ class PlayerWindow(QMainWindow):
                 _scale = (65535.0 / 65472.0) if src.hw_active() else (65535.0 / 1023.0)
             else:
                 _scale = 1.0
-            for _w in (self.mvc_embedded_widget, self.framepacking_window.display_widget):
+            for _w in self._display_widgets():
                 try:
                     _w.plane_scale = _scale
                 except Exception:
@@ -7342,7 +8349,7 @@ class PlayerWindow(QMainWindow):
             self.hevc_media_info = mi
             self._hevc_half = bool(half)
             _src_aspect = (float(mi.width) / float(mi.height)) if half else 0.0
-            for _w in (self.mvc_embedded_widget, self.framepacking_window.display_widget):
+            for _w in self._display_widgets():
                 try:
                     _w.source_aspect = _src_aspect
                 except Exception:
@@ -7368,7 +8375,10 @@ class PlayerWindow(QMainWindow):
             _trc = (mi.color_trc or '').lower()
             if _trc in ('arib-std-b67', 'hlg'):
                 logger.info('[HEVC] HLG non gere (legacy render)')
-            for _w in (self.mvc_embedded_widget, self.framepacking_window.display_widget):
+            # HDR cast eligibility: a 10-bit PQ source can be cast as HEVC
+            # Main10/P010 with its PQ signalling intact (_on_cast_requested).
+            self._hevc_pq10 = bool(mi.bit_depth == 10 and _trc == 'smpte2084')
+            for _w in self._display_widgets():
                 try:
                     _w.yuv_matrix_sel = _matrix_sel
                     if _trc == 'smpte2084':
@@ -7389,7 +8399,7 @@ class PlayerWindow(QMainWindow):
             self.active_mvc_widget = self.mvc_embedded_widget
             self.framepacking_window.display_widget.set_stereo_mode(
                 'framepack' if mode in ('sbs', 'tab', 'mvhevc') else '2d')
-            for _w in (self.mvc_embedded_widget, self.framepacking_window.display_widget):
+            for _w in self._display_widgets():
                 try:
                     if hasattr(_w, 'resume_rendering'):
                         _w.resume_rendering()
@@ -7458,6 +8468,13 @@ class PlayerWindow(QMainWindow):
                 # configure_3d_output(True, self.current_stereo_mode) with an attribute that
                 # already agrees with the UI/video_3d_info, instead of a stale 'auto'.
                 self.current_stereo_mode = _sm_ui
+                # Fix round 1, Finding 2: this direct assignment bypasses
+                # change_stereo_mode (deliberately -- see the blockSignals below), so it
+                # must carry its own Dual Projector teardown. _sm_ui is always 'mvc'/
+                # 'sbs'/'tab', never 'dual' -- if eye_windows survived from a PREVIOUS
+                # file's Dual Projector session, this promotion would otherwise leave it
+                # open while current_stereo_mode disagrees with it.
+                self._set_dual_projector_enabled(False)
                 # Fix-1 (MV-5 final review): setCurrentIndex() fires currentTextChanged
                 # SYNCHRONOUSLY (same-thread direct connection) -> _on_stereo_mode_changed
                 # -> change_stereo_mode('mvc') re-enters mid-startup, before hevc_thread
@@ -7499,6 +8516,11 @@ class PlayerWindow(QMainWindow):
                 self._on_mvc_frame_yuv_ready, Qt.QueuedConnection)
             self.hevc_thread.decodeFailed.connect(self._on_hevc_failed)
             self.hevc_thread.endOfStream.connect(self._on_mvc_finished)  # shared EOS handler
+            # Timeline position from the decode thread itself (mirror of the MVC
+            # per-frame timestamp slot): for a no-audio file the mpv shell never
+            # reports time-pos, so without this the slider has no position source.
+            self.hevc_thread.positionChanged.connect(
+                self._on_hevc_position, Qt.QueuedConnection)
             self.hevc_thread.start()
 
             # MV-4/Fix-4 (MV-5 final review): expose the two view_ids + left-eye mapping in
@@ -7628,24 +8650,146 @@ class PlayerWindow(QMainWindow):
         self._hevc_half = False
         # Reset the 10-bit rescale AND the C2 display-aspect override so the reused widgets
         # render subsequent 8-bit / full-format content correctly.
-        for _w in (getattr(self, 'mvc_embedded_widget', None),
-                   getattr(getattr(self, 'framepacking_window', None), 'display_widget', None)):
-            if _w is not None:
+        for _w in self._display_widgets():
+            try:
+                _w.plane_scale = 1.0
+            except Exception:
+                pass
+            try:
+                _w.source_aspect = 0.0
+            except Exception:
+                pass
+            # HDR10/PQ: back to the legacy 0/0 color path so a subsequent 8-bit
+            # MVC/H.264/SDR source renders byte-identically.
+            try:
+                _w.yuv_matrix_sel = 0
+                _w.transfer_sel = 0
+            except Exception:
+                pass
+
+    def _show_framepacking_output(self):
+        """Show the detached 3D output without stealing the main UI's focus."""
+        fp = getattr(self, 'framepacking_window', None)
+        if fp is None:
+            return
+        # Dual Projector owns the detached output while it is active. The mode
+        # switch hides this window, but configure_3d_output runs afterwards and
+        # would otherwise put it straight back on top of a projector.
+        if getattr(self, 'eye_windows', None):
+            return
+        fp.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        fp.showNormal()
+        fp.raise_()
+
+    def _make_eye_window(self, eye):
+        """One Dual Projector output window. Split out so the lifecycle below
+        stays testable without a real D3D11 widget."""
+        from framepacking_window_d3d11 import EyeOutputWindow
+        return EyeOutputWindow(eye, parent=None)
+
+    def _seed_eye_window_params(self, widget):
+        """Give a freshly built eye widget the render parameters of the source
+        that is ALREADY playing.
+
+        Extending the per-source sites to _display_widgets() is necessary but not
+        sufficient: those sites (_try_start_hevc, change_stereo_mode) run at load
+        time, and every path that reaches them clears the pair first, so a window
+        built afterwards — the normal case, the user picks Dual Projector during
+        playback — would keep its constructor defaults. plane_scale alone is the
+        difference between a correct picture and a blown-out white one on a 10-bit
+        D3D11VA source (65535/65472 vs the default 65535/1023).
+
+        The embedded preview is the reference: it is the widget those same sites
+        wrote to, and it is never destroyed.
+        """
+        ref = getattr(self, 'mvc_embedded_widget', None)
+        if widget is None or ref is None:
+            return
+        for name in _EYE_INHERITED_RENDER_PARAMS:
+            try:
+                setattr(widget, name, getattr(ref, name))
+            except Exception:
+                pass
+        # BD3D authored PG depth is pushed per GOP; without this the new window
+        # renders at zero depth until the next one arrives.
+        depth = getattr(self, '_pg_depth_last', None)
+        if depth is not None and hasattr(widget, 'set_subtitle_depth'):
+            try:
+                widget.set_subtitle_depth(depth)
+            except Exception:
+                pass
+
+    def _refresh_subtitle_targets(self):
+        """Re-point both subtitle renderers at the CURRENT display-widget set.
+
+        Opening or closing the eye-window pair changes that set, and both
+        renderers cache the widgets they are connected to. Without this, a pair
+        opened after the last connect never receives a cue (subtitles on the
+        control monitor, none on either projector) and a closed pair leaves two
+        dead widgets wired to the renderers.
+        """
+        if getattr(self, '_subtitle_manager', None):
+            self._connect_subtitle_to_widget()
+        if getattr(self, '_text_sub_active', False):
+            self._connect_text_subtitle_to_widget()
+
+    def _set_dual_projector_enabled(self, enable):
+        """Open or close the two one-eye output windows.
+
+        Asymmetry with the framepack window is deliberate: that one is a
+        singleton we HIDE so returning to MultiView is instant and its renderer
+        survives, while the eye windows are built on demand and CLOSED on exit
+        -- their closeEvent already releases the D3D11 resources.
+        """
+        if enable:
+            if self.eye_windows is None:
+                # Fix round 1, Finding 4: build both defensively. eye_windows was
+                # previously assigned only after BOTH constructors returned -- if the
+                # second one raised (D3D11 init can fail), the first window was alive
+                # but unreferenced (leaked) and the exception escaped with
+                # current_stereo_mode already 'dual'. Close whatever was already
+                # built and leave eye_windows None, so the caller sees a clean failure
+                # instead of an orphaned window plus a crash.
+                left = None
                 try:
-                    _w.plane_scale = 1.0
+                    left = self._make_eye_window('left')
+                    right = self._make_eye_window('right')
                 except Exception:
-                    pass
-                try:
-                    _w.source_aspect = 0.0
-                except Exception:
-                    pass
-                # HDR10/PQ: back to the legacy 0/0 color path so a subsequent 8-bit
-                # MVC/H.264/SDR source renders byte-identically.
-                try:
-                    _w.yuv_matrix_sel = 0
-                    _w.transfer_sel = 0
-                except Exception:
-                    pass
+                    logger.exception("[DUAL-PROJECTOR] failed to open the eye-window pair")
+                    if left is not None:
+                        try:
+                            left.close()
+                        except Exception:
+                            pass
+                    return
+                self.eye_windows = (left, right)
+                for window in self.eye_windows:
+                    self._seed_eye_window_params(
+                        getattr(window, 'display_widget', None))
+            fp = getattr(self, 'framepacking_window', None)
+            if fp is not None:
+                fp.hide()
+            for window in self.eye_windows:
+                window.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+                window.showNormal()
+                window.raise_()
+            # The pair is now part of the display-widget set the subtitle
+            # renderers must feed. Idempotent: both connect helpers no-op when
+            # the set they are already wired to is unchanged.
+            self._refresh_subtitle_targets()
+            logger.info("[DUAL-PROJECTOR] two eye outputs open")
+            return
+
+        pair, self.eye_windows = self.eye_windows, None
+        for window in (pair or ()):
+            try:
+                window.close()
+            except Exception:
+                logger.exception("[DUAL-PROJECTOR] closing an eye window failed")
+        if pair:
+            # Drop the two closed widgets from the renderers' target set.
+            self._refresh_subtitle_targets()
+            logger.info("[DUAL-PROJECTOR] eye outputs closed")
 
     def _configure_3d_output_hevc(self, enable_3d, stereo_mode='auto'):
         """3D toggle for the HEVC path: show / hide the framepack window (which already
@@ -7676,6 +8820,11 @@ class PlayerWindow(QMainWindow):
         # safe default as configure_3d_output's own 'auto' resolve ("mvc" for MVC content).
         if stereo_mode == 'auto':
             stereo_mode = getattr(self, '_hevc_detected_mode', None) or 'mvhevc'
+        # Fix round 1 (bidirectional): same invariant enforcement as configure_3d_output's
+        # own copy of this line -- placed AFTER the 'auto' resolution above so stereo_mode
+        # holds a real value here ('auto' never equals 'dual', so ordering only matters for
+        # correctness of the resolved value, not for safety).
+        self._set_dual_projector_enabled(enable_3d and stereo_mode == 'dual')
         # D2: SBS/TAB always present in the MAIN window with the framepack window HIDDEN — for
         # EVERY HEVC 3D source (packed SBS/TAB and MV-HEVC multiview alike), not just multiview.
         # Only the MultiView ('mvc') selection opens the detached framepack window (below). The
@@ -7702,13 +8851,15 @@ class PlayerWindow(QMainWindow):
             fp.display_widget.set_stereo_mode('framepack')
             self.active_mvc_widget = fp.display_widget
             if emb is not None:
-                self.video_stack.setCurrentWidget(emb)   # keep it rendering for sync
+                # Keep the normal UI page selected and live. Frame delivery gives
+                # this 2D preview the left eye only with non-blocking Present(0),
+                # while the detached framepack renderer remains the timing authority.
+                self.video_stack.setCurrentWidget(emb)
                 emb.set_stereo_mode('2d')
             self._connect_subtitle_to_widget(fp.display_widget)
             if self._text_sub_active:
                 self._connect_text_subtitle_to_widget()
-            fp.showNormal()
-            fp.activateWindow()
+            self._show_framepacking_output()
             self.show_3d_notification("3D Mode (HEVC framepack)", success=True)
         else:
             if fp is not None and fp.isVisible():
@@ -7780,6 +8931,35 @@ class PlayerWindow(QMainWindow):
         """Stop edge264 MVC decoder and cleanup - V7a Enhanced"""
         logger.info("[MVC CLEANUP] Starting complete decoder shutdown...")
 
+        # Reap native owners retained by an earlier timeout once they have finally
+        # returned on their own. Running entries must remain strongly referenced:
+        # destroying a live QThread is a process-aborting Qt error.
+        _mvc_survivors = []
+        for _old_thread in getattr(self, '_mvc_leaked', []):
+            try:
+                if _old_thread.isRunning():
+                    _mvc_survivors.append(_old_thread)
+                else:
+                    _old_thread.deleteLater()
+            except RuntimeError:
+                pass
+        self._mvc_leaked = _mvc_survivors
+        self._mvc_shutdown_blocked = bool(_mvc_survivors)
+
+        # SyLC Cast (Task 13): the cast session is fed by _on_mvc_frame_yuv_ready, so it
+        # cannot outlive the decoder. EVERY session-end routes through here (stop /
+        # load-new / close / edge264-fallback / EOS), so this single point guarantees no
+        # cast session leaks across a file change. stop() is idempotent and must run on
+        # the GUI thread — which every caller of this method does.
+        _cast = getattr(self, '_cast', None)
+        if _cast is not None:
+            try:
+                _cast.stop()
+            except Exception:
+                logger.exception("[CAST] stop during MVC teardown failed")
+            self._cast = None
+            self._cast_connected = False
+
         # HEVC path teardown (symmetric, idempotent no-op when inactive): every MVC
         # teardown site (stop / load-new / close / edge264-fallback / EOS) routes through
         # here, so it also releases the HEVC decode thread + source when one is active.
@@ -7810,9 +8990,10 @@ class PlayerWindow(QMainWindow):
         # BD3D depth: drop the dynamic override + per-file state
         self._pg_depth_connected = False
         self._pg_depth_logged = False
-        for _w in (getattr(self, 'active_mvc_widget', None),
-                   getattr(self, 'mvc_embedded_widget', None),
-                   getattr(getattr(self, 'framepacking_window', None), 'display_widget', None)):
+        # Mirror of _on_pg_depth_changed's latch: an eye window opened after this
+        # cleanup must not inherit the previous file's authored depth.
+        self._pg_depth_last = None
+        for _w in (getattr(self, 'active_mvc_widget', None), *self._display_widgets()):
             if _w is not None and hasattr(_w, 'set_subtitle_depth'):
                 _w.set_subtitle_depth(None)
         logger.info("[MVC CLEANUP] Streaming subtitle state cleared")
@@ -7834,12 +9015,21 @@ class PlayerWindow(QMainWindow):
                     logger.info("[MVC CLEANUP] Demuxer read abort requested")
             except Exception:
                 pass
+            try:
+                _native = getattr(
+                    self.mvc_decoder_thread, '_native_decoder', None)
+                if _native is not None and hasattr(_native, 'request_abort'):
+                    _native.request_abort()
+                    logger.info("[MVC CLEANUP] Native decode abort requested")
+            except Exception:
+                pass
             # Brief pause to allow decoder thread to see the flag and abort operations
             import time
             time.sleep(0.050)  # 50ms
 
         # Stop ALL timers (not just _sync_timer and watchdog)
-        timer_names = ['_sync_timer', '_stall_watchdog', '_playback_timer', 'controls_hide_timer', '_render_heartbeat_timer']
+        timer_names = ['_sync_timer', '_stall_watchdog', '_edge264_startup_timer',
+                       '_playback_timer', 'controls_hide_timer', '_render_heartbeat_timer']
         for timer_name in timer_names:
             timer = getattr(self, timer_name, None)
             if timer and hasattr(timer, 'isActive') and timer.isActive():
@@ -7883,11 +9073,17 @@ class PlayerWindow(QMainWindow):
                         self.mvc_decoder_thread.subtitleTracksDetected.disconnect()
                     except:
                         pass
-                if hasattr(self.mvc_decoder_thread, 'pgsDataReady'):
+                if (hasattr(self.mvc_decoder_thread, 'pgsDataReady') and
+                        getattr(self, '_pgs_streaming_connected', False)):
                     try:
-                        self.mvc_decoder_thread.pgsDataReady.disconnect()
-                    except:
+                        if self._subtitle_manager:
+                            self.mvc_decoder_thread.pgsDataReady.disconnect(
+                                self._subtitle_manager.on_pgs_data)
+                        else:
+                            self.mvc_decoder_thread.pgsDataReady.disconnect()
+                    except (RuntimeError, TypeError):
                         pass
+                    self._pgs_streaming_connected = False
                 logger.info("[MVC CLEANUP] All decoder signals disconnected")
             except Exception as e:
                 logger.warning(f"[MVC CLEANUP] Error disconnecting signals: {e}")
@@ -7908,46 +9104,70 @@ class PlayerWindow(QMainWindow):
             self.mvc_decoder_thread.requestInterruption()
             logger.info("[MVC CLEANUP] Stop signal sent to decoder thread")
 
-            # STEP 4: Wait for thread to finish (with timeout)
-            if not self.mvc_decoder_thread.wait(5000):  # 5s timeout (increased from 3s)
-                logger.error("[MVC CLEANUP] Thread did not stop in 5s! Force terminating...")
-                # CRITICAL FIX: NEVER call terminate() on a thread inside a C-extension!
-                # Calling terminate() causes "Windows fatal exception: access violation" (0xc0000005)
-                # because it kills the thread while it's holding a lock or inside edge264.dll.
-                # Last resort: try terminate() with additional wait
+            # STEP 4: Wait for thread to finish (with timeout).
+            #
+            # NEVER call QThread.terminate() here: the worker can be inside edge264
+            # or the native demuxer while holding locks. Killing it would make every
+            # subsequent cleanup operation a possible use-after-free. If native I/O
+            # does not return, retain the QThread and all of its native ownership in a
+            # leak list. This mirrors the HEVC leak-over-UAF policy.
+            _mvc_thread = self.mvc_decoder_thread
+            thread_dead = bool(_mvc_thread.wait(5000))
+            self._mvc_shutdown_blocked = (not thread_dead) or bool(_mvc_survivors)
+            if not thread_dead:
+                if not hasattr(self, '_mvc_leaked'):
+                    self._mvc_leaked = []
                 try:
-                    self.mvc_decoder_thread.terminate()
-                    if not self.mvc_decoder_thread.wait(1000):  # 1s for terminate
-                        logger.critical("[MVC CLEANUP] Thread still alive after terminate! App may hang...")
-                except:
-                    pass  # Terminate may fail, we continue anyway
-
-            logger.info("[MVC CLEANUP] Decoder thread stopped successfully")
+                    # The QThread object normally has the main window as QObject
+                    # parent. Detach it or closing the window would delete the live
+                    # child despite the Python leak-list reference and trigger
+                    # "QThread: Destroyed while thread is still running".
+                    _mvc_thread.setParent(None)
+                except RuntimeError:
+                    pass
+                self._mvc_leaked.append(_mvc_thread)
+                logger.critical(
+                    "[MVC CLEANUP] Decoder thread did not stop in 5 s; it was NOT "
+                    "force-terminated. Native ownership is retained to prevent a "
+                    "use-after-free. A second MVC decoder will not be started."
+                )
+            else:
+                logger.info("[MVC CLEANUP] Decoder thread stopped successfully")
+                _mvc_thread.deleteLater()
             self.mvc_decoder_thread = None
             self._last_display_frame_ts = None
             self._display_fps_avg = None
 
-        # STEP 5: Clear framepacking windows and flush OpenGL textures
-        if hasattr(self, 'mvc_embedded_widget') and self.mvc_embedded_widget:
+        # STEP 5: Clear framepacking windows and flush OpenGL textures.
+        # EVERY display widget, not the embedded+framepack pair this used to name
+        # one by one. stop_playback's own clearing loop does not cover this: the
+        # natural end of a film reaches THIS method directly (_on_mvc_finished
+        # sets _playback_ended and posts _stop_mvc_decoder on a 300 ms timer,
+        # while stop_playback early-returns on that same flag), and so does the
+        # decoder-error path via _fallback_from_edge264. An unlisted widget
+        # therefore keeps the last frame frozen at exactly the moment a Dual
+        # Projector user is looking at the screen -- on both projectors.
+        # The two pre-existing log lines are reproduced verbatim per widget.
+        _emb = getattr(self, 'mvc_embedded_widget', None)
+        _fpw = getattr(getattr(self, 'framepacking_window', None),
+                       'display_widget', None)
+        for _w in self._display_widgets():
+            if _w is _emb:
+                _label = "Embedded widget"
+            elif _w is _fpw:
+                _label = "Framepacking window"
+            else:
+                _label = f"Eye window ({getattr(_w, 'eye_view', None) or '?'})"
             try:
                 # V7b FIX: Clear OpenGL textures to prevent stale frames during seek
-                if hasattr(self.mvc_embedded_widget, 'clear_textures'):
-                    self.mvc_embedded_widget.clear_textures()
-                logger.info("[MVC CLEANUP] Embedded widget cleared")
+                if hasattr(_w, 'clear_textures'):
+                    _w.clear_textures()
+                logger.info(f"[MVC CLEANUP] {_label} cleared")
             except Exception as e:
-                logger.warning(f"[MVC CLEANUP] Error clearing embedded widget: {e}")
-
-        if hasattr(self, 'framepacking_window') and self.framepacking_window:
-            try:
-                # V7b FIX: Clear OpenGL textures to prevent stale frames during seek
-                if hasattr(self.framepacking_window.display_widget, 'clear_textures'):
-                    self.framepacking_window.display_widget.clear_textures()
-                logger.info("[MVC CLEANUP] Framepacking window cleared")
-            except Exception as e:
-                logger.warning(f"[MVC CLEANUP] Error clearing framepacking window: {e}")
+                logger.warning(f"[MVC CLEANUP] Error clearing {_label.lower()}: {e}")
 
         # STEP 6: Close demuxer
-        if self.demuxer:
+        if self.demuxer and not getattr(self, '_mvc_shutdown_blocked', False):
             try:
                 self.demuxer.close()
             except:
@@ -7964,6 +9184,9 @@ class PlayerWindow(QMainWindow):
         # Clear MVC mode flag and references
         self.mvc_mode_active = False
         self.active_mvc_widget = None  # CRITICAL: Release reference to widget
+        self._edge264_waiting_for_first_frame = False
+        self._edge264_mpv_handoff_done = False
+        self._edge264_pre_handoff_widget = None
 
         # V7c FIX: Do NOT clear PGS subtitles during MVC decoder restart
         # The subtitle parser should persist across decoder stop/start cycles
@@ -8092,13 +9315,35 @@ class PlayerWindow(QMainWindow):
         # 3840x1012 frame (~140 MB/s at 24 fps).
         return left, right
 
+    @staticmethod
+    def _planes_for_target(target, left_planes, right_planes):
+        """Which eye(s) this presentation target wants.
+
+        A Dual Projector window shows ONE eye through the renderer's '2d' mode,
+        which samples only the first three textures -- so its own eye's planes
+        go in the FIRST slot and the second is left empty. Every other target
+        (framepack, embedded preview) keeps receiving the full pair."""
+        eye = getattr(target, 'eye_view', None)
+        if eye == 'right':
+            return (right_planes, None)
+        if eye == 'left':
+            return (left_planes, None)
+        return (left_planes, right_planes)
+
     @Slot(object, object)
     def _on_mvc_frame_yuv_ready(self, left_planes, right_planes):
-        """Dispatch one decoded MVC frame to every visible render target.
+        """Dispatch one decoded stereo frame to every visible presentation target.
 
         Both numpy tuples are passed by reference — no extra copy made here.
-        The embedded widget and the detached framepack window can render the
-        same frame simultaneously (kept in sync) without doubling decode cost.
+        The detached framepack window owns vsync while visible; the embedded
+        main-window preview is updated with a non-blocking Present(0), and its 2D
+        renderer uploads only the left-eye planes. This keeps both windows alive
+        without the old 2x-six-plane upload / two-blocking-vsync performance trap.
+
+        In Dual Projector mode the two eye windows REPLACE the framepack window
+        as the targets (same picture, cut in two): the left eye becomes the
+        timing authority, the right eye and the preview follow with Present(0),
+        and each eye window receives only its own eye's planes.
         """
         # Validate planes — bail out silently on malformed input (decoder transient)
         if (not left_planes or not right_planes
@@ -8106,6 +9351,22 @@ class PlayerWindow(QMainWindow):
             return
         for plane in (*left_planes, *right_planes):
             if plane is None or not isinstance(plane, np.ndarray):
+                return
+
+        # Startup transaction: MPV stays on-screen while demux/edge264 warms up.
+        # The first structurally valid decoded frame is the commit point; only
+        # then do we release MPV's D3D11 output and expose the native widget.
+        if (not getattr(self, '_hevc_mode_active', False)
+                and getattr(self, '_edge264_waiting_for_first_frame', False)):
+            try:
+                signal_owner = self.sender()
+            except Exception:
+                signal_owner = None
+            if (signal_owner is not None and self.mvc_decoder_thread is not None
+                    and signal_owner is not self.mvc_decoder_thread):
+                logger.debug("[EDGE264-HANDOFF] Ignoring a queued frame from a stale decoder")
+                return
+            if not self._commit_edge264_video_handoff():
                 return
 
         # A valid frame means edge264 is healthy again — clear the crash streak so
@@ -8128,31 +9389,38 @@ class PlayerWindow(QMainWindow):
                 logger.error(f"[PACKED-3D] frame split failed: {e}")
                 return
 
-        # Enumerate currently visible targets, deduplicated by identity
-        targets = []
-        seen = set()
-
-        def _add(widget):
-            if widget is None or id(widget) in seen:
-                return
-            seen.add(id(widget))
-            targets.append(widget)
-
         embedded = getattr(self, 'mvc_embedded_widget', None)
         fp_window = getattr(self, 'framepacking_window', None)
-        if embedded is not None and embedded.isVisible():
-            _add(embedded)
-        if fp_window is not None and fp_window.isVisible():
-            _add(fp_window.display_widget)
+        presentations = _select_stereo_presentation_targets(
+            embedded, fp_window, getattr(self, 'active_mvc_widget', None),
+            getattr(self, 'eye_windows', None))
+        targets = [widget for widget, _ in presentations]
 
-        # Fallback: during init/transitions no widget may be visible yet but
-        # the active target still needs the frame to keep its texture fresh.
-        if not targets:
-            _add(getattr(self, 'active_mvc_widget', None))
+        eye_active = bool(getattr(self, 'eye_windows', None))
+        if len(presentations) > 1 and not getattr(self, '_dual_output_logged', False):
+            self._dual_output_logged = True
+            if eye_active:
+                logger.info("[FRAME-ROUTE] Dual Projector active: left eye=vsync, "
+                            "right eye + main preview=non-blocking, one eye each")
+            else:
+                logger.info("[FRAME-ROUTE] dual presentation active: framepack=vsync, "
+                            "main preview=non-blocking left eye")
 
-        for target in targets:
+        cast = getattr(self, '_cast', None)
+        cast_frame_uploaded = False
+        for target, use_vsync in presentations:
             try:
-                target.set_frame_yuv_views(left_planes, right_planes)
+                # NativeFramepackWidget reads this immediately in the same GUI
+                # thread. An attribute keeps the call contract compatible with
+                # older/test widgets while the new renderer honours Present(0).
+                target.present_vsync = bool(use_vsync)
+                _first, _second = self._planes_for_target(
+                    target, left_planes, right_planes)
+                delivered = target.set_frame_yuv_views(_first, _second)
+                if (delivered is not False and cast is not None and
+                        getattr(target, '_r', None) is getattr(cast, '_renderer', None)
+                        and getattr(target, 'current_stereo_mode', 1) != 0):
+                    cast_frame_uploaded = True
             except Exception as e:
                 logger.error(f"[FRAME-ROUTE] delivery to {type(target).__name__} failed: {e}")
 
@@ -8175,6 +9443,41 @@ class PlayerWindow(QMainWindow):
                 ref = targets[0] if targets else getattr(self, 'active_mvc_widget', None)
                 sdr = getattr(ref, '_sdr_white_level', None)
                 tap.push(left_planes, right_planes, sm, sdr)
+
+        # SyLC Cast (Task 13): feed the SAME decoded stereo frame to an active cast
+        # session. Fires AFTER the display's own set_frame_yuv_views above (same GUI
+        # thread, same planes), so the cast's upload + NVENC-encode never disturbs the
+        # on-screen picture; push() returns fast and self-drops frames under backpressure.
+        if cast is not None:
+            # 8-bit sessions cannot take uint16 planes (silent low-byte truncation +
+            # R16<->R8 texture thrash on the shared renderer). A Main10 session CAN:
+            # the pack reads the same R16 planes the display uploaded (plane_scale
+            # aligns SW/HW layouts) into a P010 surface -- so only gate the 10-bit
+            # push when the session is NOT main10.
+            if left_planes[0].dtype != np.uint8 and not getattr(cast, 'is_main10', False):
+                if not getattr(self, '_cast_10bit_warned', False):
+                    self._cast_10bit_warned = True
+                    logger.warning("[CAST] 10-bit 3D source (uint16 planes) not supported by "
+                                   "the v1 cast path; skipping cast push")
+                    self.show_3d_notification(
+                        "Streaming to Quest: 10-bit video is not supported in v1.",
+                        success=False)
+            else:
+                # Dual Projector presents the SAME stereo pair through two one-eye
+                # windows instead of the framepack window, which it hides -- so the
+                # frame being cast is still stereo and this gate must say so, or the
+                # Quest silently receives mono for the whole session.
+                csm = 1 if (eye_active or
+                            (fp_window is not None and fp_window.isVisible())) else 0
+                cref = targets[0] if targets else getattr(self, 'active_mvc_widget', None)
+                csdr = getattr(cref, '_sdr_white_level', None)
+                cast.push(
+                    left_planes,
+                    right_planes,
+                    csm,
+                    csdr,
+                    frame_already_uploaded=cast_frame_uploaded,
+                )
 
         self._record_display_frame_stats()
 
@@ -8229,103 +9532,27 @@ class PlayerWindow(QMainWindow):
         """
         raw_timestamp = timestamp
 
-        # DISABLED by default to avoid thread-safety crashes
-        if not self._audio_sync_enabled:
-            self._last_mvc_timestamp = raw_timestamp
-            return
+        # V62 SYNC-FIX: Disable the external drift corrector. The decoder's
+        # internal V12 loop is now the master authority; fighting it from here
+        # with a stale MPV clock was the cause of the 19.98 fps cap.
+        self._last_mvc_timestamp = raw_timestamp
+        if raw_timestamp > 0:
+            self._set_ui_time(raw_timestamp)
+        return
 
-        # Safety checks
-        if not self.player or not self.mvc_mode_active:
-            self._last_mvc_timestamp = raw_timestamp
-            return
-
-        try:
-            # Timestamp is already absolute since the decoder thread fix
-            absolute_timestamp = raw_timestamp
-
-            # Get the current MPV audio position (thread-safe?)
-            # V7b STABILITY FIX: Protect MPV access from crashes
-            try:
-                audio_pos = self.player.time_pos
-            except (RuntimeError, OSError):
-                # MPV access failed from decoder thread
-                return
-            if audio_pos is None or not isinstance(audio_pos, (int, float)):
-                return
-
-            # === SMART AUDIO SYNC ALGORITHM ===
-            # Velvet #9: make this corrector aware of the V58 video-delay offset so it targets the
-            # SAME delayed position the decoder's V12 sync does, instead of fighting it. When it was
-            # V58-unaware it read raw_timestamp-audio_pos as a ~610ms "lag" and railed the decoder
-            # PI to -250ms -> video paced ~25% fast -> a constant brake/race judder. Targeting the
-            # offset lets both correctors cooperate -> stable, smooth playback.
-            av_offset = 0.0
-            if self.mvc_decoder_thread is not None:
-                av_offset = getattr(self.mvc_decoder_thread, '_av_sync_offset_s', 0.0) or 0.0
-
-            # 1. Low-pass bias filter: Cancel constant offsets without abrupt skips
-            raw_error_ms = (raw_timestamp - audio_pos + av_offset) * 1000.0  # Convert to ms
-
-            if abs(raw_error_ms) < self.SYNC_BIAS_WINDOW_MS:
-                # Learn bias from small errors (adaptive low-pass filter)
-                self._sync_bias += raw_error_ms * self.SYNC_BIAS_LEARNING_RATE
-                self._sync_bias = max(min(self._sync_bias, self.SYNC_BIAS_MAX_MS), -self.SYNC_BIAS_MAX_MS)
-
-            # 2. Apply bias correction to video timestamp
-            absolute_timestamp = raw_timestamp - (self._sync_bias / 1000.0)  # Back to seconds
-            self._last_mvc_timestamp = absolute_timestamp
-
-            # 3. Calculate residual error after bias correction
-            sync_error_ms = (absolute_timestamp - audio_pos + av_offset) * 1000.0  # ms for comparison
-            now = time.monotonic()
-
-            # 4. Progressive drift correction (3-tier strategy)
-            if abs(sync_error_ms) < self.SYNC_ACCEPTABLE_MS:
-                # Tier 1: Perfect sync - Reset drift accumulator
-                self._cumulative_drift = 0.0
-                if self.mvc_decoder_thread and hasattr(self.mvc_decoder_thread, 'adjust_timing_drift'):
-                    self.mvc_decoder_thread.adjust_timing_drift(0.0)
-
-            elif abs(sync_error_ms) < self.SYNC_MICRO_ADJUST_MS:
-                # Tier 2: Small drift (200-500ms) - Micro timing adjustments
-                if (now - self._last_drift_adjust_time) > self.SYNC_DRIFT_THROTTLE_S:
-                    self._cumulative_drift = sync_error_ms / 1000.0  # seconds
-                    if self.mvc_decoder_thread and hasattr(self.mvc_decoder_thread, 'adjust_timing_drift'):
-                        self.mvc_decoder_thread.adjust_timing_drift(self._cumulative_drift)
-                        self._last_drift_adjust_time = now
-
-                    # Adaptive logging: Only every 48 frames (2s @ 24fps)
-                    if frame_id % 48 == 0:
-                        logger.debug(f"[AUDIO SYNC] Micro-adjust: {sync_error_ms:.1f}ms "
-                                    f"(bias={self._sync_bias:.1f}ms, video={absolute_timestamp:.3f}s)")
-
-            else:
-                # Tier 3: Large drift (>500ms) - Gentle timing adjustment only
-                if (now - self._last_drift_adjust_time) > self.SYNC_DRIFT_THROTTLE_S:
-                    if self.mvc_decoder_thread and hasattr(self.mvc_decoder_thread, 'adjust_timing_drift'):
-                        try:
-                            self.mvc_decoder_thread.adjust_timing_drift(sync_error_ms / 1000.0)
-                            self._last_drift_adjust_time = now
-
-                            # Adaptive logging: Every 120 frames (~5s @ 24fps)
-                            if frame_id % 120 == 0:
-                                direction = "ahead" if sync_error_ms > 0 else "behind"
-                                logger.warning(f"[AUDIO SYNC] Large drift {sync_error_ms:.1f}ms ({direction}) "
-                                             f"(bias={self._sync_bias:.1f}ms, gentle timing)")
-                        except Exception as e:
-                            logger.error(f"[AUDIO SYNC] Timing adjust failed: {e}")
-
-            self._last_frame_timestamp = absolute_timestamp
-            
-            # 5. Direct UI update with bias-corrected timestamp
-            # This ensures the timeline matches the actual sync-adjusted playback
-            if absolute_timestamp > 0:
-                self._set_ui_time(absolute_timestamp)
-
-        except AttributeError as e:
-            logger.error(f"[SYNC] Player attribute error: {e}")
-        except Exception as e:
-            logger.error(f"[SYNC] Error during synchronization: {e}")
+    @Slot(float)
+    def _on_hevc_position(self, t_s):
+        """HEVC-native timeline feed (HevcDecodeThread.positionChanged, ~4 Hz):
+        same contract as the MVC per-frame timestamp slot above, and the ONLY
+        position clock in HEVC mode (_update_playback_position stands down).
+        Vital for no-audio media, where the mpv shell never produces a
+        time-pos."""
+        self._last_mvc_timestamp = t_s
+        # Keep the relative-seek base in sync now that the position poller no
+        # longer maintains it in HEVC mode.
+        self._current_precise_time = float(t_s)
+        if t_s > 0 and not self._is_scrubbing and not getattr(self, '_is_seeking', False):
+            self._set_ui_time(t_s)
 
     @Slot()
     def _on_mvc_finished(self):
@@ -8368,9 +9595,9 @@ class PlayerWindow(QMainWindow):
             self._playback_timer.stop()
             logger.info("[MVC FINISHED] Playback timer stopped")
 
-        # CRITICAL FIX: Set is_playing to False immediately
-        # The MPV pause callback may not fire reliably
-        self.is_playing = False
+        # MPV callbacks are suppressed during this transition; reset the
+        # transport synchronously instead.
+        self._set_playback_stopped_ui()
 
         # CRITICAL FIX V2: Clear MVC file detection flag to prevent timer restart
         # The _handle_pause_change callback keeps timer active if _mvc_file_detected is True
@@ -8393,9 +9620,6 @@ class PlayerWindow(QMainWindow):
         except Exception as e:
             logger.warning(f"[MVC FINISHED] Could not pause/stop MPV: {e}")
 
-        # Update UI to show paused state
-        self.controls_overlay.set_paused(True)
-
         # V14b GRACEFUL ENDING: Increase delay to 300ms for MPV event loop to settle
         # The decoder needs time to exit AND MPV event thread needs to calm down
         QTimer.singleShot(300, self._stop_mvc_decoder)
@@ -8403,6 +9627,7 @@ class PlayerWindow(QMainWindow):
     def _record_display_frame_stats(self):
         now = time.perf_counter()
         self._last_decoder_activity_ts = time.monotonic()
+        self._last_watchdog_dump_ts = 0.0
         if self._last_display_frame_ts is not None:
             delta = now - self._last_display_frame_ts
             if delta > 0:
@@ -8492,7 +9717,12 @@ class PlayerWindow(QMainWindow):
             # switches silently stopped taking effect (the picture froze mis-scaled). The fix
             # below removes the ambiguity by mode-gating: current_stereo_mode in ('sbs','tab')
             # IS that missing signal, so the hide is recognized and ignored, not raced.
-            if getattr(self, 'current_stereo_mode', 'mvc') in ('sbs', 'tab'):
+            # 'dual' added (fix round 1, Finding 1): _set_dual_projector_enabled(True)
+            # hides framepacking_window as part of ENTERING Dual Projector, which fires
+            # this same handler synchronously (fp.hide() -> hideEvent -> visibilityChanged
+            # -> here) -- exactly the same ambiguity SBS/TAB already solved, just with a
+            # third deliberate-hide reason.
+            if getattr(self, 'current_stereo_mode', 'mvc') in ('sbs', 'tab', 'dual'):
                 logger.info("[VISIBILITY] Framepacking window hidden during SBS/TAB "
                             "presentation — expected (main-window 3D); is_3d preserved")
                 return
@@ -8535,6 +9765,11 @@ class PlayerWindow(QMainWindow):
                     btn.blockSignals(False)
                     logger.info("[3D-BUTTON] Auto-deactivated (framepacking window closed)")
                 self.is_3d_enabled = False
+                
+                # SyLC Cast: Auto-stop cast if running, because the 3D renderer is shutting down
+                if getattr(self, '_cast', None) is not None:
+                    self._on_cast_requested(None)
+                    logger.info("[CAST] Auto-stopped because framepacking window closed")
             except Exception as e:
                 logger.warning(f"[3D-BUTTON] Could not auto-deactivate: {e}")
 
@@ -8568,8 +9803,18 @@ class PlayerWindow(QMainWindow):
             self._last_decoder_activity_ts = time.monotonic()
             return
 
+        # The transactional edge264 startup guard owns this phase and has a
+        # topology-aware deadline (12 s mono, 25 s MVC). Dumping all process
+        # stacks every three seconds before the first frame is both misleading
+        # and expensive on the very systems we are trying to diagnose.
+        if getattr(self, '_edge264_waiting_for_first_frame', False):
+            return
+
         now = time.monotonic()
-        if now - self._last_decoder_activity_ts > 5.0:
+        last_dump = getattr(self, '_last_watchdog_dump_ts', 0.0)
+        if (now - self._last_decoder_activity_ts > 5.0 and
+                (not last_dump or now - last_dump >= 15.0)):
+            self._last_watchdog_dump_ts = now
             logger.error("[WATCHDOG] MVC decoder stalled for >5s. Dumping stack traces...")
             try:
                 import faulthandler
@@ -8584,10 +9829,13 @@ class PlayerWindow(QMainWindow):
                     self._last_decoder_activity_ts = now
 
     def _delayed_start_decoder(self, disable_mpv=False):
-        """Start MVC decoder thread after OpenGL is fully initialized"""
+        """Start edge264 while retaining MPV video until the first native frame."""
         try:
             if disable_mpv:
-                self._disable_mpv_video_output()
+                # Kept for call-site compatibility. Early disable used to turn a
+                # demuxer probe failure into a black screen; handoff now happens
+                # transactionally in _commit_edge264_video_handoff().
+                logger.warning("[EDGE264-HANDOFF] Ignoring unsafe early MPV-disable request")
 
             if self.mvc_decoder_thread:
                 # Initialize activity timestamp and start watchdog
@@ -8608,6 +9856,12 @@ class PlayerWindow(QMainWindow):
 
                 self.mvc_decoder_thread.start()
                 logger.info("[MVC INIT] Decoder thread started")
+                if getattr(self, '_edge264_waiting_for_first_frame', False):
+                    timeout_ms = _edge264_startup_timeout_ms(self.video_3d_info)
+                    self._edge264_startup_timer.start(timeout_ms)
+                    logger.info(
+                        f"[EDGE264-STARTUP] First-frame guard armed for "
+                        f"{timeout_ms / 1000:.0f}s; MPV video retained")
             else:
                 logger.error("[MVC INIT] mvc_decoder_thread is None!")
                 self._mvc_restarting = False
@@ -8625,6 +9879,35 @@ if __name__ == "__main__":
     # Support for PyInstaller on Windows
     import multiprocessing
     multiprocessing.freeze_support()
+
+    # --- Build-verification hook (release smoke only) ---------------------------
+    # When SYLC_EXPORT_SELFTEST names an output file, resolve the MV-HEVC export
+    # tool paths in the CURRENT deployment (standalone dist / onefile launcher dir)
+    # and dump the verdict as JSON, then exit before any GUI/Qt init. Lets the
+    # release build prove tools\x265 + tools\gpac discovery in both layouts with
+    # no window and no full export. No-op for normal launches.
+    _selftest_out = os.environ.get('SYLC_EXPORT_SELFTEST')
+    if _selftest_out:
+        _st = {}
+        try:
+            import mvhevc_exporter as _me
+            _st['x265'] = _me.X265
+            _st['mp4box'] = _me.MP4BOX
+            _st['x265_isfile'] = os.path.isfile(_me.X265)
+            _st['mp4box_isfile'] = os.path.isfile(_me.MP4BOX)
+            _st['tools_available'] = bool(_me.tools_available())
+        except Exception as _e:
+            _st['error'] = repr(_e)
+        _st['argv0'] = sys.argv[0] if sys.argv else None
+        _st['executable'] = sys.executable
+        _st['onefile_parent'] = os.environ.get('NUITKA_ONEFILE_PARENT')
+        try:
+            import json as _json
+            with open(_selftest_out, 'w', encoding='utf-8') as _f:
+                _json.dump(_st, _f, indent=2)
+        except Exception:
+            pass
+        raise SystemExit(0)
 
     # Enable faulthandler to a file (never stderr) to capture real crashes.
     #
@@ -8646,7 +9929,16 @@ if __name__ == "__main__":
     import faulthandler
     try:
         _script_dir = os.path.dirname(os.path.abspath(__file__))
-        _crash_log = open(os.path.join(_script_dir, "crash_log.txt"), "w", encoding="utf-8")
+        # Append instead of overwriting the only crash evidence on every launch,
+        # and use the per-user writable log directory for installed/onefile builds.
+        os.makedirs(_SYLC_LOG_DIR, exist_ok=True)
+        _crash_log = open(
+            os.path.join(_SYLC_LOG_DIR, "crash_log.txt"),
+            "a", encoding="utf-8")
+        _crash_log.write(
+            f"\n=== SyLC launch {time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"pid={os.getpid()} ===\n")
+        _crash_log.flush()
         faulthandler.enable(file=_crash_log, all_threads=True)
         print(f"[FAULTHANDLER] Enabled -> {_crash_log.name}")
     except Exception as e:

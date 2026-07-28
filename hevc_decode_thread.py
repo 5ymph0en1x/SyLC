@@ -45,6 +45,11 @@ class HevcDecodeThread(QThread):
     frameYUVReady = Signal(object, object)
     endOfStream = Signal()
     decodeFailed = Signal(str)
+    # Position of the frame just emitted, in SECONDS, throttled to ~4 Hz.
+    # This is the UI timeline's only live position source for files where the
+    # mpv shell has nothing to play (no audio track): frameYUVReady carries no
+    # pts, and mpv's time-pos stays dead for such media.
+    positionChanged = Signal(float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -129,6 +134,7 @@ class HevcDecodeThread(QThread):
         last_interval_s = 1.0 / 24.0     # repli quand une frame n'a pas de pts
         last_pts_ms = None
         nopts_count = 0
+        last_pos_emit_ms = None      # throttle de positionChanged (~4 Hz)
         # --- [HEVC-METER] instrumentation (SYLC_HEVC_DIAG=1, silent otherwise) ---
         _diag = os.environ.get("SYLC_HEVC_DIAG") == "1"
         _m_emit = []             # emit-to-emit intervals (ms) over the 5 s window
@@ -154,6 +160,14 @@ class HevcDecodeThread(QThread):
                     anchor_wall, anchor_pts = None, target
                     last_pts_ms = None
                 if self._paused:
+                    # Re-anchor at resume: pacing is wall-anchored (due =
+                    # anchor_wall + pts), so an untouched anchor turns the
+                    # whole pause into a debt of past-due frames — on resume
+                    # the video bursts at decode speed until it has caught up
+                    # exactly the paused duration, landing that far ahead of
+                    # the audio. Dropping the anchor makes the first resumed
+                    # frame re-anchor at the current wall time instead.
+                    anchor_wall = None
                     time.sleep(0.01)
                     continue
                 out = self._read_next_pair()
@@ -244,6 +258,13 @@ class HevcDecodeThread(QThread):
                         _m_master_lo = None
                         _m_master_hi = None
                 self.frameYUVReady.emit(left, right)
+                # Timeline feed: throttled (250 ms of pts progress, or any
+                # backward jump = seek) so the GUI never sees a per-frame storm.
+                if pts_ms >= 0 and (last_pos_emit_ms is None
+                                    or pts_ms - last_pos_emit_ms >= 250
+                                    or pts_ms < last_pos_emit_ms):
+                    last_pos_emit_ms = pts_ms
+                    self.positionChanged.emit(pts_ms / 1000.0)
             except Exception as e:
                 logger.error(f"[HEVC] exception inattendue du thread: {e}")
                 self.decodeFailed.emit(f"exception thread: {e}")

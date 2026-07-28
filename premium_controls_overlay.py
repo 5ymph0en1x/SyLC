@@ -25,13 +25,14 @@ import time
 logger = logging.getLogger(__name__)
 from PySide6.QtWidgets import (
     QWidget, QSlider, QPushButton, QHBoxLayout, QVBoxLayout, QLabel,
-    QComboBox, QSizePolicy, QGraphicsDropShadowEffect, QFrame, QLayout, QMenu
+    QComboBox, QSizePolicy, QGraphicsDropShadowEffect, QFrame, QLayout, QMenu,
+    QWidgetAction
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QRectF, QPointF, QPoint, QSize, QPropertyAnimation, QEasingCurve, Property, Slot
 from PySide6.QtGui import (
     QPainter, QColor, QFont, QFontMetrics, QPen, QBrush,
     QPainterPath, QLinearGradient, QRadialGradient, QConicalGradient, QPixmap,
-    QImage, QGuiApplication, QAction
+    QImage, QGuiApplication, QAction, QActionGroup, QIcon, QPolygonF
 )
 
 # (license/subscription system removed - freeware build)
@@ -974,8 +975,11 @@ class PremiumTimelineSlider(QSlider):
                 self.preview_requested.emit(self._hover_time)
 
             # Tooltip follows the mouse IMMEDIATELY (position + time pill);
-            # only the image updates asynchronously.
-            if self._video_file:
+            # only the image updates asynchronously. GATED on _thumbs_allowed:
+            # on optical-class sources (physical disc / mounted ISO) thumbnails
+            # can never be extracted, so the tooltip would be a permanently
+            # empty black frame following the cursor -- show nothing instead.
+            if self._video_file and self._thumbs_allowed:
                 gp = self.mapToGlobal(QPointF(pos, 0).toPoint())
                 self._preview_widget.set_time_text(self._fmt_time(self._hover_time))
                 key = round(self._hover_time)
@@ -1385,23 +1389,19 @@ class PremiumSpectrumMeter(QWidget):
     motion is a level-driven envelope rather than literal frequency content.)
     """
     BANDS = 22
-    PREF_W, FIXED_H = 180, 40   # preferred footprint when the bar has room
+    MIN_W, PREF_W, FIXED_H = 104, 188, 40
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        # The VU meter is the FLEXIBLE middle of the control bar: it sits between
-        # the transport buttons and the 3D controls and is the deficit absorber.
-        # It shows at PREF_W when there's room but may shrink all the way to 0 so
-        # the bar's layout minimum never forces the overlay wider than the parent
-        # window (which pushed the fullscreen button past the right edge — see the
-        # fix_bar_overflow report). Fixed height, min width 0, capped at PREF_W so
-        # it never balloons on wide windows.
+        # This is a first-class piece of telemetry at standard player widths.
+        # It may still compress responsively in a genuinely narrow window so the
+        # fullscreen control never overflows.
         self.setFixedHeight(self.FIXED_H)
         self.setMinimumWidth(0)
         self.setMaximumWidth(self.PREF_W)
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setToolTip("Audio spectrum")
+        self.setToolTip("Live audio level")
         n = self.BANDS
         self._h = [0.0] * n          # smoothed bar heights 0..1
         self._level = 0.0            # latest overall level 0..1
@@ -1463,23 +1463,23 @@ class PremiumSpectrumMeter(QWidget):
             return
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
-        n = self.BANDS
-        # When the bar is tight the layout shrinks us toward 0; below a few px
-        # there's no room for legible bars, so draw nothing rather than cram a
-        # smear of clipped rectangles (the VU is decorative — safe to vanish).
-        if w < 12:
+        available = w
+        if available < 12:
             return
+
+        n = max(5, min(self.BANDS, int(available / 5.0)))
         top, bot = 6.0, h - 6.0
         span = bot - top
-        gap = 2.5
-        bar_w = max(2.0, (w - gap * (n + 1)) / n)
+        gap = 2.0
+        bar_w = max(1.5, (available - gap * (n + 1)) / n)
         rad = min(2.0, bar_w / 2.0)
         grad = QLinearGradient(0, top, 0, bot)
         grad.setColorAt(0.0, QColor(150, 233, 255))
         grad.setColorAt(0.4, QColor(40, 196, 255))
         grad.setColorAt(1.0, QColor(8, 90, 130))
         x = gap
-        for i in range(n):
+        for draw_index in range(n):
+            i = int(round(draw_index * (self.BANDS - 1) / max(1, n - 1)))
             # unlit track
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(255, 255, 255, 12))
@@ -1523,26 +1523,16 @@ class PremiumControlsOverlay(QWidget):
     disc_opened = Signal()  # open a Blu-ray 3D disc/folder (auto-detect the feature)
     archive_requested = Signal()  # archive the current optical disc to an .iso image
     export_mvhevc_requested = Signal(str)  # export current 3D media to MV-HEVC .mov; arg = 'quality'|'fast'
+    cast_requested = Signal(str)  # start/stop casting the live 3D session to the Quest; arg = 'wifi'|'usb'
     stereo_mode_changed = Signal(str)
     mode_3d_toggled = Signal(bool)
     audio_track_changed = Signal(int)
     subtitle_track_changed = Signal(int)
 
-    # Every string SyLC_3D_Player._format_badge_label() can hand to
-    # set_format_badge() (swept from all call sites). The badge slot is sized
-    # to fit the WIDEST of these so the control bar never reflows when the
-    # badge's text changes or the badge is hidden/shown.
-    FORMAT_BADGE_LABELS = (
-        "MultiView 3D",
-        "Full-SBS 3D",
-        "SBS 3D",
-        "Full-TAB 3D",
-        "TAB 3D",
-    )
-
     # Items offered by the stereo-mode combo (display labels only — the
     # internal mode keys are unaffected, see stereo_mode_combo below).
-    STEREO_COMBO_ITEMS = ("MultiView", "Side-by-Side", "Top-Bottom")
+    STEREO_COMBO_ITEMS = ("MultiView", "Side-by-Side", "Top-Bottom", "Dual Projector")
+    METER_STANDARD_LAYOUT_WIDTH = 1180
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1550,6 +1540,12 @@ class PremiumControlsOverlay(QWidget):
         # Window flags for overlay
         self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # Never ACTIVATE on show: this is a top-level Tool window, and a plain
+        # show()/raise_() activates it — Windows then yanks the whole ownership
+        # group (the player) above every other app each time the bar reappears.
+        # Buttons/combos still work: clicks activate on demand; the bar just
+        # cannot steal the foreground by merely becoming visible.
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
 
         self._setup_ui()
         self._connect_signals()
@@ -1611,7 +1607,7 @@ class PremiumControlsOverlay(QWidget):
         self.open_disc_button = PremiumIconButton('disc', 'medium')
         self.open_disc_button.setToolTip("Open Blu-ray 3D (drive or BDMV folder)")
         self.archive_button = PremiumIconButton('archive', 'medium')
-        self.archive_button.setToolTip("Sauvegarde / Export")
+        self.archive_button.setToolTip("Backup / Export")
         # EX-4: the former ISO button now opens a unified « Sauvegarde / Export »
         # QMenu (ISO of the disc + MV-HEVC .mov export). The button itself is
         # never disabled anymore (the individual menu entries carry their own
@@ -1680,35 +1676,9 @@ class PremiumControlsOverlay(QWidget):
         self.mode_3d_button.setCheckable(True)
         self.mode_3d_button.setToolTip("Toggle 3D mode")
 
-        # 3D format badge — a contextual cyan pill shown ONLY when a stereoscopic
-        # stream is detected & adapted by edge264, so the user sees the player
-        # recognised the stream. Hidden by default; the player sets the adaptive
-        # label (Full-SBS 3D / SBS 3D / Full-TAB 3D / TAB 3D / MVC 3D).
-        #
-        # The slot must NEVER reflow the bar when the badge appears/disappears
-        # or when its text changes between labels of different lengths, so:
-        #   - retainSizeWhenHidden keeps the layout space reserved while hidden
-        #   - a fixed width (from font metrics of the widest possible label)
-        #     means show()/setText() never changes the widget's footprint
-        self.format_badge = QLabel()
-        self.format_badge.setObjectName("formatBadge")
-        self.format_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        badge_qss_font = "font-size: 11px; font-weight: 700; letter-spacing: 0.4px;"
-        self.format_badge.setStyleSheet(
-            "#formatBadge {"
-            " color: #7FEBFF;"
-            " background-color: rgba(45, 212, 255, 0.13);"
-            " border: 1px solid rgba(45, 212, 255, 0.55);"
-            " border-radius: 9px; padding: 2px 10px;"
-            f" font-family: 'Segoe UI'; {badge_qss_font} }}"
-        )
-        badge_slot_width = self._compute_format_badge_width()
-        badge_size_policy = self.format_badge.sizePolicy()
-        badge_size_policy.setHorizontalPolicy(QSizePolicy.Policy.Fixed)
-        badge_size_policy.setRetainSizeWhenHidden(True)
-        self.format_badge.setSizePolicy(badge_size_policy)
-        self.format_badge.setFixedWidth(badge_slot_width)
-        self.format_badge.hide()
+        # Compatibility attribute for older host code. The visual format badge
+        # has deliberately been removed; the full slot belongs to the VU meter.
+        self.format_badge = None
 
         # Stereo mode combo
         self.stereo_mode_combo = QComboBox()
@@ -1752,12 +1722,10 @@ class PremiumControlsOverlay(QWidget):
         # right_group.addWidget(sep1)
 
 
-        # Audio spectrum visualiser — fills the gap between the transport and the 3D controls
+        # Audio telemetry: always keeps a legible footprint at standard widths.
         self.vu_meter = PremiumSpectrumMeter()
-        right_group.addWidget(self.vu_meter)
-        right_group.addSpacing(12)
-        right_group.addWidget(self.format_badge)
-        right_group.addSpacing(6)
+        right_group.addWidget(self.vu_meter, 1)
+        right_group.addSpacing(8)
         right_group.addWidget(self.mode_3d_button)
         right_group.addWidget(self.stereo_mode_combo)
         right_group.addWidget(sep2)
@@ -1772,25 +1740,16 @@ class PremiumControlsOverlay(QWidget):
 
         main_layout.addLayout(controls_layout)
 
-    def _compute_format_badge_width(self):
-        """Fixed width for the format-badge slot: font-metrics width of the
-        WIDEST label in FORMAT_BADGE_LABELS, plus the badge's own CSS chrome
-        (padding: 2px 10px + 1px border each side) and a small safety margin
-        for letter-spacing (0.4px/char, not counted by QFontMetrics) and
-        hinting/DPI rounding. Using one fixed width for every label means the
-        slot's footprint never changes when the text changes or the badge is
-        hidden/shown."""
-        font = QFont('Segoe UI')
-        font.setPixelSize(11)
-        font.setBold(True)
-        fm = QFontMetrics(font)
-        widest = max(self.FORMAT_BADGE_LABELS, key=lambda s: fm.horizontalAdvance(s))
-        text_width = fm.horizontalAdvance(widest)
-        letter_spacing_slack = 0.4 * max(0, len(widest) - 1)
-        padding = 10 * 2   # "padding: 2px 10px" -> 10px left + 10px right
-        border = 1 * 2     # "border: 1px solid ..." on both sides
-        safety_margin = 8  # hinting/DPI rounding slack
-        return int(text_width + letter_spacing_slack + padding + border + safety_margin)
+    def resizeEvent(self, event):
+        """Keep audio telemetry guaranteed at normal widths, responsive below."""
+        meter = getattr(self, 'vu_meter', None)
+        if meter is not None:
+            minimum = (meter.MIN_W
+                       if event.size().width() >= self.METER_STANDARD_LAYOUT_WIDTH
+                       else 0)
+            if meter.minimumWidth() != minimum:
+                meter.setMinimumWidth(minimum)
+        super().resizeEvent(event)
 
     def _compute_stereo_combo_width(self):
         """Font-metrics width covering the longest STEREO_COMBO_ITEMS entry,
@@ -1854,6 +1813,220 @@ class PremiumControlsOverlay(QWidget):
             }
         """)
 
+    _EXPORT_MENU_STYLE = """
+        QMenu#sylcExportMenu {
+            background-color: rgba(20, 22, 30, 252);
+            color: #F0F2F7;
+            border: 1px solid rgba(69, 194, 245, 88);
+            border-radius: 12px;
+            padding: 8px;
+            font-family: "Segoe UI";
+            font-size: 10pt;
+        }
+        QMenu#sylcExportMenu::item {
+            min-height: 28px;
+            padding: 7px 34px 7px 42px;
+            margin: 2px 1px;
+            border: 1px solid transparent;
+            border-radius: 8px;
+        }
+        QMenu#sylcExportMenu::item:selected {
+            color: #FFFFFF;
+            background: qlineargradient(
+                x1: 0, y1: 0, x2: 1, y2: 0,
+                stop: 0 rgba(0, 200, 255, 58),
+                stop: 1 rgba(77, 116, 255, 34)
+            );
+            border: 1px solid rgba(74, 207, 255, 105);
+        }
+        QMenu#sylcExportMenu::item:disabled {
+            color: rgba(151, 158, 177, 128);
+            background: transparent;
+            border-color: transparent;
+        }
+        QMenu#sylcExportMenu::item:checked {
+            color: #FFFFFF;
+            background-color: rgba(0, 200, 255, 32);
+        }
+        QMenu#sylcExportMenu::icon {
+            left: 13px;
+            width: 20px;
+            height: 20px;
+        }
+        QMenu#sylcExportMenu::indicator {
+            width: 15px;
+            height: 15px;
+            left: 14px;
+        }
+        QMenu#sylcExportMenu::separator {
+            height: 1px;
+            margin: 7px 10px;
+            background-color: rgba(255, 255, 255, 24);
+        }
+        QMenu#sylcExportMenu::right-arrow {
+            right: 12px;
+        }
+        QWidget#sylcMenuHeader {
+            background: transparent;
+        }
+        QLabel#sylcMenuEyebrow {
+            color: #59D8FF;
+            font-family: "Segoe UI";
+            font-size: 8pt;
+            font-weight: 700;
+            letter-spacing: 1px;
+            background: transparent;
+        }
+        QLabel#sylcMenuSubtitle {
+            color: #9299AA;
+            font-family: "Segoe UI";
+            font-size: 9pt;
+            background: transparent;
+        }
+        QToolTip {
+            color: #F4F6FA;
+            background-color: #20242F;
+            border: 1px solid rgba(89, 216, 255, 100);
+            border-radius: 6px;
+            padding: 6px 8px;
+        }
+    """
+
+    @staticmethod
+    def _export_menu_icon(kind, color=None):
+        """Return a crisp, theme-native vector icon for the export menus."""
+        accent = QColor(color or PremiumColors.ACCENT_PRIMARY)
+        pixmap = QPixmap(40, 40)
+        pixmap.setDevicePixelRatio(2.0)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(accent, 1.65)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        if kind == 'disc':
+            painter.drawEllipse(QRectF(2.5, 2.5, 15.0, 15.0))
+            painter.drawEllipse(QRectF(7.7, 7.7, 4.6, 4.6))
+            painter.drawArc(QRectF(5.0, 5.0, 10.0, 10.0), 35 * 16, 85 * 16)
+        elif kind == 'spatial':
+            painter.drawRoundedRect(QRectF(2.0, 4.5, 10.5, 11.0), 2.5, 2.5)
+            painter.drawRoundedRect(QRectF(7.5, 4.5, 10.5, 11.0), 2.5, 2.5)
+            painter.setBrush(QBrush(accent))
+            painter.drawEllipse(QRectF(8.3, 8.3, 3.4, 3.4))
+        elif kind == 'quality':
+            path = QPainterPath()
+            path.moveTo(10.0, 1.8)
+            path.lineTo(12.0, 7.6)
+            path.lineTo(18.2, 10.0)
+            path.lineTo(12.0, 12.1)
+            path.lineTo(10.0, 18.2)
+            path.lineTo(7.9, 12.1)
+            path.lineTo(1.8, 10.0)
+            path.lineTo(7.9, 7.6)
+            path.closeSubpath()
+            painter.drawPath(path)
+            painter.setBrush(QBrush(accent))
+            painter.drawEllipse(QRectF(8.2, 8.2, 3.6, 3.6))
+        elif kind == 'fast':
+            painter.setBrush(QBrush(accent))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPolygon(QPolygonF([
+                QPointF(11.2, 1.5), QPointF(4.2, 11.0),
+                QPointF(9.2, 11.0), QPointF(7.8, 18.5),
+                QPointF(16.0, 8.3), QPointF(10.8, 8.3),
+            ]))
+        elif kind == 'eye':
+            path = QPainterPath()
+            path.moveTo(1.5, 10.0)
+            path.cubicTo(5.0, 4.3, 15.0, 4.3, 18.5, 10.0)
+            path.cubicTo(15.0, 15.7, 5.0, 15.7, 1.5, 10.0)
+            path.closeSubpath()
+            painter.drawPath(path)
+            painter.setBrush(QBrush(accent))
+            painter.drawEllipse(QRectF(7.4, 7.4, 5.2, 5.2))
+        elif kind == 'auto':
+            painter.drawArc(QRectF(3.0, 3.0, 14.0, 14.0), 35 * 16, 285 * 16)
+            painter.setBrush(QBrush(accent))
+            painter.drawPolygon(QPolygonF([
+                QPointF(15.0, 2.2), QPointF(18.3, 3.7), QPointF(15.7, 6.0)
+            ]))
+        elif kind in ('left', 'right'):
+            painter.drawEllipse(QRectF(2.5, 2.5, 15.0, 15.0))
+            font = QFont("Segoe UI", 9, QFont.Weight.Bold)
+            painter.setFont(font)
+            painter.drawText(QRectF(2.5, 2.2, 15.0, 15.0),
+                             Qt.AlignmentFlag.AlignCenter,
+                             'L' if kind == 'left' else 'R')
+        elif kind == 'quest':
+            path = QPainterPath()
+            path.moveTo(2.0, 11.7)
+            path.lineTo(3.1, 6.0)
+            path.cubicTo(3.5, 4.4, 5.0, 3.4, 6.7, 3.4)
+            path.lineTo(13.3, 3.4)
+            path.cubicTo(15.0, 3.4, 16.5, 4.4, 16.9, 6.0)
+            path.lineTo(18.0, 11.7)
+            path.cubicTo(18.3, 13.5, 17.0, 15.0, 15.3, 15.0)
+            path.cubicTo(13.7, 15.0, 13.0, 12.2, 10.0, 12.2)
+            path.cubicTo(7.0, 12.2, 6.3, 15.0, 4.7, 15.0)
+            path.cubicTo(3.0, 15.0, 1.7, 13.5, 2.0, 11.7)
+            painter.drawPath(path)
+        elif kind == 'wifi':
+            painter.drawArc(QRectF(1.5, 2.0, 17.0, 17.0), 38 * 16, 104 * 16)
+            painter.drawArc(QRectF(5.0, 6.0, 10.0, 10.0), 38 * 16, 104 * 16)
+            painter.setBrush(QBrush(accent))
+            painter.drawEllipse(QRectF(8.5, 14.5, 3.0, 3.0))
+        elif kind == 'usb':
+            painter.drawLine(QPointF(10.0, 17.5), QPointF(10.0, 4.0))
+            painter.drawLine(QPointF(10.0, 8.0), QPointF(5.7, 5.4))
+            painter.drawLine(QPointF(10.0, 11.0), QPointF(14.3, 8.5))
+            painter.setBrush(QBrush(accent))
+            painter.drawEllipse(QRectF(8.4, 15.7, 3.2, 3.2))
+            painter.drawRect(QRectF(3.9, 3.6, 3.2, 3.2))
+            painter.drawPolygon(QPolygonF([
+                QPointF(14.3, 5.4), QPointF(17.0, 8.2), QPointF(11.6, 8.2)
+            ]))
+
+        painter.end()
+        return QIcon(pixmap)
+
+    def _prepare_export_menu(self, menu, minimum_width):
+        """Apply the same visual contract to every menu in the export tree."""
+        menu.setObjectName("sylcExportMenu")
+        menu.setStyleSheet(self._EXPORT_MENU_STYLE)
+        menu.setToolTipsVisible(True)
+        menu.setSeparatorsCollapsible(False)
+        menu.setMinimumWidth(minimum_width)
+
+    @staticmethod
+    def _add_export_menu_header(menu, title, subtitle, minimum_width):
+        """Add a non-command header so each level states its purpose at a glance."""
+        header_action = QWidgetAction(menu)
+        header = QWidget(menu)
+        header.setObjectName("sylcMenuHeader")
+        header.setMinimumWidth(max(240, minimum_width - 18))
+        header.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        layout = QVBoxLayout(header)
+        layout.setContentsMargins(12, 7, 12, 9)
+        layout.setSpacing(2)
+
+        eyebrow = QLabel(title, header)
+        eyebrow.setObjectName("sylcMenuEyebrow")
+        eyebrow.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        subtitle_label = QLabel(subtitle, header)
+        subtitle_label.setObjectName("sylcMenuSubtitle")
+        subtitle_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        layout.addWidget(eyebrow)
+        layout.addWidget(subtitle_label)
+
+        header_action.setDefaultWidget(header)
+        header_action.setEnabled(False)
+        menu.addAction(header_action)
+        return header_action
+
     def _build_export_menu(self):
         """EX-4: build the unified « Sauvegarde / Export » QMenu attached to the
         (former ISO) archive_button.
@@ -1862,7 +2035,8 @@ class PremiumControlsOverlay(QWidget):
           * « Créer un ISO du disque » — emits archive_requested (the UNCHANGED
             existing ISO archiving flow). Enabled only for a physical Blu-ray
             disc/ISO source — the host refreshes it on aboutToShow.
-          * « Exporter en MV-HEVC (.mov) » submenu with a Qualité / Rapide choice,
+          * "Export to MV-HEVC (.mov)" submenu with a Quality / Fast choice,
+            plus a per-source eye-order override (Automatic / Left / Right),
             each emitting export_mvhevc_requested('quality'|'fast'). Enabled only
             for an exportable 3D source with the export tools present — the host
             refreshes the submenu's enabled state, tooltip and title (it becomes
@@ -1874,29 +2048,155 @@ class PremiumControlsOverlay(QWidget):
         export_fast_action) and wires them to signals here.
         """
         menu = QMenu(self.archive_button)
-        menu.setToolTipsVisible(True)   # show the disabled-entry explanation tooltips
+        self._prepare_export_menu(menu, 340)
+        self.export_menu_header = self._add_export_menu_header(
+            menu, "BACKUP & EXPORT", "Disc image  ·  Apple Spatial  ·  Quest", 340)
 
-        self.iso_action = QAction("Créer un ISO du disque", menu)
+        self.iso_action = QAction("Create a disc ISO image", menu)
+        self.iso_action.setIcon(self._export_menu_icon('disc'))
         self.iso_action.triggered.connect(lambda: self.archive_requested.emit())
+        self.iso_action.setStatusTip("Create a lossless ISO backup of the inserted disc.")
         menu.addAction(self.iso_action)
 
         menu.addSeparator()
 
-        sub = QMenu("Exporter en MV-HEVC (.mov)", menu)
-        sub.setToolTipsVisible(True)
-        self.export_quality_action = QAction("Qualité (lente, CRF 20)", sub)
+        sub = QMenu("Export to MV-HEVC (.mov)", menu)
+        self._prepare_export_menu(sub, 370)
+        sub.setIcon(self._export_menu_icon('spatial'))
+        self.export_mvhevc_header = self._add_export_menu_header(
+            sub, "APPLE SPATIAL VIDEO",
+            "Two-view MV-HEVC  ·  Vision Pro ready", 370)
+        self.export_quality_action = QAction("Quality (slow, CRF 20)", sub)
+        self.export_quality_action.setIcon(self._export_menu_icon('quality'))
         self.export_quality_action.triggered.connect(
             lambda: self.export_mvhevc_requested.emit('quality'))
-        self.export_fast_action = QAction("Rapide (moyenne, CRF 23)", sub)
+        self.export_fast_action = QAction("Fast (medium, CRF 23)", sub)
+        self.export_fast_action.setIcon(
+            self._export_menu_icon('fast', PremiumColors.WARNING))
         self.export_fast_action.triggered.connect(
             lambda: self.export_mvhevc_requested.emit('fast'))
+        self.export_quality_action.setToolTip(
+            "Best visual quality. Uses the slow x265 preset at CRF 20.")
+        self.export_fast_action.setToolTip(
+            "Faster export. Uses the medium x265 preset at CRF 23.")
         sub.addAction(self.export_quality_action)
         sub.addAction(self.export_fast_action)
+        sub.setDefaultAction(self.export_quality_action)
+        sub.addSeparator()
+
+        # Absolute source order is less error-prone than a sticky "swap" toggle:
+        # it states what the first packed plane / MVC base view actually is.
+        self.export_eye_order_menu = QMenu("Source eye order", sub)
+        self._prepare_export_menu(self.export_eye_order_menu, 390)
+        self.export_eye_order_menu.setIcon(self._export_menu_icon('eye'))
+        self.export_eye_order_header = self._add_export_menu_header(
+            self.export_eye_order_menu, "SOURCE LAYOUT",
+            "Define which decoded view belongs to the left eye", 390)
+        self.export_eye_order_group = QActionGroup(self.export_eye_order_menu)
+        self.export_eye_order_group.setExclusive(True)
+        self.export_eye_auto_action = QAction("Automatic (metadata)", self.export_eye_order_menu)
+        self.export_eye_left_action = QAction("Left eye first / MVC base is left",
+                                              self.export_eye_order_menu)
+        self.export_eye_right_action = QAction("Right eye first / MVC base is right",
+                                               self.export_eye_order_menu)
+        self.export_eye_auto_action.setIcon(self._export_menu_icon('auto'))
+        self.export_eye_left_action.setIcon(self._export_menu_icon('left'))
+        self.export_eye_right_action.setIcon(self._export_menu_icon('right'))
+        for action in (self.export_eye_auto_action,
+                       self.export_eye_left_action,
+                       self.export_eye_right_action):
+            action.setCheckable(True)
+            self.export_eye_order_group.addAction(action)
+            self.export_eye_order_menu.addAction(action)
+        self.export_eye_auto_action.setChecked(True)
+        self.export_eye_auto_action.setToolTip(
+            "Use Stereo3D/Matroska/Blu-ray metadata; SyLC asks if metadata is absent.")
+        self.export_eye_left_action.setToolTip(
+            "Treat the left/top packed plane or MVC base view as the left eye.")
+        self.export_eye_right_action.setToolTip(
+            "Treat the first left/top packed plane or MVC base view as the right eye.")
+        sub.addMenu(self.export_eye_order_menu)
         menu.addMenu(sub)
 
         self.export_mvhevc_menu = sub
+
+        # « Diffuser vers Quest » — cast the LIVE 3D session to the headset over
+        # Wi-Fi or USB-C (SyLC Cast). Mirrors the MV-HEVC submenu idiom above. The
+        # host (SyLC_3D_Player) owns enablement/tooltip in _update_export_menu_state
+        # (active 3D session + renderer.cast_available()) and toggles start/stop via
+        # the _on_cast_requested handler wired to cast_requested.
+        menu.addSeparator()
+        cast_sub = QMenu("Stream to Quest", menu)
+        self._prepare_export_menu(cast_sub, 320)
+        cast_sub.setIcon(
+            self._export_menu_icon('quest', PremiumColors.SUCCESS))
+        self.cast_menu_header = self._add_export_menu_header(
+            cast_sub, "SYLC CAST", "Live stereoscopic playback  ·  Quest", 320)
+        self.cast_wifi_action = QAction("Wi-Fi", cast_sub)
+        self.cast_wifi_action.setIcon(self._export_menu_icon('wifi'))
+        self.cast_wifi_action.triggered.connect(
+            lambda: self.cast_requested.emit('wifi'))
+        self.cast_usb_action = QAction("USB-C", cast_sub)
+        self.cast_usb_action.setIcon(
+            self._export_menu_icon('usb', PremiumColors.INFO))
+        self.cast_usb_action.triggered.connect(
+            lambda: self.cast_requested.emit('usb'))
+        cast_sub.addAction(self.cast_wifi_action)
+        cast_sub.addAction(self.cast_usb_action)
+        menu.addMenu(cast_sub)
+
+        self.cast_menu = cast_sub
+        # Status lights (témoin) on the two transports: refreshed by the host
+        # via set_cast_transport_state() at cast start/stop and on status.
+        self._cast_light_state = (None, False)   # (active_kind, connected)
         self.export_menu = menu
         self.archive_button.setMenu(menu)
+
+    @classmethod
+    def _export_menu_icon_with_status(cls, kind, color, state):
+        """The transport icon with a status light (témoin) composited at its
+        bottom-right corner: green = session on this transport with the Quest
+        connected, orange = session up, waiting for the headset, no dot =
+        inactive. Drawn over the same glyph _export_menu_icon renders, so the
+        icon itself is untouched."""
+        base = cls._export_menu_icon(kind, color)
+        if state is None:
+            return base
+        pixmap = base.pixmap(40, 40)          # the 20x20-logical DPR-2 canvas
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        dot = QColor(PremiumColors.SUCCESS if state == 'connected'
+                     else PremiumColors.WARNING)
+        # Physical pixels on the 40px canvas (= 6.5px logical dot, bottom-right).
+        cx, cy, r = 31.0, 31.0, 6.5
+        halo = QColor(dot)
+        halo.setAlpha(70)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(halo))
+        painter.drawEllipse(QPointF(cx, cy), r + 2.5, r + 2.5)
+        painter.setBrush(QBrush(dot))
+        painter.drawEllipse(QPointF(cx, cy), r, r)
+        painter.end()
+        pixmap.setDevicePixelRatio(2.0)
+        return QIcon(pixmap)
+
+    def set_cast_transport_state(self, active_kind, connected=False):
+        """Refresh the Stream-to-Quest status lights (témoins). active_kind:
+        'wifi', 'usb' or None (no session). connected: the Quest client is
+        attached (green) vs the session waiting for it (orange)."""
+        state = (active_kind, bool(connected))
+        if state == getattr(self, '_cast_light_state', None):
+            return
+        self._cast_light_state = state
+        for kind, action, base_color in (
+                ('wifi', getattr(self, 'cast_wifi_action', None), None),
+                ('usb', getattr(self, 'cast_usb_action', None), PremiumColors.INFO)):
+            if action is None:
+                continue
+            dot = None
+            if active_kind == kind:
+                dot = 'connected' if connected else 'waiting'
+            action.setIcon(self._export_menu_icon_with_status(kind, base_color, dot))
 
     def _connect_signals(self):
         """Connects internal signals."""
@@ -1961,17 +2261,12 @@ class PremiumControlsOverlay(QWidget):
         pass
 
     def set_format_badge(self, text, tooltip="Decoded by edge264"):
-        """Show the contextual 3D-format badge (only for detected stereo streams)."""
-        if not text:
-            self.clear_format_badge()
-            return
-        self.format_badge.setText(text)
-        self.format_badge.setToolTip(tooltip)
-        self.format_badge.show()
+        """Compatibility no-op: the format badge is intentionally not rendered."""
+        return
 
     def clear_format_badge(self):
-        """Hide the 3D-format badge (2D content / stopped / mpv fallback)."""
-        self.format_badge.hide()
+        """Compatibility no-op: the format badge is intentionally not rendered."""
+        return
 
     def set_tech_info(self, resolution="", fps="", codec=""):
         """Updates the technical info."""
@@ -1991,6 +2286,13 @@ class PremiumControlsOverlay(QWidget):
     def set_paused(self, is_paused):
         """Changes play/pause icon."""
         self.play_pause_button.icon_type = 'play' if is_paused else 'pause'
+        self.play_pause_button.setToolTip("Play" if is_paused else "Pause")
+        self.play_pause_button.update()
+
+    def set_playback_stopped(self):
+        """Force the transport to its canonical stopped appearance."""
+        self.play_pause_button.icon_type = 'play'
+        self.play_pause_button.setToolTip("Play")
         self.play_pause_button.update()
 
     def set_fullscreen_icon(self, is_fullscreen):
@@ -2145,7 +2447,8 @@ class PremiumControlsOverlay(QWidget):
         # "MultiView" is the display label for the internal 'mvc' key (unchanged everywhere
         # internal). "MVC" kept as an alias for robustness against older callers.
         mode_map = {"MultiView": "mvc", "MVC": "mvc",
-                    "Side-by-Side": "sbs", "Top-Bottom": "tab"}
+                    "Side-by-Side": "sbs", "Top-Bottom": "tab",
+                    "Dual Projector": "dual"}
         self.stereo_mode_changed.emit(mode_map.get(text, "auto"))
 
     def _on_audio_track_changed(self, index):

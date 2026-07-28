@@ -13,9 +13,97 @@ offset 824, size 78) EXACTLY:
         stri (13B) = 0x03      FullBox v0/f0, 1 data byte (L+R views present)
         hero (13B) = 0x01      FullBox v0/f0, 1 data byte (left eye is hero)
 
-NO cams/blin/hfov/proj -- the spec's amended v1 decision (post-EX-1) is to
-reproduce this MINIMAL, PROVEN structure rather than speculate boxes that
-have no reference-validated home (spec Sec.3 "vexu maison -- AMENDE").
+That structure is the MINIMAL profile (`build_vexu_bytes()` with no optional
+argument), still available and still byte-exact against the reference.
+
+## Spatial extension (default since the hardening pass)
+
+An MV-HEVC file with only `eyes{stri,hero}` is a valid *stereo* file; what
+makes it an Apple *spatial* file is the additional shooting/presentation
+geometry a Vision Pro uses to size and place the stereo window:
+
+    vexu (126B)
+      must (16B)               requires=['eyes']          <- UNCHANGED
+      eyes (78B)
+        must (20B)              requires=['stri','hero']  <- UNCHANGED
+        stri (13B) = 0x03                                 <- UNCHANGED
+        hero (13B) = 0x01                                 <- UNCHANGED
+        cams (24B)
+          blin (16B) = uint32 stereo baseline, micrometres
+      proj (24B)
+        prji (16B) = 4CC projection kind ('rect' = flat stereo)
+    hfov (12B) = uint32 horizontal FOV, thousandths of a degree
+                 -- a PLAIN box (no version/flags), and a SIBLING of vexu in
+                 the visual sample entry, NOT a vexu child (see Verification)
+
+**The 78-byte reference core is embedded verbatim** -- the extension only
+appends siblings around it.
+
+Two deliberate safety properties:
+
+  1. **Nothing new joins a `must` list.** `must` is an instruction to REFUSE
+     the file when a listed box isn't understood. `vexu.must` therefore still
+     says `['eyes']` only, and `eyes.must` still says `['stri','hero']` only,
+     exactly as in the reference. A reader that has never heard of
+     `cams`/`proj`/`hfov` skips them (ISO/IEC 14496-12 unknown-box rule) and
+     plays the file exactly as it plays a minimal one. The extension can
+     only ever add information, never withhold playback.
+
+  2. **The values are honest conventions, not measurements, and they are
+     overridable.** A Blu-ray/MVC or packed-SBS source carries no rig
+     baseline and no lens FOV -- nothing survives the authoring chain. So
+     `blin` defaults to 65 mm (the conventional human interocular distance)
+     and `hfov` to 90 deg; `mvhevc_exporter` passes both through from its
+     `opts`, and passing `None` for any of them drops that box entirely
+     (`opts['vexu_minimal'] = True` drops all three, restoring the
+     reference-exact 78-byte box).
+
+## Verification -- what is proven, and what is not
+
+Stated plainly, because it is what the trust in this file rests on.
+
+**PROVEN.** The minimal core is byte-identical to a real Apple sample we
+hold (`docs\hevc_4k24P_main_multiview_1.mp4`). On top of that, three of the
+four extension boxes were round-tripped through ffmpeg's MOV demuxer -- an
+INDEPENDENT implementation of the same Apple structure, which has never
+seen this code. Reading back an export it produces:
+
+    "baseline": 65000                <- our eyes>cams>blin
+    "projection": "rectilinear"      <- our vexu>proj>prji = 'rect'
+    "primary_eye": "left"            <- our eyes>hero
+    (stereo view + view_ids 0,1)     <- our eyes>stri
+
+Re-muxing that same file with `ffmpeg -c copy` makes ffmpeg re-serialise
+what it understood, and it writes back `vexu{proj{prji}, eyes{stri, hero,
+cams{blin}}}` -- our own layout, from a program that has no idea we exist.
+Those four boxes are settled.
+
+**PROVEN (2026-07-27): `hfov` is a 12-byte PLAIN box SIBLING of vexu.**
+Settled by a four-way placement experiment against ffmpeg's MOV demuxer on
+a vexu-free MP4Box substrate (extract-ES + mux of the Apple sample):
+
+    A. FullBox inside `eyes`   (the old guess) -> hfov NOT read (0/1)
+    B. FullBox child of `vexu`                 -> hfov NOT read (0/1)
+    C. FullBox sibling of vexu                 -> BREAKS the whole sample-
+       entry parse: ffmpeg drops ALL the stereo side data, vexu included
+    D. PLAIN box (size + 'hfov' + uint32) sibling of vexu
+                                               -> horizontal_field_of_view
+                                                  = 90000/1000  READ BACK
+
+D matches the community documentation of iPhone-authored spatial files
+(vexu / hfov / lhvC as separate sample-entry atoms). Variant C is the
+cautionary tale: an unknown box with an unexpected 4-byte version/flags
+prefix at sample-entry level is NOT safely skipped -- never ship one.
+`build_hfov_bytes` writes D; `inject_vexu` splices it right after vexu in
+the same insertion. `hfov_mdeg=None` (or `opts['vexu_minimal']`) drops it.
+Legacy exports carry the old eyes-internal FullBox: harmless (skipped by
+every reader, per experiment A) and still parsed by `read_vexu` for
+backward compatibility, but no longer written.
+
+Worth knowing for the same reason: ffmpeg's writer drops the `must` boxes
+that Apple's own sample carries. Re-muxing one of our exports through
+ffmpeg therefore silently downgrades its vexu -- prefer the exporter's
+output as-is.
 
 ## Parent box (determined from EX-1's dump)
 
@@ -112,14 +200,28 @@ from mvhevc_exporter import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Fixed reference-minimal vexu parameters (spec Sec.3 amendment; EX-1 dump).
+# vexu parameters. The two `must`-listed values are the reference-minimal core
+# (spec Sec.3 amendment; EX-1 dump); the three below them are the SPATIAL
+# extension (see "Spatial extension" in the module docstring).
 # ---------------------------------------------------------------------------
-STRI_VALUE = 0x03   # bit0 has_left_eye_view | bit1 has_right_eye_view
+STRI_VALUE = 0x03   # bit0 has_right_eye_view | bit1 has_left_eye_view -> both present
 HERO_VALUE = 0x01   # hero_eye = left
 
+# 65 mm: the conventional human interocular distance, and what stereo-3D
+# authoring uses as the nominal rig baseline when the real one is unknown --
+# which it always is for a Blu-ray/MVC or packed-SBS source (no shooting
+# geometry survives in the container). Overridable per export.
+DEFAULT_BASELINE_UM = 65000
+# 90.000 degrees, in thousandths of a degree. Same caveat: a converted movie
+# carries no lens FOV, so this is a stated convention, not a measurement.
+DEFAULT_HFOV_MDEG = 90000
+PROJECTION_RECTANGULAR = b'rect'   # prji projection_kind for flat stereo video
+
 
 # ---------------------------------------------------------------------------
-# vexu box construction (byte-exact vs. the EX-1 reference dump)
+# vexu box construction. The MINIMAL profile is byte-exact vs. the EX-1
+# reference dump; the SPATIAL profile adds proj/cams/hfov AROUND that exact
+# core (see the module docstring for why none of them join a `must` list).
 # ---------------------------------------------------------------------------
 def _box(fourcc, payload):
     return struct.pack('>I', 8 + len(payload)) + fourcc + payload
@@ -129,18 +231,72 @@ def _fullbox(fourcc, payload, version_flags=b'\x00\x00\x00\x00'):
     return _box(fourcc, version_flags + payload)
 
 
-def _build_vexu_bytes(stri=STRI_VALUE, hero=HERO_VALUE):
-    """Build the vexu box byte-for-byte: vexu{must[eyes], eyes{must[stri,hero],
-    stri, hero}} -- reference-minimal, no cams/blin/hfov."""
-    stri_box = _fullbox(b'stri', bytes([stri]))
-    hero_box = _fullbox(b'hero', bytes([hero]))
+def build_vexu_bytes(stri=STRI_VALUE, hero=HERO_VALUE, baseline_um=None,
+                     projection=None):
+    """Build the vexu box bytes.
+
+    With every optional argument left at None this returns the MINIMAL,
+    reference-exact box: ``vexu{must[eyes], eyes{must[stri,hero], stri, hero}}``
+    (78 bytes, byte-identical to docs\\hevc_4k24P_main_multiview_1.mp4's).
+
+    Each optional argument adds one spatial box AROUND that untouched core:
+      baseline_um -> ``eyes{... cams{blin}}``  (uint32 micrometres)
+      projection  -> ``vexu{... proj{prji}}``  (4CC, 'rect' for flat stereo)
+
+    The horizontal FOV is deliberately NOT here: `hfov` is a SIBLING of vexu
+    in the sample entry (see `build_hfov_bytes` and "Verification" in the
+    module docstring), so it is spliced by `inject_vexu`, not built into
+    this box.
+
+    The `must` lists are deliberately NOT extended: `must` means "refuse the
+    file if you don't understand these", so listing an optional box there
+    would turn a purely additive hint into a hard incompatibility for any
+    reader that doesn't know it. Ordering follows the reference (must first);
+    box order among a container's children is not semantically significant
+    per ISO/IEC 14496-12.
+    """
+    stri_box = _fullbox(b'stri', bytes([stri & 0xFF]))
+    hero_box = _fullbox(b'hero', bytes([hero & 0xFF]))
     eyes_must = _fullbox(b'must', b'stri' + b'hero')
-    eyes_box = _box(b'eyes', eyes_must + stri_box + hero_box)
-    vexu_must = _fullbox(b'must', b'eyes')
-    return _box(b'vexu', vexu_must + eyes_box)
+    eyes_payload = eyes_must + stri_box + hero_box
+    if baseline_um is not None:
+        blin = _fullbox(b'blin', struct.pack('>I', _u32(baseline_um, 'baseline_um')))
+        eyes_payload += _box(b'cams', blin)
+    vexu_payload = _fullbox(b'must', b'eyes') + _box(b'eyes', eyes_payload)
+    if projection is not None:
+        if not isinstance(projection, bytes) or len(projection) != 4:
+            raise ValueError(f'projection must be a 4-byte 4CC, got {projection!r}')
+        vexu_payload += _box(b'proj', _fullbox(b'prji', projection))
+    return _box(b'vexu', vexu_payload)
 
 
-_VEXU_BYTES = _build_vexu_bytes()   # fixed, built once (78 bytes, matches EX-1 dump)
+def build_hfov_bytes(hfov_mdeg):
+    """The `hfov` box: 12 bytes, size + 'hfov' + uint32 thousandths of a
+    degree. A PLAIN box -- NO version/flags -- and a SIBLING of vexu in the
+    visual sample entry. Both facts are load-bearing and oracle-proven (see
+    "Verification" in the module docstring): with a version/flags prefix, or
+    placed anywhere inside vexu, ffmpeg's independent parser either ignores
+    the value or (FullBox sibling) rejects the whole sample entry's stereo
+    metadata."""
+    return _box(b'hfov', struct.pack('>I', _u32(hfov_mdeg, 'hfov_mdeg')))
+
+
+def _u32(value, name):
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f'{name} must be an integer, got {value!r}') from None
+    if not 0 <= v <= 0xFFFFFFFF:
+        raise ValueError(f'{name} out of uint32 range: {v}')
+    return v
+
+
+# Back-compat alias: EX-3 named this privately, and tests import it.
+_build_vexu_bytes = build_vexu_bytes
+
+_VEXU_BYTES = build_vexu_bytes()   # MINIMAL profile (78 bytes, matches EX-1 dump)
+_VEXU_SPATIAL_BYTES = build_vexu_bytes(baseline_um=DEFAULT_BASELINE_UM,
+                                       projection=PROJECTION_RECTANGULAR)
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +348,18 @@ def _find_vexu_range(f, hvc1_box):
     child_start = hoff + hheader + _VSE_SKIP
     for typ, off, size, header, box_end in _iter_boxes(f, child_start, hend):
         if typ == 'vexu':
+            return (off, size)
+    return None
+
+
+def _find_sibling_hfov_range(f, hvc1_box):
+    """Return (offset, size) of the 12-byte plain `hfov` box among hvc1_box's
+    children, or None. Only the exact oracle-proven shape qualifies (size 12,
+    plain 8-byte header) -- anything else is not ours to touch."""
+    _etyp, hoff, hsize, hheader, hend = hvc1_box
+    child_start = hoff + hheader + _VSE_SKIP
+    for typ, off, size, header, box_end in _iter_boxes(f, child_start, hend):
+        if typ == 'hfov' and size == 12 and header == 8:
             return (off, size)
     return None
 
@@ -259,8 +427,12 @@ def has_vexu(mov_path):
 
 
 def read_vexu(mov_path):
-    """Parse the vexu box's stri/hero values. Raises RuntimeError if no vexu
-    box (or no hvc1/hev1 sample entry at all) is present."""
+    """Parse the vexu box back into a dict. Raises RuntimeError if no vexu
+    box (or no hvc1/hev1 sample entry at all) is present.
+
+    Always carries 'stri' and 'hero'. The spatial keys ('baseline_um',
+    'projection', 'hfov_mdeg') appear ONLY when their box is present, so a
+    minimal-profile file still parses to exactly {'stri':..,'hero':..}."""
     with open(mov_path, 'rb') as f:
         f.seek(0, os.SEEK_END)
         fsize = f.tell()
@@ -273,29 +445,70 @@ def read_vexu(mov_path):
         voff, vsize = vexu_range
         f.seek(voff)
         raw = f.read(vsize)
-    return _parse_vexu(raw)
+        # Sibling hfov (the oracle-proven 12-byte plain box next to vexu).
+        # Scanned independently of the vexu parse; overrides any legacy
+        # eyes-internal value _parse_vexu may find in an old export.
+        sibling_hfov = None
+        _etyp, hoff, _hsize, hheader, hend = chain[-1]
+        for typ, off, size, header, _bend in _iter_boxes(
+                f, hoff + hheader + _VSE_SKIP, hend):
+            if typ == 'hfov' and size == 12 and header == 8:
+                f.seek(off + 8)
+                sibling_hfov = struct.unpack('>I', f.read(4))[0]
+                break
+    result = _parse_vexu(raw)
+    if sibling_hfov is not None:
+        result['hfov_mdeg'] = sibling_hfov
+    return result
 
 
 def _parse_vexu(raw):
-    """Parse a vexu box's raw bytes (its own 8-byte header included) into
-    {'stri': int, 'hero': int} by walking must/eyes/stri/hero."""
+    """Parse a vexu box's raw bytes (its own 8-byte header included).
+
+    Descends ONLY into real containers (eyes/cams/proj) -- `must`, `stri`,
+    `hero`, `blin`, `hfov`, `prji` are FullBox leaves whose payload would be
+    misparsed as bogus box headers (infinite-loop hazard) if walked."""
     result = {}
     bio = io.BytesIO(raw)
+
+    def _leaf_u8(off, header):
+        return raw[off + header + 4]                              # skip v/flags(4)
+
+    def _leaf_u32(off, header):
+        return struct.unpack('>I', raw[off + header + 4:off + header + 8])[0]
+
     for typ, off, size, header, box_end in _iter_boxes(bio, 8, len(raw)):
         if typ == 'eyes':
-            for etyp, eoff, esize, eheader, ebox_end in _iter_boxes(bio, off + header, box_end):
+            for etyp, eoff, esize, eheader, eend in _iter_boxes(bio, off + header, box_end):
                 if etyp == 'stri':
-                    result['stri'] = raw[eoff + eheader + 4]   # FullBox: skip v/flags(4)
+                    result['stri'] = _leaf_u8(eoff, eheader)
                 elif etyp == 'hero':
-                    result['hero'] = raw[eoff + eheader + 4]
+                    result['hero'] = _leaf_u8(eoff, eheader)
+                elif etyp == 'cams':
+                    for ctyp, coff, _cs, chdr, _ce in _iter_boxes(bio, eoff + eheader, eend):
+                        if ctyp == 'blin':
+                            result['baseline_um'] = _leaf_u32(coff, chdr)
+                elif etyp == 'hfov':
+                    result['hfov_mdeg'] = _leaf_u32(eoff, eheader)
+        elif typ == 'proj':
+            for ptyp, poff, _ps, phdr, _pe in _iter_boxes(bio, off + header, box_end):
+                if ptyp == 'prji':
+                    result['projection'] = raw[poff + phdr + 4:poff + phdr + 8]
     if 'stri' not in result or 'hero' not in result:
         raise RuntimeError('read_vexu: could not parse stri/hero out of the vexu box')
     return result
 
 
-def inject_vexu(mov_path):
-    """Inject the fixed reference-minimal vexu box (stri=0x03, hero=0x01)
-    into `mov_path`'s video trak's hvc1 sample entry, in place.
+def inject_vexu(mov_path, stri=STRI_VALUE, hero=HERO_VALUE,
+                baseline_um=DEFAULT_BASELINE_UM, hfov_mdeg=DEFAULT_HFOV_MDEG,
+                projection=PROJECTION_RECTANGULAR):
+    """Inject the vexu box into `mov_path`'s video trak's hvc1 sample entry,
+    in place.
+
+    Defaults write the SPATIAL profile (reference-exact core + cams/blin +
+    proj/prji + hfov -- see "Spatial extension" in the module docstring).
+    Pass ``baseline_um=None, hfov_mdeg=None, projection=None`` for the
+    MINIMAL, reference-byte-exact 78-byte box.
 
     Raises RuntimeError (clean, descriptive message) if:
       - no moov / no hvc1|hev1 sample entry can be located;
@@ -308,8 +521,16 @@ def inject_vexu(mov_path):
         patch trun/tfhd (documented limitation for foreign files).
 
     Idempotent: a no-op (file left byte-identical) if vexu is already
-    present -- see module docstring "Idempotence".
+    present -- see module docstring "Idempotence". Note this covers a
+    Tier-1 copy of a source that already carries its OWN vexu: we keep the
+    source's, rather than overwriting an authored one with our conventions.
     """
+    # One insertion, two sibling boxes: vexu, then the 12-byte plain hfov
+    # right after it (its oracle-proven home -- see the module docstring).
+    vexu_bytes = build_vexu_bytes(stri=stri, hero=hero, baseline_um=baseline_um,
+                                  projection=projection)
+    if hfov_mdeg is not None:
+        vexu_bytes += build_hfov_bytes(hfov_mdeg)
     probe = probe_mv_hevc_container(mov_path)
     if not probe['moov_found']:
         raise RuntimeError(f'vexu injection: no moov box found in {mov_path!r}')
@@ -343,7 +564,7 @@ def inject_vexu(mov_path):
     _mtyp, moov_off, moov_size, _mheader, moov_end = moov_box
     _htyp, _hoff, _hsize, _hheader, hvc1_end = hvc1_box
 
-    delta = len(_VEXU_BYTES)
+    delta = len(vexu_bytes)
 
     with open(mov_path, 'rb') as f:
         f.seek(moov_off)
@@ -362,7 +583,7 @@ def inject_vexu(mov_path):
     #    done last; insertion point uses the ORIGINAL hvc1_end, still valid
     #    since steps 1/2 never change moov_buf's length).
     insert_rel = hvc1_end - moov_off
-    moov_buf[insert_rel:insert_rel] = _VEXU_BYTES
+    moov_buf[insert_rel:insert_rel] = vexu_bytes
 
     # temp-then-atomic-move rewrite: [0, moov_off) + patched moov_buf +
     # [moov_end, EOF), all verbatim except moov_buf itself.
@@ -387,7 +608,9 @@ def inject_vexu(mov_path):
         raise RuntimeError(
             f'vexu injection: post-write verification failed -- vexu not '
             f'found in {mov_path!r} after rewrite (internal error)')
-    logger.info('[VEXU] injected stri=0x%02x hero=0x%02x into %s', STRI_VALUE, HERO_VALUE, mov_path)
+    logger.info('[VEXU] injected %dB stri=0x%02x hero=0x%02x baseline=%s hfov=%s proj=%s '
+                'into %s', len(vexu_bytes), stri, hero, baseline_um, hfov_mdeg,
+                projection.decode('latin1') if projection else None, mov_path)
 
 
 def remove_vexu(mov_path):
@@ -445,16 +668,20 @@ def remove_vexu(mov_path):
             raise RuntimeError(
                 f'vexu removal: no vexu box found under hvc1 in {mov_path!r} '
                 f'(internal error -- probe said has_vexu=True)')
+        # The sibling hfov travels with vexu: leaving it orphaned would make
+        # a later re-injection write a DUPLICATE next to it.
+        hfov_range = _find_sibling_hfov_range(f, chain[-1])
 
     moov_box = chain[0]
     _mtyp, moov_off, moov_size, _mheader, moov_end = moov_box
     voff, vsize = vexu_range
+    ranges = [vexu_range] + ([hfov_range] if hfov_range else [])
 
     with open(mov_path, 'rb') as f:
         f.seek(moov_off)
         moov_buf = bytearray(f.read(moov_size))
 
-    delta = -vsize
+    delta = -sum(size for _off, size in ranges)
 
     # 1) rebase stco/co64 (uses the CURRENT, pre-removal moov_end as the
     #    boundary -- same convention/comparison as inject_vexu; delta just
@@ -466,10 +693,12 @@ def remove_vexu(mov_path):
     for (typ, off, size, header, box_end) in chain:
         _patch_box_size(moov_buf, off - moov_off, size, header, delta)
 
-    # 3) splice the vexu bytes OUT (length-changing -- done last, mirroring
-    #    inject_vexu's insertion-last ordering).
-    rel_off = voff - moov_off
-    del moov_buf[rel_off:rel_off + vsize]
+    # 3) splice the vexu (and sibling hfov) bytes OUT (length-changing --
+    #    done last, mirroring inject_vexu's insertion-last ordering; highest
+    #    offset first so earlier ranges stay valid).
+    for r_off, r_size in sorted(ranges, reverse=True):
+        rel_off = r_off - moov_off
+        del moov_buf[rel_off:rel_off + r_size]
 
     # temp-then-atomic-move rewrite: [0, moov_off) + patched moov_buf +
     # [moov_end, EOF), all verbatim except moov_buf itself (moov_end here is
@@ -496,7 +725,8 @@ def remove_vexu(mov_path):
         raise RuntimeError(
             f'vexu removal: post-write verification failed -- vexu still '
             f'present in {mov_path!r} after rewrite (internal error)')
-    logger.info('[VEXU] removed vexu box from %s', mov_path)
+    logger.info('[VEXU] removed vexu box%s from %s',
+                ' (+sibling hfov)' if hfov_range else '', mov_path)
 
 
 def _copy_rest(fin, fout, chunk=4 * 1024 * 1024):

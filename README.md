@@ -9,7 +9,7 @@
 
 *Stereoscopic 3D Blu-ray (MVC) **and** modern MV-HEVC playback, decoded from scratch, rendered in native HDR — given to the community, no strings attached.*
 
-![Version](https://img.shields.io/badge/version-5.0.0-1f6feb?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-5.0.3-1f6feb?style=for-the-badge)
 ![Platform](https://img.shields.io/badge/Windows-x64-0078D6?style=for-the-badge&logo=windows&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.14-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/license-free%20%26%20open--source-2ea44f?style=for-the-badge)
@@ -23,6 +23,15 @@
 </div>
 
 ---
+
+## What's new in v5.0.3
+
+This release turns the player into a **living-room streamer** and finishes the HDR story:
+
+- **🥽 SyLC Cast — stream your 3D session to a Meta Quest, live.** One click sends the *playing* stereo session — both eyes, side by side — to a Quest 3 over **Wi-Fi (auto-discovery, zero setup)** or **USB-C**, encoded in hardware by **NVENC** at up to 500 Mbps with an adaptive quality ladder, receiver feedback, and instant reconnect. **Subtitles are burned in with their stereoscopic depth**, disc playback stays smooth while casting (cast audio is demuxed from the bytes the player already reads — never a second reader on the optical head), and the companion **receiver app** (included, `quest_app_native/`) picks its decoder by real capabilities. Status lights in the menu show at a glance whether the headset is connected.
+- **🌈 HDR, end to end.** On an HDR-enabled Windows display the renderer switches to its **scRGB** swapchain automatically and shows PQ content **without tone-mapping** (`SYLC_NATIVE_HDR=1/0` to force). And a 10-bit PQ source can now be **cast as HEVC Main10** (P010) with BT.2020 / ST 2084 signalled in-stream — the Quest's compositor reads the intent.
+- **📤 Export, hardened.** Fixed a subtle **x265 multiview bug** that macroblocked the right eye whenever a scene cut was denied a keyframe — every detected cut is now an aligned IDR inside 2-second closed GOPs (clean Vision Pro scrubbing). `hfov` now lives where Apple players actually read it, and export audio is always headset-safe **AAC**.
+- **🎯 Daily-driver polish.** Pause/resume on MV-HEVC no longer fast-forwards, audio-less files get a working playback bar, play-after-end replays the file, the window no longer steals the foreground, and disc seeks keep both eyes clean and A/V within ±8 ms.
 
 ## What's new in v5.0.0
 
@@ -57,6 +66,7 @@ As far as we know, it is **the only actively-developed, open-source player that 
 - 🎥 **HEVC decoded directly through libavcodec.** FSBS / FTAB / SBS / TAB up to 4K 10-bit, with **D3D11VA** hardware decode and bit-exact copy-back — plus **MV-HEVC** two-layer streams paired by PTS.
 - 🌈 **True HDR, not a tone-mapped fake.** Frames land in a 16-bit-float **scRGB** Direct3D 11 swapchain; a GPU shader does YUV→RGB and the stereo frame-packing in one pass. HDR10/PQ (BT.2020) is preserved end to end.
 - 🥽 **Real 3D output.** Frame-packed stereo to a detached window for 3D TVs, projectors and HMDs — plus an embedded 2D preview.
+- 🛰️ **Stream it to a headset.** The live 3D session casts to a Meta Quest over Wi-Fi or USB-C — NVENC-encoded, subtitle-burned, adaptive — with the receiver app included.
 - 📤 **Carry your 3D forward.** Export to **MV-HEVC QuickTime** (`hvc1+hvcC+lhvC`, `vexu`-signalled) — bit-exact remux when possible, otherwise re-encoded with an in-house multiview x265.
 - 🎯 **Pixel-exact.** The decoder's luma output has been verified byte-for-byte against FFmpeg's base view. It's not "close enough" — it's correct.
 - 🪶 **Self-contained.** One executable, or one portable folder. Nothing to install, no codec packs, no system pollution.
