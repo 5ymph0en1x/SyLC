@@ -87,6 +87,8 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
         .def_property_readonly("size", &FrameRingBuffer::size)
         .def_property_readonly("dropped", &FrameRingBuffer::dropped)
         .def_property_readonly("max_frame_bytes", &FrameRingBuffer::maxFrameBytes)
+        .def("clear", &FrameRingBuffer::clear,
+             "Drop every queued access unit (borrowed arrays remain valid)")
         .def("pop",
              [](std::shared_ptr<FrameRingBuffer> self) -> py::tuple {  // explicit return type: clang needs it (MSVC tolerant)
                  FrameBufferView view;
@@ -516,8 +518,19 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
              py::arg("ring_buffer"),
              "Demux next frame pair into a native ring buffer (zero-copy)")
         .def("seek", &MVCM2TSDemuxer::seek,
-             "Seek to timestamp in milliseconds (resets to start)",
-             py::arg("timestamp_ms"));
+             "Seek to a nearby clean IDR for a normalized timestamp",
+             py::arg("timestamp_ms"))
+        .def("set_external_duration_ms",
+             &MVCM2TSDemuxer::setExternalDurationMs,
+             "Provide media duration for timestamp-to-byte M2TS seeking",
+             py::arg("duration_ms"))
+        .def("getLastCueTimestamp",
+             &MVCM2TSDemuxer::getLastCueTimestamp,
+             "Return the normalized IDR timestamp selected by seek")
+        .def("request_abort", &MVCM2TSDemuxer::requestAbort,
+             "Cooperatively abort an in-flight probe/frame read")
+        .def("clear_abort", &MVCM2TSDemuxer::clearAbort,
+             "Clear the cooperative abort flag before reuse");
 
     // === SSIF DEMUXER (Blu-ray 3D with separate streams) ===
 
@@ -633,6 +646,22 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
              "Provide the BD3D Extent-Start-Point seek map (pts_ms[], ssif_byte[]) for "
              "byte-exact, both-views-aligned streaming seeks",
              py::arg("pts_ms"), py::arg("ssif_bytes"))
+        .def("enable_stream_tap", &MVCSSIFDemuxer::enableStreamTap,
+             "Tee the raw bytes the active reader already pulls off the disk into a "
+             "bounded buffer (drop-oldest), so cast audio can be demuxed WITHOUT a "
+             "second reader on the optical head. Returns False if no reader is open.",
+             py::arg("capacity_bytes") = size_t(32) * 1024 * 1024)
+        .def("disable_stream_tap", &MVCSSIFDemuxer::disableStreamTap,
+             "Detach and clear the cast-audio stream tap.")
+        .def("read_stream_tap",
+             [](MVCSSIFDemuxer& d, size_t maxBytes) {
+                 auto v = d.readStreamTap(maxBytes);
+                 return py::bytes(reinterpret_cast<const char*>(v.data()), v.size());
+             },
+             "Pop up to max_bytes of teed stream bytes (b'' when none pending).",
+             py::arg("max_bytes") = size_t(1) * 1024 * 1024)
+        .def("stream_tap_dropped", &MVCSSIFDemuxer::streamTapDropped,
+             "Total teed bytes discarded on overflow (drop-oldest) since enable.")
         .def("request_abort", &MVCSSIFDemuxer::requestAbort,
              "Cooperatively abort an in-flight read/scan. Safe to call from another thread "
              "(read_next_* releases the GIL); the read returns early so a slow cold/contended "
@@ -672,42 +701,71 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
     // === MVC DECODER (edge264 integration) ===
 
 #ifdef EDGE264_AVAILABLE
-    // Only expose MVCDecoder if edge264 is properly linked.
-    // If disabled (MSVC build for AV safety), this class will be missing,
-    // forcing Python to fallback to the ctypes implementation using edge264.dll.
+    // edge264 itself is loaded dynamically by MVCDecoder. The Python extension
+    // therefore stays MSVC-only and does not embed/link the MinGW static archive.
 
     // Decoded view structure
     py::class_<DecodedMVCFrame::View>(m, "DecodedView")
         .def_readonly("width", &DecodedMVCFrame::View::width)
         .def_readonly("height", &DecodedMVCFrame::View::height)
+        .def_readonly("chroma_width", &DecodedMVCFrame::View::chroma_width)
+        .def_readonly("chroma_height", &DecodedMVCFrame::View::chroma_height)
         .def_readonly("stride_y", &DecodedMVCFrame::View::stride_y)
         .def_readonly("stride_c", &DecodedMVCFrame::View::stride_c)
         .def_property_readonly("y_plane",
-            [](const DecodedMVCFrame::View& self) -> py::array_t<uint8_t> {
-                if (!self.y_plane) return py::array_t<uint8_t>();
-                return py::array_t<uint8_t>({self.height, self.stride_y}, self.y_plane);
+            [](py::object self_object) -> py::array_t<uint8_t> {
+                const auto& self = self_object.cast<const DecodedMVCFrame::View&>();
+                if (self.y_plane.empty()) return py::array_t<uint8_t>();
+                return py::array_t<uint8_t>(
+                    {static_cast<py::ssize_t>(self.height),
+                     static_cast<py::ssize_t>(self.width)},
+                    {static_cast<py::ssize_t>(self.stride_y),
+                     static_cast<py::ssize_t>(1)},
+                    self.y_plane.data(), self_object);
             })
         .def_property_readonly("cb_plane",
-            [](const DecodedMVCFrame::View& self) -> py::array_t<uint8_t> {
-                if (!self.cb_plane) return py::array_t<uint8_t>();
-                int h_c = self.height / 2;
-                return py::array_t<uint8_t>({h_c, self.stride_c}, self.cb_plane);
+            [](py::object self_object) -> py::array_t<uint8_t> {
+                const auto& self = self_object.cast<const DecodedMVCFrame::View&>();
+                if (self.cb_plane.empty()) return py::array_t<uint8_t>();
+                return py::array_t<uint8_t>(
+                    {static_cast<py::ssize_t>(self.chroma_height),
+                     static_cast<py::ssize_t>(self.chroma_width)},
+                    {static_cast<py::ssize_t>(self.stride_c),
+                     static_cast<py::ssize_t>(1)},
+                    self.cb_plane.data(), self_object);
             })
         .def_property_readonly("cr_plane",
-            [](const DecodedMVCFrame::View& self) -> py::array_t<uint8_t> {
-                if (!self.cr_plane) return py::array_t<uint8_t>();
-                int h_c = self.height / 2;
-                return py::array_t<uint8_t>({h_c, self.stride_c}, self.cr_plane);
+            [](py::object self_object) -> py::array_t<uint8_t> {
+                const auto& self = self_object.cast<const DecodedMVCFrame::View&>();
+                if (self.cr_plane.empty()) return py::array_t<uint8_t>();
+                return py::array_t<uint8_t>(
+                    {static_cast<py::ssize_t>(self.chroma_height),
+                     static_cast<py::ssize_t>(self.chroma_width)},
+                    {static_cast<py::ssize_t>(self.stride_c),
+                     static_cast<py::ssize_t>(1)},
+                    self.cr_plane.data(), self_object);
             });
 
     // Decoded MVC frame (both views)
-    py::class_<DecodedMVCFrame>(m, "DecodedMVCFrame")
+    py::class_<DecodedMVCFrame, std::shared_ptr<DecodedMVCFrame>>(m, "DecodedMVCFrame")
         .def(py::init<>())
-        .def_readonly("base_view", &DecodedMVCFrame::base_view)
-        .def_readonly("dependent_view", &DecodedMVCFrame::dependent_view)
+        .def_property_readonly(
+            "base_view",
+            [](DecodedMVCFrame& self) -> DecodedMVCFrame::View& {
+                return self.base_view;
+            },
+            py::return_value_policy::reference_internal)
+        .def_property_readonly(
+            "dependent_view",
+            [](DecodedMVCFrame& self) -> DecodedMVCFrame::View& {
+                return self.dependent_view;
+            },
+            py::return_value_policy::reference_internal)
         .def_readonly("has_mvc", &DecodedMVCFrame::has_mvc)
         .def_readonly("frame_id", &DecodedMVCFrame::frame_id)
         .def_readonly("frame_id_mvc", &DecodedMVCFrame::frame_id_mvc)
+        .def_readonly("picture_order_cnt", &DecodedMVCFrame::picture_order_cnt)
+        .def_readonly("picture_order_cnt_mvc", &DecodedMVCFrame::picture_order_cnt_mvc)
         .def_readonly("display_width", &DecodedMVCFrame::display_width)
         .def_readonly("display_height", &DecodedMVCFrame::display_height);
 
@@ -731,6 +789,9 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
         .def("decode_annexb_stream",
              [](MVCDecoder& self, py::buffer buffer) -> int {
                  auto info = buffer.request();
+                 if (info.itemsize != 1 || info.ndim != 1 || info.strides[0] != 1) {
+                     throw py::value_error("Annex B data must be a contiguous byte buffer");
+                 }
                  py::gil_scoped_release release;
                  return self.decodeAnnexBStream(
                      static_cast<const uint8_t*>(info.ptr),
@@ -739,26 +800,61 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
              },
              "Decode a full Annex B access unit without copying",
              py::arg("data"))
+        .def("decode_access_unit_pair",
+             [](MVCDecoder& self, py::buffer base, py::buffer dependent) -> int {
+                 auto base_info = base.request();
+                 auto dep_info = dependent.request();
+                 if (base_info.itemsize != 1 || base_info.ndim != 1 ||
+                     base_info.strides[0] != 1 || dep_info.itemsize != 1 ||
+                     dep_info.ndim != 1 || dep_info.strides[0] != 1) {
+                     throw py::value_error(
+                         "MVC access units must be contiguous byte buffers");
+                 }
+                 py::gil_scoped_release release;
+                 return self.decodeAccessUnitPair(
+                     static_cast<const uint8_t*>(base_info.ptr),
+                     static_cast<size_t>(base_info.size),
+                     static_cast<const uint8_t*>(dep_info.ptr),
+                     static_cast<size_t>(dep_info.size));
+             },
+             "Decode a base/dependent MVC access-unit pair without copying",
+             py::arg("base"), py::arg("dependent"))
         .def("get_frame",
              [](MVCDecoder& self) -> py::tuple {
-                 DecodedMVCFrame frame;
-                bool success = false;
-                {
-                    py::gil_scoped_release release;
-                    success = self.getFrame(frame);
-                }
-                if (!success) {
-                    return py::make_tuple(false, py::none());
-                }
-                return py::make_tuple(true, frame);
+                 auto frame = std::make_shared<DecodedMVCFrame>();
+                 bool success = false;
+                 {
+                     py::gil_scoped_release release;
+                     success = self.getFrame(*frame);
+                 }
+                 if (!success) return py::make_tuple(false, py::none());
+                 return py::make_tuple(true, py::cast(frame));
              },
              "Get next decoded frame if available. Returns (success, frame)")
         .def("flush", &MVCDecoder::flush,
+             py::call_guard<py::gil_scoped_release>(),
              "Flush decoder (for seeking)")
+        .def("bump_frames", &MVCDecoder::bumpFrames,
+             py::call_guard<py::gil_scoped_release>(),
+             "Make all delayed pictures eligible for end-of-stream output")
+        .def("request_abort", &MVCDecoder::requestAbort,
+             "Request cooperative cancellation at the next safe decode boundary")
+        .def("clear_abort", &MVCDecoder::clearAbort,
+             "Clear a previous cooperative cancellation request")
+        .def("close", &MVCDecoder::close,
+             py::call_guard<py::gil_scoped_release>(),
+             "Release the edge264 decoder deterministically")
         .def("is_initialized", &MVCDecoder::isInitialized,
              "Check if decoder is initialized")
         .def("get_last_error", &MVCDecoder::getLastError,
              "Get last error message");
+
+    m.def("edge264_runtime_status", []() {
+        std::string diagnostic;
+        const bool available = MVCDecoder::runtimeAvailable(&diagnostic);
+        return py::make_tuple(available, diagnostic);
+    }, "Probe edge264.dll and return (available, diagnostic)");
+    m.attr("EDGE264_DYNAMIC") = true;
 #else
     // Edge264 not available - do NOT expose MVCDecoder
     // Python code will check hasattr(module, 'MVCDecoder') and fallback to ctypes
@@ -784,8 +880,10 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
              py::call_guard<py::gil_scoped_release>(),
              "ResizeBuffers to the new physical size (flip-model requirement).")
         .def("present", &sylc::NativeRenderer::present,
+             py::arg("sync_interval") = 1,
              py::call_guard<py::gil_scoped_release>(),
-             "Clear to black and Present (interval 1). Call from the owning thread only.")
+             "Draw and Present. interval 1 is the timing authority; interval 0 "
+             "is intended for a simultaneous non-blocking secondary preview.")
         .def("is_hdr", &sylc::NativeRenderer::is_hdr,
              "True if the scRGB HDR color space was accepted.")
         .def("set_uniforms", &sylc::NativeRenderer::set_uniforms,
@@ -924,7 +1022,45 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
         .def("is_paused", &sylc::NativeRenderer::is_paused)
         .def("backend_info", &sylc::NativeRenderer::backend_info)
         .def("last_error", &sylc::NativeRenderer::last_error)
-        .def("shutdown", &sylc::NativeRenderer::shutdown);
+        .def("shutdown", &sylc::NativeRenderer::shutdown)
+        // --- SyLC Cast (PC sender): NV12-SBS pack + NVENC HEVC encode ----------
+        .def("cast_available", &sylc::NativeRenderer::cast_available,
+             "True if NVENC (nvEncodeAPI64.dll) is present. Safe on non-NVIDIA hosts "
+             "(returns False, no crash).")
+        .def("cast_start", &sylc::NativeRenderer::cast_start,
+             py::arg("mode"), py::arg("fps"), py::arg("bitrate_bps"),
+             py::arg("main10") = false,
+             py::call_guard<py::gil_scoped_release>(),
+             "Build the cast pipeline (Task-2 NV12-SBS packer + Task-1 NVENC encoder) on "
+             "the renderer's D3D11 device. mode='lossless' (bit-exact) or 'cbr'; "
+             "bitrate_bps applies to CBR only. main10=True encodes HEVC Main10 from a "
+             "P010 pack with BT.2020/ST2084 (PQ) VUI signalling — the HDR cast path. "
+             "Returns False on error (see last_error()).")
+        .def("cast_encode",
+             [](sylc::NativeRenderer& r, int64_t pts_ms, bool force_idr) -> py::list {
+                 std::vector<std::vector<uint8_t>> pkts;
+                 {
+                     py::gil_scoped_release nogil;   // GPU pack + NVENC encode off the GIL
+                     pkts = r.cast_encode(pts_ms, force_idr);
+                 }
+                 py::list out;
+                 for (const auto& p : pkts)
+                     out.append(py::bytes(reinterpret_cast<const char*>(p.data()), p.size()));
+                 return out;
+             },
+             py::arg("pts_ms"), py::arg("force_idr"),
+             "Pack the last-uploaded YUV planes (set_yuv_frame) into NV12 SBS and NVENC-encode "
+             "ONE frame. Returns a list of HEVC Annex-B packets (bytes); empty on error.")
+        .def("cast_reconfigure", &sylc::NativeRenderer::cast_reconfigure,
+             py::arg("mode"), py::arg("bitrate_bps"),
+             py::call_guard<py::gil_scoped_release>(),
+             "Hot-change the running cast encoder to a new bitrate/mode mid-stream. A same-mode "
+             "bitrate change is seamless (NvEncReconfigureEncoder, no teardown); a mode switch "
+             "the driver won't reconfigure falls back to an encoder-only reopen (packer/texture "
+             "stay). The next encoded frame is an IDR. Returns False on error (see last_error()).")
+        .def("cast_stop", &sylc::NativeRenderer::cast_stop,
+             py::call_guard<py::gil_scoped_release>(),
+             "Flush + tear down the cast pipeline. Idempotent.");
     m.attr("NATIVE_RENDERER_AVAILABLE") = true;
 #else
     m.attr("NATIVE_RENDERER_AVAILABLE") = false;

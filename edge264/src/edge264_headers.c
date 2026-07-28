@@ -5,6 +5,16 @@
 #define MTTRACE(...)
 #endif
 
+// Diagnostic-only: trace just the blocking waits (the sites where decode_NAL can
+// park indefinitely), without the per-task PICK/DONE/SUBMIT flood that perturbs
+// worker timing. Defining neither macro keeps the shipping behaviour identical.
+#ifdef SYLC_WAIT_TRACE
+#define MTWAIT(...) do { fprintf(stderr, "[MTWAIT] " __VA_ARGS__); fputc(10, stderr); fflush(stderr); } while (0)
+#else
+#define MTWAIT(...) MTTRACE(__VA_ARGS__)
+#endif
+
+#include <stdbool.h>
 
 #include "edge264_bitstream.c"
 #include "edge264_deblock.c"
@@ -141,20 +151,136 @@ static int bump_frame(Edge264Decoder *dec, int non_base_view, unsigned ignored) 
 	return 1;
 }
 
+/**
+ * SyLC diagnostic ONLY — never mutates decoder state.
+ *
+ * Dumps why the worker task pool has stopped making progress: which tasks are
+ * queued, what each one waits for, and which picture is stuck below INT_MAX.
+ * Compiled out entirely unless SYLC_WAIT_TRACE is defined.
+ */
+static void dump_deadlock_state(Edge264Decoder *dec) {
+#ifdef SYLC_WAIT_TRACE
+	unsigned rf = ready_frames(dec), df = depended_frames(dec);
+	MTWAIT("DEADLOCK currPic=%d basePic=%d ready_frames=%08x depended=%08x busy=%04x pending=%04x ready=%04x",
+		dec->currPic, dec->basePic, rf, df,
+		dec->busy_tasks, dec->pending_tasks, dec->ready_tasks);
+	for (int i = 0; i < 16; i++) {
+		if (!(dec->busy_tasks >> i & 1))
+			continue;
+		MTWAIT("  task%2d pic=%d deps=%08x missing=%08x queued=%d", i,
+			dec->taskPics[i], dec->task_dependencies[i],
+			dec->task_dependencies[i] & ~rf, dec->pending_tasks >> i & 1);
+	}
+	for (int p = 0; p < 32; p++) {
+		if (!(df >> p & 1) || dec->next_deblock_addr[p] == INT_MAX)
+			continue;
+		int has_task = 0;
+		for (int i = 0; i < 16; i++)
+			if ((dec->busy_tasks >> i & 1) && dec->taskPics[i] == p)
+				has_task = 1;
+		MTWAIT("  frame%2d next_deblock=%d remaining_mbs=%d has_task=%d",
+			p, dec->next_deblock_addr[p], dec->remaining_mbs[p], has_task);
+	}
+#else
+	(void)dec;
+#endif
+}
+
+/**
+ * SyLC: is waiting on task_complete still meaningful?
+ *
+ * task_complete is only ever signalled by a worker finishing a task, so progress
+ * is guaranteed iff some task is executing or can be started. busy_tasks holds
+ * every allocated task (queued or executing) and a worker clears its
+ * pending_tasks bit the instant it picks one, both under dec->lock — therefore
+ * pending_tasks == busy_tasks proves nothing is executing, and ready_tasks == 0
+ * proves nothing can start. In that state the wait can never end.
+ */
+static int feeder_can_make_progress(Edge264Decoder *dec) {
+	return dec->busy_tasks != 0 &&
+		(dec->ready_tasks != 0 || dec->pending_tasks != dec->busy_tasks);
+}
+
+/**
+ * SyLC: last-resort recovery from a damaged stream, NOT a routine path.
+ *
+ * A picture whose macroblocks were never all decoded keeps next_deblock_addr
+ * below INT_MAX, so it stays out of ready_frames() and every task referencing it
+ * stays un-ready forever; the pool then saturates and decode_NAL would block for
+ * good. Finalizing such a picture by concealment lets its dependents run again.
+ *
+ * WHICH pictures may be finalized is the whole difficulty, and getting it wrong
+ * is worse than the freeze. Three exclusions, each learned the hard way:
+ *   - currPic and basePic: MVC keeps TWO pictures under construction (the view
+ *     being parsed and its base view). Their slices are still arriving.
+ *   - any picture that still owns a queued or running task: it completes by
+ *     itself once the chain ahead of it unblocks.
+ * A first attempt excluded only currPic and finalized whole untouched pictures
+ * (measured: missing_mbs=8160 — an entire frame). They are used as references,
+ * so the concealment sprayed macroblock garbage across the GOP.
+ *
+ * Never fires on a healthy stream: 62 s of clean BD3D playback with 4 workers
+ * reached the fatal state zero times.
+ *
+ * Returns the mask of pictures finalized, 0 when nothing could be unblocked.
+ */
+static unsigned force_complete_stalled_frames(Edge264Decoder *dec) {
+	unsigned blocking = depended_frames(dec) & ~ready_frames(dec);
+	if (dec->currPic >= 0)
+		blocking &= ~(1u << dec->currPic);
+	if (dec->basePic >= 0)
+		blocking &= ~(1u << dec->basePic);
+	for (int i = 0; i < 16; i++) {
+		if ((dec->busy_tasks >> i & 1) && dec->taskPics[i] >= 0)
+			blocking &= ~(1u << dec->taskPics[i]);
+	}
+	if (!blocking)
+		return 0;
+	for (unsigned m = blocking; m; m &= m - 1) {
+		int pic = __builtin_ctz(m);
+		MTWAIT("force-complete pic=%d missing_mbs=%d next_deblock=%d", pic,
+			__atomic_load_n(&dec->remaining_mbs[pic], __ATOMIC_ACQUIRE),
+			dec->next_deblock_addr[pic]);
+		// Safe to touch without racing a worker: this is only reached when
+		// feeder_can_make_progress() is false, i.e. no task is executing.
+		__atomic_store_n(&dec->remaining_mbs[pic], 0, __ATOMIC_RELEASE);
+		dec->next_deblock_addr[pic] = INT_MAX; // signals the frame is complete
+	}
+	pthread_cond_broadcast(&dec->task_progress);
+	dec->ready_tasks = ready_tasks(dec);
+	if (dec->ready_tasks)
+		pthread_cond_broadcast(&dec->task_ready);
+	return blocking;
+}
+
 static int bump_all_frames(Edge264Decoder *dec) {
 	if (dec->currPic >= 0)
 		unset_currPic(dec);
 	while (bump_frame(dec, 0, 0) | bump_frame(dec, 1, 0));
-	while (dec->busy_tasks)
-		pthread_cond_wait(&dec->task_complete, &dec->lock);
+	while (dec->busy_tasks) {
+		MTWAIT("feeder WAIT bumpall busy=%04x toget=%08x out=%08x", dec->busy_tasks, dec->to_get_frames, dec->output_frames);
+		dump_deadlock_state(dec);
+		if (feeder_can_make_progress(dec)) {
+			pthread_cond_wait(&dec->task_complete, &dec->lock);
+		} else if (!force_complete_stalled_frames(dec)) {
+			return ENOBUFS; // queued tasks can never run — report backpressure, never hang
+		}
+	}
 	return dec->to_get_frames | dec->output_frames ? ENOBUFS : 0;
 }
 
 static void flush_frames(Edge264Decoder *dec) {
 	// FIXME interrupt all threads then wait until they are back to wait
 	assert(!(dec->n_threads == 0 && dec->busy_tasks));
-	while (dec->busy_tasks)
-		pthread_cond_wait(&dec->task_complete, &dec->lock);
+	while (dec->busy_tasks) {
+		MTWAIT("feeder WAIT flush busy=%04x toget=%08x out=%08x", dec->busy_tasks, dec->to_get_frames, dec->output_frames);
+		dump_deadlock_state(dec);
+		if (feeder_can_make_progress(dec)) {
+			pthread_cond_wait(&dec->task_complete, &dec->lock);
+		} else if (!force_complete_stalled_frames(dec)) {
+			break; // seek/flush must not inherit a stall; clear_decoder() resets the pool
+		}
+	}
 }
 
 static int alloc_frame(Edge264Decoder *dec, int id, int errno_on_fail) {
@@ -588,6 +714,10 @@ void *ADD_VARIANT(worker_loop)(void *arg) {
 		// deblock the rest of the frame if all mbs have been decoded correctly
 		int slice_mbs_decoded = c.CurrMbAddr - c.t.first_mb_in_slice;
 		int remaining_mbs = ret ?: __atomic_sub_fetch(&c.d->remaining_mbs[currPic], slice_mbs_decoded, __ATOMIC_ACQ_REL);
+		if (__builtin_expect(ret != 0, 0))
+			MTWAIT("worker SLICE-ERROR pic=%d ret=%d first_mb=%d CurrMbAddr=%d covered=%d remaining=%d",
+				currPic, (int)ret, c.t.first_mb_in_slice, c.CurrMbAddr,
+				slice_mbs_decoded, remaining_mbs);
 		if (remaining_mbs == 0) {
 			c.t.next_deblock_addr = c.d->next_deblock_addr[currPic];
 			c.CurrMbAddr = c.t.pic_width_in_mbs * c.t.pic_height_in_mbs;
@@ -1032,8 +1162,13 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 	// find and reserve an empty task to fill
 	unsigned avail_tasks;
 	while (!(avail_tasks = 0xffff & ~dec->busy_tasks)) {
-		MTTRACE("feeder WAIT taskpool busy=%04x pending=%04x ready=%04x", dec->busy_tasks, dec->pending_tasks, dec->ready_tasks);
-		pthread_cond_wait(&dec->task_complete, &dec->lock);
+		MTWAIT("feeder WAIT taskpool busy=%04x pending=%04x ready=%04x", dec->busy_tasks, dec->pending_tasks, dec->ready_tasks);
+		dump_deadlock_state(dec);
+		if (feeder_can_make_progress(dec)) {
+			pthread_cond_wait(&dec->task_complete, &dec->lock);
+		} else if (!force_complete_stalled_frames(dec)) {
+			return ENOBUFS; // queued tasks can never run — report backpressure, never hang
+		}
 	}
 	Edge264Task *t = dec->tasks + __builtin_ctz(avail_tasks);
 	t->unref_cb = unref_cb;
@@ -1219,7 +1354,13 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 		}
 		// bump frames until there are enough available slots in the DPB
 		unsigned reference_frames = dec->prev_short_term_frames | dec->prev_long_term_frames;
-		assert(dec->currPic < 0);
+                // SyLC robustness: malformed/discontinuous streams (and a
+                // recoverable ENOBUFS retry) can expose a frame_num gap while
+                // the previous picture is still current. abort() is never an
+                // acceptable decoder API outcome: finalize that partial
+                // picture using the decoder's existing concealment path.
+                if (dec->currPic >= 0)
+                        unset_currPic(dec);
 		// MVC FIX: max_dec_frame_buffering applies per-view, so filter by same_views like other DPB checks
 		while (non_existing + __builtin_popcount((reference_frames | dec->to_get_frames & ~dec->output_frames) & same_views) > sps->max_dec_frame_buffering && bump_frame(dec, non_base_view, 0));
 		// graceful (post-seek robustness): a huge FrameNum gap from a random-access seek can
@@ -1234,8 +1375,13 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 		// wait until enough empty slots are undepended
 		unsigned unavail;
 		while (non_existing + __builtin_popcount(unavail = reference_frames | dec->to_get_frames | dec->output_frames | depended_frames(dec)) > 32) {
-			MTTRACE("feeder WAIT gapslots ref=%08x toget=%08x out=%08x dep=%08x busy=%04x", reference_frames, dec->to_get_frames, dec->output_frames, depended_frames(dec), dec->busy_tasks);
-			pthread_cond_wait(&dec->task_complete, &dec->lock);
+			MTWAIT("feeder WAIT gapslots non_existing=%d ref=%08x toget=%08x out=%08x dep=%08x busy=%04x", non_existing, reference_frames, dec->to_get_frames, dec->output_frames, depended_frames(dec), dec->busy_tasks);
+			dump_deadlock_state(dec);
+			if (feeder_can_make_progress(dec)) {
+				pthread_cond_wait(&dec->task_complete, &dec->lock);
+			} else if (!force_complete_stalled_frames(dec)) {
+				return ENOBUFS; // queued tasks can never run — report backpressure, never hang
+			}
 		}
 		// finally insert the last non-existing frames one by one
 		for (unsigned FrameNum = dec->FrameNum - non_existing; FrameNum < dec->FrameNum; FrameNum++) {
@@ -1271,8 +1417,13 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 		// wait until at least one empty slot is undepended (or returned in the meantime)
 		unsigned unavail;
 		while (__builtin_popcount(unavail = reference_frames | dec->to_get_frames | dec->output_frames | depended_frames(dec)) >= 32) {
-			MTTRACE("feeder WAIT currslot ref=%08x toget=%08x out=%08x dep=%08x busy=%04x", reference_frames, dec->to_get_frames, dec->output_frames, depended_frames(dec), dec->busy_tasks);
-			pthread_cond_wait(&dec->task_complete, &dec->lock);
+			MTWAIT("feeder WAIT currslot ref=%08x toget=%08x out=%08x dep=%08x busy=%04x q0=%04x q1=%04x", reference_frames, dec->to_get_frames, dec->output_frames, depended_frames(dec), dec->busy_tasks, movemask(dec->get_frame_queue_v[0]), movemask(dec->get_frame_queue_v[1]));
+			dump_deadlock_state(dec);
+			if (feeder_can_make_progress(dec)) {
+				pthread_cond_wait(&dec->task_complete, &dec->lock);
+			} else if (!force_complete_stalled_frames(dec)) {
+				return ENOBUFS; // queued tasks can never run — report backpressure, never hang
+			}
 		}
 		int currPic = __builtin_ctz(~unavail);
 		if (dec->samples_buffers[currPic] == NULL &&

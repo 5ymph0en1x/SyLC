@@ -39,6 +39,9 @@ public:
     // Release a slot that was returned by pop().
     void release(size_t slotIndex);
 
+    // Drop all queued (not currently borrowed) access units.
+    void clear();
+
     // Metrics
     size_t size() const;
     size_t capacity() const { return capacity_; }

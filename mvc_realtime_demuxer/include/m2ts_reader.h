@@ -4,9 +4,74 @@
 #include <string>
 #include <vector>
 #include <map>
-#include <fstream>
+#include <memory>
+#include <deque>
+#include <mutex>
+
+#include "file_byte_source.h"
 
 namespace mvc_demux {
+
+/**
+ * StreamTapBuffer — a bounded, thread-safe tee of raw bytes in file order.
+ *
+ * SyLC Cast audio: the cast's AudioTap used to open its OWN reader on the
+ * media to decode audio — on an optical disc that is a THIRD concurrent
+ * reader on one head (video demuxer + mpv audio + tap) and causes the
+ * measured 45-120s seek thrash (8.4s single demux reads, frozen playback).
+ * Instead, the M2TSReader tees every byte it already pulls off the disk into
+ * this buffer, and the AudioTap demuxes the audio out of THAT: the disc
+ * keeps exactly its two established readers.
+ *
+ * Shared via shared_ptr between the demuxer (Python-facing reads) and the
+ * reader (appends): the buffer outlives either side, so a teardown on one
+ * thread can never dangle the other.
+ */
+struct StreamTapBuffer {
+    std::mutex m;
+    size_t capacity = 0;                       // bytes; 0 = disabled
+    size_t size = 0;                           // bytes currently queued
+    uint64_t dropped = 0;                      // bytes discarded on overflow
+    std::deque<std::vector<uint8_t>> chunks;
+
+    void append(const uint8_t* data, size_t n) {
+        if (!data || n == 0) return;
+        std::lock_guard<std::mutex> lk(m);
+        if (capacity == 0) return;
+        chunks.emplace_back(data, data + n);
+        size += n;
+        while (size > capacity && !chunks.empty()) {   // drop-OLDEST: freshest audio wins
+            size -= chunks.front().size();
+            dropped += chunks.front().size();
+            chunks.pop_front();
+        }
+    }
+
+    std::vector<uint8_t> pop(size_t maxBytes) {
+        std::vector<uint8_t> out;
+        std::lock_guard<std::mutex> lk(m);
+        while (!chunks.empty() && out.size() < maxBytes) {
+            auto& front = chunks.front();
+            if (out.size() + front.size() <= maxBytes) {
+                out.insert(out.end(), front.begin(), front.end());
+                size -= front.size();
+                chunks.pop_front();
+            } else {
+                size_t take = maxBytes - out.size();
+                out.insert(out.end(), front.begin(), front.begin() + take);
+                front.erase(front.begin(), front.begin() + take);
+                size -= take;
+            }
+        }
+        return out;
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lk(m);
+        chunks.clear();
+        size = 0;
+    }
+};
 
 /**
  * M2TS/TS Reader
@@ -31,7 +96,7 @@ public:
     void close();
 
     // Check if file is open
-    bool isOpen() const { return file_.is_open(); }
+    bool isOpen() const { return static_cast<bool>(source_); }
 
     // TS Packet (188 or 192 bytes)
     struct TSPacket {
@@ -54,6 +119,7 @@ public:
         uint16_t pmtPid;
         std::map<uint16_t, uint8_t> streamPids; // PID -> stream_type
         std::map<uint16_t, bool> mvcStreams;     // PID -> has MVC descriptor (0x7A)
+        bool hasMvcProgramDescriptor = false;    // program-level descriptor 0x7A
     };
 
     // Read next TS packet
@@ -80,11 +146,28 @@ public:
     // DIAG: count of resync events (forward-scans on sync-byte loss)
     long getResyncCount() const { return resync_count_; }
 
+    // Attach/detach the cast-audio stream tap (see StreamTapBuffer above).
+    // Thread-safe against a concurrent readBuffered() refill on the demux
+    // thread; pass nullptr to detach. seek() clears the attached buffer so
+    // the tee never carries stale pre-seek bytes.
+    void setStreamTap(std::shared_ptr<StreamTapBuffer> tap) {
+        std::lock_guard<std::mutex> lk(tapMutex_);
+        tap_ = std::move(tap);
+    }
+
 private:
-    std::ifstream file_;
+    std::mutex tapMutex_;                       // guards tap_ (the pointer, not the buffer)
+    std::shared_ptr<StreamTapBuffer> tap_;      // null when no cast audio tap is active
+
+    std::shared_ptr<StreamTapBuffer> currentTap() {
+        std::lock_guard<std::mutex> lk(tapMutex_);
+        return tap_;
+    }
+
+    std::shared_ptr<FileByteSource> source_;
     // EXPLICIT big-chunk read buffer. pubsetbuf is unreliable on MSVC (the demuxer still
     // read ~2 MB/s while the SAME disc does 18 MB/s with 1 MB reads — measured), so we buffer
-    // ourselves: one big file_.read() fills io_buffer_, packets are served from it. Few large
+    // ourselves: one big source read fills io_buffer_, packets are served from it. Few large
     // sequential reads instead of thousands of tiny ones = optical drive streams at full speed.
     std::vector<char> io_buffer_;
     size_t bufPos_ = 0;            // consumed offset within io_buffer_

@@ -135,6 +135,17 @@ public:
     void requestAbort() { abortRequested_.store(true, std::memory_order_relaxed); }
     void clearAbort()   { abortRequested_.store(false, std::memory_order_relaxed); }
 
+    // ---- Cast-audio stream tap (SyLC Cast; see StreamTapBuffer) ----
+    // Tee of the raw bytes the ACTIVE reader already pulls off the disk, so
+    // the cast's AudioTap can demux audio without opening its own (third)
+    // reader on the optical head. The buffer is owned HERE via shared_ptr:
+    // Python-side reads never touch the reader, so a teardown/close on the
+    // decoder thread can never dangle a concurrent read_stream_tap() call.
+    bool enableStreamTap(size_t capacityBytes);
+    void disableStreamTap();
+    std::vector<uint8_t> readStreamTap(size_t maxBytes);
+    uint64_t streamTapDropped() const;
+
     // ---- PGS subtitle streaming (dual-file/M2TS) ----
     // PIDs of PGS (Presentation Graphics) subtitle streams found in the base PMT.
     std::vector<uint16_t> getSubtitlePids() const;
@@ -216,6 +227,10 @@ private:
     std::unique_ptr<M2TSReader> dependentReader_;
     std::unique_ptr<M2TSReader> ssifReader_;  // For streaming mode: read directly from SSIF
 
+    // Cast-audio stream tap buffer (see enableStreamTap). Kept on the demuxer,
+    // shared into the audio-carrying reader; survives reader teardown.
+    std::shared_ptr<StreamTapBuffer> streamTap_;
+
     VideoInfo videoInfo_;
     std::vector<uint8_t> codecPrivate_;
     bool hasCodecPrivate_;
@@ -252,12 +267,17 @@ private:
     // SSIF can have significant offset (many MVC frames before base frames arrive)
     // Need large buffer to avoid dropping frames before matching
     static constexpr size_t MAX_FRAME_BUFFER_SIZE = 500;  // ~20 seconds at 24fps
-    // MVC dependent frames pair with the base by nearest PTS. They are nominally the same
-    // temporal instant, but in this interleave the dependent view's PTS can sit up to ~1 frame
-    // off the base's (a ~40-50ms residual seen after a mid-stream seek + re-align). Use a ~1.5
-    // frame window (24fps -> 6000 ticks ~= 67ms); the nearest-match search keeps it picking the
-    // correct (closest) dependent frame, so this just admits the small offset, never mispairs.
-    static constexpr int64_t PTS_MATCH_TOLERANCE = 6000;
+    // MVC dependent frames pair with the base by nearest PTS. They are the same temporal
+    // instant, and ground truth (PES headers of 01762.m2ts vs the SSIF interleave, 2026-07-27)
+    // measures REAL pair deltas at 0.1-1.0 ms. The old ~1.5-frame window (6000 ticks = 67ms,
+    // wider than one frame time = 3754) was justified by a "~40-50ms residual seen after a
+    // mid-stream seek" — that residual WAS the mispairing: at a seek edge one dependent frame
+    // is missing from the buffer, nearest-match then accepted the NEIGHBOR (delta = exactly
+    // one frame), erased it, and the +1 shift self-perpetuated for the whole session. Symptom:
+    // clean left eye, macroblocked right eye (inter-view prediction from the wrong base).
+    // Keep the window strictly under half a frame time so the neighbor can never match; the
+    // catch-up logic below then drops the orphaned base front and pairing re-locks exactly.
+    static constexpr int64_t PTS_MATCH_TOLERANCE = 1800;  // 20ms << 41.7ms frame time
 
     // PTS normalization: Blu-ray streams often start at non-zero PTS (e.g., ~11s)
     // We capture the first valid PTS and subtract it from all subsequent frames
@@ -284,6 +304,9 @@ private:
     // open()/openDual()/close().
     int basePesFlushCount_ = 0;
     int mvcPesFlushCount_ = 0;
+    // Post-seek re-align: base fronts dropped because their dependent partner is gone
+    // (see the strict PTS_MATCH_TOLERANCE rationale above). Logged, never fatal.
+    long orphanBaseDrops_ = 0;
 
     // PGS subtitle streaming state
     int selectedSubtitlePid_ = 0;                       // 0 = disabled

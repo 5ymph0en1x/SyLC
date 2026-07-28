@@ -1651,6 +1651,10 @@ static noinline void CAFUNC(parse_slice_data)
 		// update flip_bit atomically to signal mb is a priori decoded, otherwise end the slice
 		int prev_recovery_bits = __atomic_exchange_n(&mb->recovery_bits, ctx->t.frame_flip_bit, __ATOMIC_ACQ_REL);
 		if (prev_recovery_bits == ctx->t.frame_flip_bit) {
+			MTWAIT("SLICE-CUT pic=%d CurrMbAddr=%d first_mb=%d decoded=%d flip=%d prev_rb=%d",
+				ctx->t.next_deblock_idc, ctx->CurrMbAddr, ctx->t.first_mb_in_slice,
+				ctx->CurrMbAddr - ctx->t.first_mb_in_slice,
+				ctx->t.frame_flip_bit, prev_recovery_bits);
 			return;
 		}
 

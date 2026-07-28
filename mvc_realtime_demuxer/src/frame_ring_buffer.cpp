@@ -94,6 +94,12 @@ void FrameRingBuffer::release(size_t slotIndex) {
     slots_[slotIndex].inUse.store(false, std::memory_order_release);
 }
 
+void FrameRingBuffer::clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    tail_ = head_;
+    size_ = 0;
+}
+
 void FrameRingBuffer::copyIntoStorage(std::vector<uint8_t>& target,
                                       const std::vector<uint8_t>& src,
                                       size_t& outSize) {

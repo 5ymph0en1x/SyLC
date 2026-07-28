@@ -402,11 +402,10 @@ int edge264_decode_NAL(Edge264Decoder *dec, const uint8_t *buf, const uint8_t *e
 
 
 
-// NOTE: MVC base/dependent OUTPUT pairing (matching the two views by PictureOrderCnt) is
-// done in the HOST (mvc_decoder.py), not here: pairing by POC inside get_frame would have
-// to wait for the lagging dependent picture, which holds the base picture's DPB slot and
-// deadlocks deblocking. get_frame therefore emits both views (each deblocked) by queue
-// position; the host re-associates base[X] with dep[X] by POC for display.
+// MVC base/dependent output is emitted as one Edge264Frame. Pairing by waiting on
+// POC inside get_frame would hold the lagging view's DPB slot and can deadlock
+// deblocking, so the two per-view output queues advance in lockstep here. The host
+// receives and retains the resulting stereo pair atomically.
 
 /**
  * By default all frames with POC lower or equal with the last non-reference

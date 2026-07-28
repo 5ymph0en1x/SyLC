@@ -103,6 +103,12 @@ class NativeFramepackWidget(QWidget):
         self._r = None                 # NativeRenderer, or False if unavailable
         self._stereo_mode = 1          # framepack default
         self.current_stereo_mode = 1   # public attr the player syncs/reads
+        # Dual-output policy: the detached framepack renderer owns vsync; the
+        # simultaneous main-window preview uses interval 0 so its second
+        # swapchain never stalls the GUI frame-delivery slot.
+        self.present_vsync = True
+        self._present_interval_supported = True
+        self._present_interval_warned = False
         # Self-sufficient HDR: query the display's SDR white level when not given,
         # so we no longer depend on the Qt widget having done it.
         self._sdr_white = float(sdr_white) if sdr_white is not None else query_sdr_white_level()
@@ -119,8 +125,11 @@ class NativeFramepackWidget(QWidget):
         self._sub = None               # (rgba_ndarray, (x,y,w,h) normalized, disparity) or None
         self._sub_dirty = False        # upload the RGBA to the GPU only when it changed
         self._sub_depth_override = None  # BD3D dynamic depth (OFMD); None = per-cue value
+        self.eye_view = None      # 'left'/'right' in Dual Projector windows
         self._uniforms_take_disparity = True   # probed once; False on an older renderer build
         self._fail_logged = False
+        self._renderer_failures = 0
+        self._next_renderer_retry = 0.0
         # 10-bit HEVC (uint16 planes) routing. plane_scale rescales a 10-bit value
         # stored low in an R16 texel back to [0,1]: 65535/1023 ~= 64.06 (yuv420p10le).
         # The player overwrites plane_scale per-source (Task 8).
@@ -177,14 +186,50 @@ class NativeFramepackWidget(QWidget):
             s = event.size()
             pw, ph = self._phys(s.width(), s.height())
             try:
-                self._r.resize(pw, ph)
-            except Exception:
-                pass
+                if not self._r.resize(pw, ph):
+                    self._invalidate_renderer("resize")
+            except Exception as exc:
+                self._invalidate_renderer("resize exception", exc)
 
     # --- native renderer lifecycle -------------------------------------------
+    def _invalidate_renderer(self, operation, exception=None, renderer=None):
+        """Release a failed D3D11 instance and retry later with backoff.
+
+        DXGI device removal/reset, display hot-plug and suspend/resume all surface
+        as false/exception from upload, resize or Present. Retaining that renderer
+        leaves a permanently black/stale surface, so rebuild the whole device and
+        swapchain on a subsequent frame.
+        """
+        r = renderer if renderer is not None else self._r
+        self._r = None
+        self.has_video = False
+        if self._sub is not None:
+            self._sub_dirty = True
+        error = str(exception) if exception is not None else ""
+        if not error and r and r is not False:
+            try:
+                error = str(r.last_error())
+            except Exception:
+                error = ""
+        if r and r is not False:
+            try:
+                r.shutdown()
+            except Exception:
+                pass
+        self._renderer_failures += 1
+        delay = min(5.0, 0.25 * (2 ** min(self._renderer_failures - 1, 5)))
+        self._next_renderer_retry = time.monotonic() + delay
+        logger.warning(
+            f"[NATIVE-WIDGET] {operation} failed"
+            f"{': ' + error if error else ''}; rebuilding D3D11 in {delay:.2f}s"
+        )
+        return False
+
     def _ensure(self):
         if self._r is not None:
             return self._r is not False
+        if time.monotonic() < self._next_renderer_retry:
+            return False
         try:
             import mvc_demuxer_cpp as m
             if not getattr(m, "NATIVE_RENDERER_AVAILABLE", False) or not hasattr(m, "NativeRenderer"):
@@ -207,22 +252,21 @@ class NativeFramepackWidget(QWidget):
             sz = self.size()
             pw, ph = self._phys(sz.width(), sz.height())
             if not r.initialize(int(self.winId()), pw, ph, self._hdr):
-                logger.warning(f"[NATIVE-WIDGET] initialize failed: {r.last_error()}")
-                self._r = False
-                return False
+                return self._invalidate_renderer("initialize", renderer=r)
             logger.info(f"[NATIVE-WIDGET] {r.backend_info()} | hdr={self._hdr} gamma={self._gamma} sdr_white={self._sdr_white}")
             self._r = r
+            self._renderer_failures = 0
+            self._next_renderer_retry = 0.0
+            self._fail_logged = False
             return True
         except Exception as e:
-            logger.warning(f"[NATIVE-WIDGET] disabled: {e}")
-            self._r = False
-            return False
+            return self._invalidate_renderer("initialize exception", e)
 
     # --- contract: frame delivery --------------------------------------------
     def set_frame_yuv_views(self, y_l_or_tuple, u_l_or_right=None, v_l=None,
                             y_r=None, u_r=None, v_r=None):
         if self._rendering_paused:
-            return
+            return False
         if isinstance(y_l_or_tuple, tuple):
             yl, ul, vl = y_l_or_tuple
             if isinstance(u_l_or_right, tuple):
@@ -232,8 +276,15 @@ class NativeFramepackWidget(QWidget):
         else:
             yl, ul, vl = y_l_or_tuple, u_l_or_right, v_l
             yr, ur, vr = y_r, u_r, v_r
+
+        # A 2D presentation samples only t1..t3. Do not upload the unused right
+        # eye to an embedded preview: this halves its CPU->GPU traffic when the
+        # framepack window is being presented simultaneously.
+        if self._stereo_mode == 0:
+            yr = ur = vr = None
+
         if not self._ensure():
-            return
+            return False
         if self._diag:
             _t_slot = time.perf_counter()
             if self._diag_last_slot is not None:
@@ -245,6 +296,16 @@ class NativeFramepackWidget(QWidget):
             rect = self._sub[1] if self._sub else (0.0, 0.0, 1.0, 1.0)
             disp = (self._sub_depth_override if self._sub_depth_override is not None
                     else (self._sub[2] if self._sub else 0.0))
+            # A Dual Projector window renders ONE eye through the '2d' path,
+            # where the shader forces eyeSign = 0 and therefore drops the
+            # subtitle disparity entirely. Shifting the rect here restores the
+            # authored depth without a shader change: each eye moves by half
+            # the disparity, in opposite directions -- the same split the
+            # framepack shader performs internally.
+            if self.eye_view in ('left', 'right') and disp:
+                half = 0.5 * float(disp)
+                rect = (rect[0] + (half if self.eye_view == 'left' else -half),
+                        rect[1], rect[2], rect[3])
             if self._uniforms_take_disparity:
                 try:
                     self._r.set_uniforms(self._stereo_mode, 1 if self._sub else 0,
@@ -284,7 +345,8 @@ class NativeFramepackWidget(QWidget):
             # The subtitle texture persists on the GPU (slot t0) — upload only
             # when the image actually changed, not on every frame.
             if self._sub is not None and self._sub_dirty:
-                self._r.set_subtitle_rgba(self._sub[0])
+                if not self._r.set_subtitle_rgba(self._sub[0]):
+                    return self._invalidate_renderer("subtitle upload")
                 self._sub_dirty = False
             # Route by plane dtype: uint16 (10-bit HEVC) -> R16 path with plane_scale;
             # uint8 -> the existing R8 path. Same TypeError/AttributeError-probe idiom
@@ -294,22 +356,43 @@ class NativeFramepackWidget(QWidget):
             _t_up0 = time.perf_counter() if self._diag else 0.0
             if is16:
                 if not self._have_yuv16:
-                    return
+                    return False
                 try:
-                    self._r.set_yuv_frame16(yl, ul, vl, yr, ur, vr, float(self.plane_scale))
+                    uploaded = self._r.set_yuv_frame16(
+                        yl, ul, vl, yr, ur, vr, float(self.plane_scale))
                 except (AttributeError, TypeError):
                     self._have_yuv16 = False
                     if not self._yuv16_unsupported_logged:
                         logger.warning("[NATIVE-WIDGET] set_yuv_frame16 unavailable "
                                        "(old .pyd); dropping 10-bit frames")
                         self._yuv16_unsupported_logged = True
-                    return
+                    return False
             else:
-                self._r.set_yuv_frame(yl, ul, vl, yr, ur, vr)
+                uploaded = self._r.set_yuv_frame(yl, ul, vl, yr, ur, vr)
+            if not uploaded:
+                return self._invalidate_renderer(
+                    "16-bit YUV upload" if is16 else "YUV upload")
             if self._diag:
                 _t_up1 = time.perf_counter()
                 self._diag_upload.append((_t_up1 - _t_up0) * 1000.0)
-            self._r.present()
+            interval = 1 if self.present_vsync else 0
+            if self._present_interval_supported:
+                try:
+                    presented = self._r.present(interval)
+                except TypeError:
+                    # Compatibility with a pyd built before the optional
+                    # sync_interval argument. Correctness is preserved, though
+                    # the secondary preview remains blocking until rebuilt.
+                    self._present_interval_supported = False
+                    presented = self._r.present()
+                    if not self._present_interval_warned:
+                        logger.warning("[NATIVE-WIDGET] renderer lacks present(sync_interval); "
+                                       "dual-output preview uses compatibility vsync")
+                        self._present_interval_warned = True
+            else:
+                presented = self._r.present()
+            if not presented:
+                return self._invalidate_renderer("Present")
             self.has_video = True
             if self._diag:
                 self._diag_present.append((time.perf_counter() - _t_up1) * 1000.0)
@@ -325,10 +408,9 @@ class NativeFramepackWidget(QWidget):
                         f"max={(_sp[-1] if _sp else 0.0):.2f} | n={len(_ss)}")
                     self._diag_slot, self._diag_upload, self._diag_present = [], [], []
                     self._diag_win = time.perf_counter()
+            return True
         except Exception as e:
-            if not self._fail_logged:
-                logger.warning(f"[NATIVE-WIDGET] frame delivery failed: {e}")
-                self._fail_logged = True
+            return self._invalidate_renderer("frame delivery exception", e)
 
     # --- contract: control ----------------------------------------------------
     def set_stereo_mode(self, mode_str):
@@ -359,9 +441,10 @@ class NativeFramepackWidget(QWidget):
         if self._r and self._r is not False:
             try:
                 self._r.clear_frame()
-                self._r.present()
-            except Exception:
-                pass
+                if not self._r.present():
+                    self._invalidate_renderer("clear Present")
+            except Exception as exc:
+                self._invalidate_renderer("clear exception", exc)
 
     def set_subtitle(self, rgba_array, x, y, w, h, video_width=1920, video_height=1080,
                      disparity=0.0):
@@ -412,6 +495,8 @@ class NativeFramepackWidget(QWidget):
         # re-triggers _ensure().
         r = self._r
         self._r = None
+        self._renderer_failures = 0
+        self._next_renderer_retry = 0.0
         if r and r is not False:
             try:
                 r.shutdown()

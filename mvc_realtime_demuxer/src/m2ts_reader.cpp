@@ -32,16 +32,15 @@ bool M2TSReader::open(const std::string& filePath) {
     bufPos_ = 0;
     bufLen_ = 0;
     bufFileStart_ = 0;
-    file_.open(filePath, std::ios::binary);
-    if (!file_) {
-        std::cerr << "[M2TSReader] Failed to open file: " << filePath << std::endl;
+    std::string sourceError;
+    source_ = FileByteSource::open(filePath, &sourceError);
+    if (!source_) {
+        std::cerr << "[M2TSReader] Failed to open file: " << filePath
+                  << " (" << sourceError << ")" << std::endl;
         return false;
     }
 
-    // Get file size
-    file_.seekg(0, std::ios::end);
-    fileSize_ = file_.tellg();
-    file_.seekg(0, std::ios::beg);
+    fileSize_ = source_->size();
 
     // Detect packet size (188 or 192 bytes)
     if (!detectPacketSize()) {
@@ -60,9 +59,10 @@ bool M2TSReader::open(const std::string& filePath) {
 }
 
 void M2TSReader::close() {
-    if (file_.is_open()) {
-        file_.close();
-    }
+    source_.reset();
+    bufPos_ = 0;
+    bufLen_ = 0;
+    bufFileStart_ = 0;
     programs_.clear();
     pesBuffers_.clear();
 }
@@ -74,22 +74,12 @@ bool M2TSReader::detectPacketSize() {
     constexpr size_t PROBE_SIZE = 8192;
     std::vector<uint8_t> probe(PROBE_SIZE);
 
-    file_.clear();
-    file_.seekg(0, std::ios::beg);
-    size_t bytesRead = 0;
-    for (int tries = 0; tries < 8 && bytesRead < PROBE_SIZE; tries++) {
-        file_.read(reinterpret_cast<char*>(probe.data()) + bytesRead,
-                   static_cast<std::streamsize>(PROBE_SIZE - bytesRead));
-        std::streamsize n = file_.gcount();
-        if (n <= 0) {
-            if (file_.eof()) break;     // genuine end of (tiny) file
-            file_.clear();              // transient failure: clear and retry
-            continue;
-        }
-        bytesRead += static_cast<size_t>(n);
-    }
-    file_.clear();
-    file_.seekg(0, std::ios::beg);
+    const size_t bytesRead = source_
+        ? source_->readAt(0, probe.data(), PROBE_SIZE)
+        : 0;
+    bufPos_ = 0;
+    bufLen_ = 0;
+    bufFileStart_ = 0;
 
     if (bytesRead < 1024) {
         return false;
@@ -132,12 +122,18 @@ bool M2TSReader::readBuffered(uint8_t* dst, size_t n) {
         if (bufPos_ >= bufLen_) {
             // Refill with ONE big sequential read. bufFileStart_ = file offset of io_buffer_[0]
             // so bufFileStart_+bufPos_ is always the logical read position (used by resync).
-            if (!file_) return false;                       // fail/eof state -> no more data
-            bufFileStart_ = static_cast<uint64_t>(file_.tellg());
-            file_.read(io_buffer_.data(), static_cast<std::streamsize>(io_buffer_.size()));
-            bufLen_ = static_cast<size_t>(file_.gcount());
+            if (!source_) return false;
+            bufFileStart_ += bufPos_;
+            bufLen_ = source_->readAt(
+                bufFileStart_, reinterpret_cast<uint8_t*>(io_buffer_.data()),
+                io_buffer_.size());
             bufPos_ = 0;
             if (bufLen_ == 0) return false;                 // genuine EOF
+            // Cast-audio stream tap: tee the freshly read chunk, in file
+            // order. One append per 4 MB refill — negligible next to the
+            // disk read it mirrors; the buffer bounds itself (drop-oldest).
+            if (auto tap = currentTap())
+                tap->append(reinterpret_cast<const uint8_t*>(io_buffer_.data()), bufLen_);
         }
         size_t avail = bufLen_ - bufPos_;
         size_t take = (n - got < avail) ? (n - got) : avail;
@@ -149,7 +145,7 @@ bool M2TSReader::readBuffered(uint8_t* dst, size_t n) {
 }
 
 bool M2TSReader::readPacket(TSPacket& packet) {
-    if (!file_.is_open()) {
+    if (!source_) {
         return false;
     }
 
@@ -243,7 +239,7 @@ bool M2TSReader::resyncToNextPacket() {
     resync_count_++;  // DIAG
     // Called right after readPacket() loaded a wrong-phase block into packetBuffer_.
     // Search forward (bounded) for the next position where the packet cadence resumes,
-    // reposition file_ there, and reload packetBuffer_ with that aligned packet.
+    // reposition the logical cursor there, and reload packetBuffer_ with that packet.
     const size_t ps = static_cast<size_t>(packetSize_);
     const int tcSkip = (packetSize_ == M2TS_PACKET_SIZE) ? 4 : 0;
     const size_t MAX_SCAN = 4 * 1024 * 1024;          // bound the resync effort (~4 MB)
@@ -251,15 +247,14 @@ bool M2TSReader::resyncToNextPacket() {
 
     // Seed the search buffer with the bad block we just read. With explicit buffering the
     // logical read position is bufFileStart_+bufPos_ (file_.tellg() is ahead by the unconsumed
-    // buffer). Sync file_ there and drop the buffer so the forward CHUNK reads below continue
-    // from right after the bad block; the next readPacket then refills cleanly past the resync.
+    // buffer). Read the forward scan directly from the shared random-access source;
+    // the next readPacket then refills cleanly past the resync.
     std::vector<uint8_t> buf(packetBuffer_.begin(), packetBuffer_.begin() + ps);
     uint64_t logicalPos = bufFileStart_ + bufPos_;
     uint64_t bufBase = logicalPos - ps;
-    file_.clear();
-    file_.seekg(static_cast<std::streamoff>(logicalPos), std::ios::beg);
     bufPos_ = 0;
     bufLen_ = 0;
+    bufFileStart_ = logicalPos;
 
     size_t scanStart = 1;  // skip the known-bad boundary at offset 0
     while (buf.size() <= MAX_SCAN) {
@@ -273,12 +268,15 @@ bool M2TSReader::resyncToNextPacket() {
                     buf[b + tcSkip + 2 * ps] == TS_SYNC_BYTE &&
                     buf[b + tcSkip + 3 * ps] == TS_SYNC_BYTE) {
                     uint64_t boundary = bufBase + b;
-                    file_.clear();
-                    file_.seekg(static_cast<std::streamoff>(boundary), std::ios::beg);
-                    file_.read(reinterpret_cast<char*>(packetBuffer_.data()),
-                               static_cast<std::streamsize>(ps));
-                    return file_.gcount() == static_cast<std::streamsize>(ps) &&
-                           packetBuffer_[tcSkip] == TS_SYNC_BYTE;
+                    const size_t loaded = source_->readAt(
+                        boundary, packetBuffer_.data(), ps);
+                    if (loaded == ps && packetBuffer_[tcSkip] == TS_SYNC_BYTE) {
+                        bufFileStart_ = boundary + ps;
+                        bufPos_ = 0;
+                        bufLen_ = 0;
+                        return true;
+                    }
+                    return false;
                 }
             }
             scanStart = limit;  // don't rescan bytes already checked
@@ -287,11 +285,10 @@ bool M2TSReader::resyncToNextPacket() {
         size_t old = buf.size();
         constexpr size_t CHUNK = 64 * 1024;
         buf.resize(old + CHUNK);
-        file_.read(reinterpret_cast<char*>(buf.data()) + old,
-                   static_cast<std::streamsize>(CHUNK));
-        std::streamsize n = file_.gcount();
-        if (n <= 0) break;  // EOF before a resync point was found
-        buf.resize(old + static_cast<size_t>(n));
+        const size_t n = source_->readAt(
+            bufBase + old, buf.data() + old, CHUNK);
+        if (n == 0) break;  // EOF before a resync point was found
+        buf.resize(old + n);
     }
     return false;
 }
@@ -418,7 +415,7 @@ void M2TSReader::parsePMT(const std::vector<uint8_t>& data, uint16_t pid) {
             //           << std::dec << " length: " << (int)descriptorLength << std::endl;
 
             if (descriptorTag == 0x7A) {
-                // std::cout << "[M2TSReader] *** Found MVC descriptor (0x7A) at PROGRAM level! ***" << std::endl;
+                prog->hasMvcProgramDescriptor = true;
             }
 
             progDescPos += 2 + descriptorLength;
@@ -507,33 +504,36 @@ std::vector<uint16_t> M2TSReader::getVideoPids() const {
 }
 
 bool M2TSReader::seek(uint64_t bytePosition) {
-    if (!file_.is_open()) {
+    if (!source_) {
         return false;
     }
 
-    // Clear EOF/fail flags before seeking - CRITICAL for robust seeking
-    file_.clear();
-
     // Align to packet boundary
     uint64_t alignedPos = (bytePosition / packetSize_) * packetSize_;
-    file_.seekg(alignedPos, std::ios::beg);
+    if (alignedPos > fileSize_) {
+        std::cerr << "[M2TSReader] Seek to " << alignedPos << " failed" << std::endl;
+        return false;
+    }
     // Invalidate the read buffer so the next packet refills from the new position.
     bufPos_ = 0;
     bufLen_ = 0;
     bufFileStart_ = alignedPos;
 
-    bool success = file_.good();
-    if (!success) {
-        std::cerr << "[M2TSReader] Seek to " << alignedPos << " failed" << std::endl;
-    } else if (bytePosition == 0) {
+    // Cast-audio stream tap: drop the pre-seek backlog — the tee must only
+    // ever carry bytes from the CURRENT playback position onward (ffmpeg's
+    // mpegts consumer resynchronizes on the discontinuity by itself).
+    if (auto tap = currentTap())
+        tap->clear();
+
+    if (bytePosition == 0) {
         // Log only rewind to 0 to avoid spam
         std::cout << "[M2TSReader] Rewind to start (0)" << std::endl;
     }
-    return success;
+    return true;
 }
 
 uint64_t M2TSReader::tell() {
-    if (!file_.is_open()) {
+    if (!source_) {
         return 0;
     }
     // Logical read position (accounts for unconsumed bytes in io_buffer_).

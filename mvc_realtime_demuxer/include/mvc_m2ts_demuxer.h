@@ -2,6 +2,8 @@
 
 #include "m2ts_reader.h"
 #include "h264_nal_parser.h"
+#include <atomic>
+#include <deque>
 #include <memory>
 #include <map>
 
@@ -57,6 +59,16 @@ public:
     // Seek to timestamp (milliseconds)
     bool seek(int64_t timestampMs);
 
+    void setExternalDurationMs(int64_t durationMs) {
+        if (durationMs > 0) externalDurationMs_ = durationMs;
+    }
+    int64_t getLastCueTimestamp() const { return lastSeekTimestampMs_; }
+
+    // Cooperatively interrupt an in-flight optical-disc read/probe. This keeps
+    // GUI fallback and shutdown bounded even when the source is slow or damaged.
+    void requestAbort() { abortRequested_.store(true, std::memory_order_relaxed); }
+    void clearAbort() { abortRequested_.store(false, std::memory_order_relaxed); }
+
 private:
     std::unique_ptr<M2TSReader> reader_;
     H264NALParser nalParser_;
@@ -64,6 +76,10 @@ private:
     VideoInfo videoInfo_;
     bool hasVideoInfo_;
     uint64_t dualPidStartPos_;  // Position where both H.264 and MVC PIDs are synchronized (for SSIF)
+    std::atomic<bool> abortRequested_{false};
+    int64_t externalDurationMs_ = 0;
+    int64_t streamStartPts90k_ = -1;
+    int64_t lastSeekTimestampMs_ = 0;
 
     // PES reassembly state
     struct PESState {
@@ -92,6 +108,12 @@ private:
     };
 
     FrameState currentFrame_;
+
+    // Frames consumed by the startup IDR probe must be replayed before normal
+    // reading resumes. Keep this separate from pendingFrame_: finding the end
+    // of an IDR necessarily pre-reads the first PES of the following access
+    // unit, which already occupies pendingFrame_.
+    std::deque<FramePair> replayFrames_;
 
     // Pending NAL data for next frame (when AUD detected mid-processing)
     struct PendingData {

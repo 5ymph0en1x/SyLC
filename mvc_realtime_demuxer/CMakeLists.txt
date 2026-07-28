@@ -1,6 +1,15 @@
 cmake_minimum_required(VERSION 3.15)
 project(mvc_realtime_demuxer VERSION 1.0.0 LANGUAGES CXX)
 
+# The application packages its runtime DLLs explicitly. Disable vcpkg's
+# PowerShell applocal post-build step: on locked-down Windows/Store PowerShell
+# installations that helper can fail after a completely successful link and
+# incorrectly mark the native build as failed.
+if(DEFINED VCPKG_TARGET_TRIPLET)
+    set(VCPKG_APPLOCAL_DEPS OFF CACHE BOOL
+        "Runtime DLLs are packaged by the SyLC release scripts" FORCE)
+endif()
+
 # C++ Standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,19 +28,26 @@ if(MSVC)
     set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /LTCG")
 else()
     add_compile_options(-Wall -Wextra -Wpedantic)
-    # GCC/Clang optimization flags for maximum speed
-    # -O3: Aggressive optimizations
-    # -march=native: Use all CPU features available on build machine
-    # -mtune=native: Tune for build machine's CPU
-    # -ffast-math: Fast floating point (safe for video processing)
-    # -funroll-loops: Unroll loops for better performance
-    # -flto: Link-time optimization
-    add_compile_options(-O3 -march=native -mtune=native -ffast-math -funroll-loops)
+    # Keep release artifacts portable: edge264 performs its own CPU dispatch and
+    # the demuxer must not inherit the build host's instruction set.
+    add_compile_options(-O3 -ffast-math -funroll-loops)
     # Enable LTO (Link Time Optimization) for inter-procedural optimizations
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
 
 # Find pybind11
+# Force pybind11's modern FindPython integration. The legacy FindPythonLibs path
+# parses "3.14" as a split library name (python3 + newline + 14.lib) and makes a
+# clean configure fail with current CMake/Python.
+set(PYBIND11_FINDPYTHON ON)
+if(DEFINED PYTHON_EXECUTABLE AND NOT DEFINED Python_EXECUTABLE)
+    # Preserve the interpreter explicitly selected by existing build scripts /
+    # caches instead of silently picking vcpkg's helper Python.
+    set(Python_EXECUTABLE "${PYTHON_EXECUTABLE}" CACHE FILEPATH
+        "Python interpreter used for the extension" FORCE)
+endif()
+find_package(Python COMPONENTS Interpreter Development REQUIRED)
+
 # First try CONFIG mode (vcpkg provides this)
 find_package(pybind11 CONFIG QUIET)
 
@@ -382,124 +398,25 @@ if(HAVE_LIBMATROSKA)
     endif()
 endif()
 
-# edge264 decoder library (optional for MVC decoding)
-# Use precompiled edge264 library (MinGW-compiled)
+# edge264 decoder headers. The decoder DLL is built independently with
+# ../edge264/build_sylc_edge264.bat and resolved at runtime by mvc_decoder.cpp.
+# Never link a MinGW import/static archive into the MSVC extension.
 set(EDGE264_DIR "${CMAKE_SOURCE_DIR}/../edge264")
-
-# Don't compile edge264 with MSVC - use precompiled MinGW library
-# add_subdirectory(${EDGE264_DIR} ${CMAKE_BINARY_DIR}/edge264_build)
-
-# Set include directory
 set(EDGE264_INCLUDE_DIR "${EDGE264_DIR}")
 
-# Find precompiled library
-set(EDGE264_LIBRARY "${EDGE264_DIR}/libedge264.a")
-
-# AV SAFETY & 3D FIX: Use Dynamic Loading (LoadLibrary) instead of Static Linking
-# This prevents embedding the MinGW static lib into the MSVC binary (AV false positive)
-# while keeping the C++ logic intact (Full 3D support).
-set(HAVE_EDGE264 OFF)
-add_definitions(-DEDGE264_DYNAMIC_LOAD)
-message(STATUS "Enabling Dynamic Loading of edge264.dll (Anti-Virus Safe Mode)")
-
-# When using MinGW-compiled edge264 with MSVC, we need MinGW runtime libraries
-set(MINGW_LIBRARIES "")
-if(WIN32 AND MSVC AND EDGE264_LIBRARY AND HAVE_EDGE264)
-    # Check if edge264 was built with MinGW (look for .a extension or check for MinGW symbols)
-    get_filename_component(EDGE264_EXT "${EDGE264_LIBRARY}" EXT)
-    if(EDGE264_EXT STREQUAL ".a")
-        message(STATUS "Detected MinGW-compiled edge264 library")
-        message(STATUS "Searching for MinGW runtime libraries...")
-
-        # Try to find MSYS2/MinGW installation
-        set(MINGW_SEARCH_PATHS
-            "C:/msys64/mingw64/lib"
-            "C:/msys64/mingw64/x86_64-w64-mingw32/lib"
-            "C:/msys2/mingw64/lib"
-            "C:/msys2/mingw64/x86_64-w64-mingw32/lib"
-            "$ENV{MSYSTEM_PREFIX}/lib"
-            "$ENV{MINGW_PREFIX}/lib"
-        )
-
-        # Add GCC version-specific directories (for libgcc.a)
-        # These are typically in lib/gcc/x86_64-w64-mingw32/<version>/
-        foreach(base_path "C:/msys64/mingw64" "C:/msys2/mingw64")
-            file(GLOB gcc_version_dirs "${base_path}/lib/gcc/x86_64-w64-mingw32/*")
-            foreach(gcc_dir ${gcc_version_dirs})
-                if(IS_DIRECTORY "${gcc_dir}")
-                    list(APPEND MINGW_SEARCH_PATHS "${gcc_dir}")
-                endif()
-            endforeach()
-        endforeach()
-
-        # Find required MinGW libraries
-        # CMake's find_library on Windows MSVC doesn't recognize .a files, so check directly
-        set(MINGW_PTHREAD_LIB "")
-        set(MINGW_GCC_LIB "")
-        set(MINGW_MINGWEX_LIB "")
-
-        # Check for libwinpthread.a
-        foreach(search_path ${MINGW_SEARCH_PATHS})
-            if(EXISTS "${search_path}/libwinpthread.a")
-                set(MINGW_PTHREAD_LIB "${search_path}/libwinpthread.a")
-                break()
-            endif()
-        endforeach()
-
-        # Check for libgcc.a in GCC version-specific directories
-        foreach(search_path ${MINGW_SEARCH_PATHS})
-            if(EXISTS "${search_path}/libgcc.a")
-                set(MINGW_GCC_LIB "${search_path}/libgcc.a")
-                break()
-            endif()
-        endforeach()
-
-        # Check for libmingwex.a
-        foreach(search_path ${MINGW_SEARCH_PATHS})
-            if(EXISTS "${search_path}/libmingwex.a")
-                set(MINGW_MINGWEX_LIB "${search_path}/libmingwex.a")
-                break()
-            endif()
-        endforeach()
-
-        if(MINGW_PTHREAD_LIB)
-            list(APPEND MINGW_LIBRARIES ${MINGW_PTHREAD_LIB})
-            message(STATUS "  Found pthread: ${MINGW_PTHREAD_LIB}")
-        else()
-            message(WARNING "  pthread library not found - linking may fail!")
-        endif()
-
-        if(MINGW_GCC_LIB)
-            list(APPEND MINGW_LIBRARIES ${MINGW_GCC_LIB})
-            message(STATUS "  Found gcc: ${MINGW_GCC_LIB}")
-        else()
-            message(WARNING "  gcc library not found - linking may fail!")
-        endif()
-
-        if(MINGW_MINGWEX_LIB)
-            list(APPEND MINGW_LIBRARIES ${MINGW_MINGWEX_LIB})
-            message(STATUS "  Found mingwex: ${MINGW_MINGWEX_LIB}")
-        else()
-            message(WARNING "  mingwex library not found - linking may fail!")
-        endif()
-
-        if(NOT MINGW_PTHREAD_LIB OR NOT MINGW_GCC_LIB OR NOT MINGW_MINGWEX_LIB)
-            message(WARNING "")
-            message(WARNING "Some MinGW runtime libraries not found!")
-            message(WARNING "  This may cause linker errors when using MinGW-compiled edge264 with MSVC")
-            message(WARNING "  Searched in:")
-            foreach(path ${MINGW_SEARCH_PATHS})
-                message(WARNING "    - ${path}")
-            endforeach()
-            message(WARNING "")
-            message(WARNING "  Install MSYS2 from https://www.msys2.org/ if not already installed")
-            message(WARNING "")
-        endif()
-    endif()
+# edge264.dll is loaded with LoadLibrary/GetProcAddress by mvc_decoder.cpp.
+if(WIN32)
+    set(HAVE_EDGE264 ON)
+    set(EDGE264_DYNAMIC_LOAD ON)
+    message(STATUS "edge264 MVC decoder: dynamic runtime loading ENABLED")
+else()
+    set(HAVE_EDGE264 OFF)
+    set(EDGE264_DYNAMIC_LOAD OFF)
 endif()
 
 # Source files
 set(SOURCES
+    src/file_byte_source.cpp
     src/frame_ring_buffer.cpp
     src/h264_nal_parser.cpp
     src/mvc_demuxer.cpp
@@ -512,13 +429,8 @@ set(SOURCES
     src/mvc_decoder.cpp
 )
 
-# Add MinGW compatibility layer when cross-compiling with MSVC
-if(WIN32 AND MSVC AND MINGW_LIBRARIES)
-    message(STATUS "Adding MinGW-MSVC compatibility layer (mingw_compat.cpp)")
-    list(APPEND SOURCES src/mingw_compat.cpp)
-endif()
-
 set(HEADERS
+    include/file_byte_source.h
     include/frame_ring_buffer.h
     include/h264_nal_parser.h
     include/mvc_demuxer.h
@@ -552,25 +464,11 @@ pybind11_add_module(mvc_demuxer_cpp
 
 # Link with edge264 if available
 if(HAVE_EDGE264)
-    target_link_libraries(mvc_demuxer_cpp PRIVATE "${EDGE264_LIBRARY}")
-    target_compile_definitions(mvc_demuxer_cpp PRIVATE EDGE264_AVAILABLE)
-    message(STATUS "edge264 available - MVCDecoder will be exposed in Python")
+    target_compile_definitions(mvc_demuxer_cpp PRIVATE
+        EDGE264_AVAILABLE EDGE264_DYNAMIC_LOAD)
+    message(STATUS "MVCDecoder exposed; edge264.dll will be resolved at runtime")
 else()
     message(STATUS "edge264 library not found - MVCDecoder will NOT be available (demuxer still works)")
-endif()
-
-# Link MinGW runtime libraries if needed (cross-compilation MSVC+MinGW)
-if(MINGW_LIBRARIES)
-    message(STATUS "Linking MinGW runtime libraries: ${MINGW_LIBRARIES}")
-    target_link_libraries(mvc_demuxer_cpp PRIVATE ${MINGW_LIBRARIES})
-
-    # MinGW libraries depend on C runtime functions with different naming conventions
-    # Add MSVC legacy libraries to provide missing CRT symbols
-    if(MSVC)
-        target_link_libraries(mvc_demuxer_cpp PRIVATE
-            legacy_stdio_definitions.lib  # Provides fprintf, _vsnprintf, _vscprintf
-        )
-    endif()
 endif()
 
 if(HAVE_LIBMATROSKA)
@@ -605,10 +503,22 @@ endif()
 
 if(BUILD_NATIVE_RENDERER)
     target_sources(mvc_demuxer_cpp PRIVATE src/native_renderer.cpp)
+    # SyLC Cast: NVENC HEVC encoder wrapper (NV12 D3D11 texture -> HEVC NAL bytes).
+    # Windows-only body; nvEncodeAPI64.dll is dynamic-loaded at runtime (no NVENC .lib linked).
+    target_sources(mvc_demuxer_cpp PRIVATE src/nvenc_encoder.cpp)
+    # SyLC Cast: YUV -> NV12 side-by-side packer. Renders the renderer's 6 YUV plane SRVs
+    # into one NV12 3840x1080 SBS texture (the NVENC input). HLSL compiled at runtime via
+    # d3dcompiler (already linked below), same idiom as native_renderer.cpp.
+    target_sources(mvc_demuxer_cpp PRIVATE src/sbs_nv12_packer.cpp)
     target_compile_definitions(mvc_demuxer_cpp PRIVATE SYLC_NATIVE_RENDERER)
     # Windows SDK (MSVC) and MinGW both resolve these to the system D3D libs.
     # d3dcompiler is used to compile the embedded HLSL at runtime (S2+).
     target_link_libraries(mvc_demuxer_cpp PRIVATE d3d11 dxgi dxguid d3dcompiler)
+    # SyLC Cast (NVENC): vendored MIT nv-codec-headers only (nvEncodeAPI.h) — the
+    # encoder DLL itself is dynamic-loaded from the user's NVIDIA driver at runtime,
+    # nothing NVIDIA-licensed is compiled/linked in. See third_party/nv-codec-headers/LICENSE.
+    target_include_directories(mvc_demuxer_cpp PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nv-codec-headers)
     message(STATUS "Native D3D11 renderer: ENABLED (NativeRenderer exposed)")
 else()
     message(STATUS "Native D3D11 renderer: disabled")
@@ -626,21 +536,8 @@ target_include_directories(mvc_demuxer_static PUBLIC ${EDGE264_INCLUDE_DIR})
 
 # Link static library with edge264 if available
 if(HAVE_EDGE264)
-    target_link_libraries(mvc_demuxer_static PUBLIC "${EDGE264_LIBRARY}")
-    target_compile_definitions(mvc_demuxer_static PUBLIC EDGE264_AVAILABLE)
-endif()
-
-# Link MinGW runtime libraries if needed
-if(MINGW_LIBRARIES)
-    target_link_libraries(mvc_demuxer_static PUBLIC ${MINGW_LIBRARIES})
-
-    # MinGW libraries depend on C runtime functions with different naming conventions
-    # Add MSVC legacy libraries to provide missing CRT symbols
-    if(MSVC)
-        target_link_libraries(mvc_demuxer_static PUBLIC
-            legacy_stdio_definitions.lib  # Provides fprintf, _vsnprintf, _vscprintf
-        )
-    endif()
+    target_compile_definitions(mvc_demuxer_static PUBLIC
+        EDGE264_AVAILABLE EDGE264_DYNAMIC_LOAD)
 endif()
 
 if(HAVE_LIBMATROSKA)

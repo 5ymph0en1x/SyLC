@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace sylc {
 
@@ -116,11 +117,12 @@ public:
     void resume();
     bool is_paused() const { return paused_; }
 
-    // Clear the current back buffer to opaque black and Present (interval 1,
-    // matching the current ~1-frame latency the audio offset is tuned against).
+    // Clear the current back buffer to opaque black and Present. Interval 1 is
+    // the timing-authority default; interval 0 is used only for a simultaneous
+    // secondary preview so a second swapchain cannot block frame delivery.
     // If a frame has been uploaded and the pipeline is ready, draws the shaded,
     // aspect-correct quad before presenting; otherwise presents black (S1).
-    bool present();
+    bool present(uint32_t sync_interval = 1);
 
     // True if the scRGB HDR color space was accepted by the swapchain/output.
     bool is_hdr() const { return hdr_enabled_; }
@@ -131,6 +133,37 @@ public:
 
     // Release all D3D resources. Idempotent.
     void shutdown();
+
+    // --- SyLC Cast (PC sender): NV12-SBS pack + NVENC HEVC encode -----------
+    // A cast pipeline (Task-2 SbsNv12Packer + Task-1 NvencEncoder) bound to THIS
+    // renderer's D3D11 device. It consumes the SAME six YUV plane SRVs uploaded by
+    // set_yuv_frame (srv[1..6] = L Y/U/V, R Y/U/V) — never RGB — packs them into an
+    // NV12 3840x1080 side-by-side texture, and encodes that to HEVC. The cast path
+    // never calls present(); it only needs the device/context/srv. The three stateful
+    // methods (cast_start / cast_encode / cast_stop) are serialized by the same internal
+    // mutex as the render/upload path; cast_available() is a lock-free NVENC probe that
+    // takes no lock and touches no shared state.
+    //
+    // cast_available(): true if NVENC (nvEncodeAPI64.dll) is present. Safe on a host
+    //   with no NVIDIA GPU (returns false; no device needed).
+    // cast_start(mode,fps,bitrate): build the packer + encoder on impl_->device.
+    //   mode = "lossless" (LosslessWired, bit-exact) or anything else (CbrLowLatency).
+    //   bitrate_bps applies to CBR only (<=0 keeps the encoder default). false on error.
+    // cast_encode(pts_ms,force_idr): pack the last-uploaded planes and encode ONE
+    //   frame; returns the HEVC Annex-B packets (empty on error, see last_error()).
+    // cast_reconfigure(mode,bitrate): hot-change the RUNNING encoder to a new bitrate/mode
+    //   mid-stream without tearing down the packer/texture. A same-mode bitrate change goes
+    //   through NvEncReconfigureEncoder (seamless, no session teardown); a mode switch the
+    //   driver won't reconfigure cleanly falls back to an encoder-only reopen (the packer
+    //   and its NV12 texture stay; only the NVENC session cycles + re-registers). Either
+    //   way the next encoded frame is an IDR. false on error (see last_error()).
+    // cast_stop(): flush + tear down the pipeline. Idempotent.
+    bool cast_available() const;
+    bool cast_start(const std::string& mode, int fps, int64_t bitrate_bps,
+                    bool main10 = false);
+    std::vector<std::vector<uint8_t>> cast_encode(int64_t pts_ms, bool force_idr);
+    bool cast_reconfigure(const std::string& mode, int64_t bitrate_bps);
+    void cast_stop();
 
 private:
     // Plane texture pixel format. Kept free of DXGI/Windows types so this public

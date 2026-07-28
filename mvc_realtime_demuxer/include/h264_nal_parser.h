@@ -69,7 +69,10 @@ public:
         if (size >= 4) {
             uint32_t word;
             std::memcpy(&word, data, 4);
-            if (word == 0x01000000u || word == 0x00000001u) {
+            // The build target is little-endian: bytes 00 00 00 01 load as
+            // 0x01000000. 0x00000001 would mean bytes 01 00 00 00 and is NOT
+            // an Annex-B prefix; accepting it split valid slice payloads.
+            if (word == 0x01000000u) {
                 return 4;
             }
         }

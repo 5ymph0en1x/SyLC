@@ -4,6 +4,8 @@
 
 #include "native_renderer.h"
 #include "native_renderer_shaders.h"   // kVertexHLSL / kFragmentHLSL (exact, embedded)
+#include "nvenc_encoder.h"             // SyLC Cast: Task-1 NVENC HEVC encoder wrapper
+#include "sbs_nv12_packer.h"           // SyLC Cast: Task-2 YUV -> NV12 SBS packer
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -14,11 +16,27 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <memory>
 #include <mutex>
 
 using Microsoft::WRL::ComPtr;
 
 namespace sylc {
+
+static std::string d3d_error(const char* operation, HRESULT hr,
+                             ID3D11Device* device = nullptr) {
+    char buf[192] = {};
+    const HRESULT removed = device ? device->GetDeviceRemovedReason() : S_OK;
+    if (device && FAILED(removed)) {
+        std::snprintf(buf, sizeof(buf), "%s failed (hr=0x%08lX, removed=0x%08lX)",
+                      operation, static_cast<unsigned long>(hr),
+                      static_cast<unsigned long>(removed));
+    } else {
+        std::snprintf(buf, sizeof(buf), "%s failed (hr=0x%08lX)",
+                      operation, static_cast<unsigned long>(hr));
+    }
+    return std::string(buf);
+}
 
 // Texture slots match the HLSL register bindings:
 //   t0 = subtitle (RGBA8), t1..t3 = Y/U/V left, t4..t6 = Y/U/V right.
@@ -47,6 +65,20 @@ struct FrameCB {
 // the ABI is unchanged. Both 0 (DEFAULT) is byte-identical to the pre-HDR shader.
 static_assert(sizeof(FrameCB) == 64, "cbuffer must be 64 bytes");
 
+// SyLC Cast pipeline: the Task-2 NV12-SBS packer + the Task-1 NVENC encoder, both
+// bound to the renderer's D3D11 device. Held by value (both are non-copyable, unique
+// resource owners) inside a struct the Impl owns via unique_ptr; created on
+// cast_start(), torn down on cast_stop()/shutdown(). File-local — the header only
+// forward-declares nothing of it (opaque behind Impl), exactly like the ComPtr members.
+struct CastPipeline {
+    sylc::SbsNv12Packer packer;   // 6 YUV plane SRVs -> NV12/P010 3840x1080 SBS texture
+    sylc::NvencEncoder  enc;      // NV12/P010 texture -> HEVC NAL bytes
+    void*               regInput = nullptr;   // NVENC-registered handle for the NV12 tex
+    uint32_t            fps      = 24;         // frame rate from cast_start (for reconfigure)
+    bool                main10   = false;      // Main10/P010 HDR session (for reconfigure)
+    bool                active   = false;
+};
+
 struct NativeRenderer::Impl {
     ComPtr<ID3D11Device>           device;
     ComPtr<ID3D11DeviceContext>    context;
@@ -70,6 +102,11 @@ struct NativeRenderer::Impl {
     TexFormat  tex_fmt[kNumTex] = { TexFormat::R8, TexFormat::R8, TexFormat::R8,
                                     TexFormat::R8, TexFormat::R8, TexFormat::R8,
                                     TexFormat::R8 };
+
+    // SyLC Cast: the offscreen NV12-SBS pack + NVENC encode pipeline. Null until
+    // cast_start() builds it on `device`; reset by cast_stop()/shutdown(). Held by
+    // unique_ptr so the non-copyable packer/encoder live at a stable address.
+    std::unique_ptr<CastPipeline> cast;
 
     // Last-written constant-buffer contents. set_uniforms rebuilds this fully each
     // call; set_plane_scale mutates only .plane_scale and re-uploads — so a
@@ -117,7 +154,7 @@ bool NativeRenderer::initialize(uint64_t hwnd, uint32_t width, uint32_t height, 
         hr = D3D11CreateDevice(
             nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
             &want[1], 1, D3D11_SDK_VERSION, &impl_->device, &got, &impl_->context);
-        if (FAILED(hr)) { last_error_ = "D3D11CreateDevice failed"; return false; }
+        if (FAILED(hr)) { last_error_ = d3d_error("D3D11CreateDevice", hr); return false; }
     }
 
     ComPtr<IDXGIDevice> dxgiDevice;
@@ -142,7 +179,10 @@ bool NativeRenderer::initialize(uint64_t hwnd, uint32_t width, uint32_t height, 
 
     const HWND win = reinterpret_cast<HWND>(static_cast<uintptr_t>(hwnd));
     hr = factory->CreateSwapChainForHwnd(impl_->device.Get(), win, &sd, nullptr, nullptr, &impl_->swapchain);
-    if (FAILED(hr)) { last_error_ = "CreateSwapChainForHwnd failed"; return false; }
+    if (FAILED(hr)) {
+        last_error_ = d3d_error("CreateSwapChainForHwnd", hr, impl_->device.Get());
+        return false;
+    }
     factory->MakeWindowAssociation(win, DXGI_MWA_NO_ALT_ENTER);
 
     // Color space. The shader output is GAMMA-ENCODED (BT.601 matrix, no
@@ -197,8 +237,11 @@ bool NativeRenderer::resize_backbuffer_locked(uint32_t width, uint32_t height) {
     if (width == 0 || height == 0) return true;
     if (width == width_ && height == height_ && impl_->rtv) return true; // already correct
     release_backbuffer_views();
-    if (FAILED(impl_->swapchain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0))) {
-        last_error_ = "ResizeBuffers failed"; return false;
+    const HRESULT hr = impl_->swapchain->ResizeBuffers(
+        0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+    if (FAILED(hr)) {
+        last_error_ = d3d_error("ResizeBuffers", hr, impl_->device.Get());
+        return false;
     }
     width_ = width; height_ = height;
     return create_rtv_for_backbuffer();
@@ -369,17 +412,18 @@ bool NativeRenderer::ensure_texture(int slot, uint32_t w, uint32_t h, TexFormat 
 }
 
 // Free helper that touches only public D3D types (not the private Impl).
-static bool upload_to_tex(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex,
-                          const uint8_t* data, uint32_t w, uint32_t h,
-                          uint32_t srcStride, uint32_t bytesPerPixel) {
+static HRESULT upload_to_tex(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex,
+                             const uint8_t* data, uint32_t w, uint32_t h,
+                             uint32_t srcStride, uint32_t bytesPerPixel) {
     D3D11_MAPPED_SUBRESOURCE m = {};
-    if (FAILED(ctx->Map(tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return false;
+    const HRESULT hr = ctx->Map(tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &m);
+    if (FAILED(hr)) return hr;
     auto* dst = static_cast<uint8_t*>(m.pData);
     const uint32_t rowBytes = w * bytesPerPixel;
     for (uint32_t r = 0; r < h; ++r)
         std::memcpy(dst + r * m.RowPitch, data + r * srcStride, rowBytes);
     ctx->Unmap(tex, 0);
-    return true;
+    return S_OK;
 }
 
 bool NativeRenderer::upload_plane(int plane_index, const uint8_t* data,
@@ -390,8 +434,12 @@ bool NativeRenderer::upload_plane(int plane_index, const uint8_t* data,
     std::lock_guard<std::mutex> lk(impl_->mtx);
     const int slot = plane_index + 1; // 0->t1 .. 5->t6
     if (!ensure_texture(slot, width, height, TexFormat::R8)) return false;
-    if (!upload_to_tex(impl_->context.Get(), impl_->tex[slot].Get(), data, width, height, src_stride, 1)) {
-        last_error_ = "Map(plane) failed"; return false;
+    const HRESULT hr = upload_to_tex(
+        impl_->context.Get(), impl_->tex[slot].Get(),
+        data, width, height, src_stride, 1);
+    if (FAILED(hr)) {
+        last_error_ = d3d_error("Map(plane)", hr, impl_->device.Get());
+        return false;
     }
     if (plane_index == 0) { src_w_ = width; src_h_ = height; has_frame_ = true; }
     return true;
@@ -406,9 +454,12 @@ bool NativeRenderer::upload_plane16(int plane_index, const uint16_t* data,
     const int slot = plane_index + 1; // 0->t1 .. 5->t6
     if (!ensure_texture(slot, width, height, TexFormat::R16)) return false;
     // src_stride is in BYTES; upload_to_tex copies width*2 bytes per row.
-    if (!upload_to_tex(impl_->context.Get(), impl_->tex[slot].Get(),
-                       reinterpret_cast<const uint8_t*>(data), width, height, src_stride, 2)) {
-        last_error_ = "Map(plane16) failed"; return false;
+    const HRESULT hr = upload_to_tex(
+        impl_->context.Get(), impl_->tex[slot].Get(),
+        reinterpret_cast<const uint8_t*>(data), width, height, src_stride, 2);
+    if (FAILED(hr)) {
+        last_error_ = d3d_error("Map(plane16)", hr, impl_->device.Get());
+        return false;
     }
     if (plane_index == 0) { src_w_ = width; src_h_ = height; has_frame_ = true; }
     return true;
@@ -420,8 +471,12 @@ bool NativeRenderer::upload_subtitle(const uint8_t* data, uint32_t width, uint32
     if (!data) { last_error_ = "upload_subtitle: null data"; return false; }
     std::lock_guard<std::mutex> lk(impl_->mtx);
     if (!ensure_texture(0, width, height, TexFormat::RGBA8)) return false;
-    if (!upload_to_tex(impl_->context.Get(), impl_->tex[0].Get(), data, width, height, src_stride, 4)) {
-        last_error_ = "Map(subtitle) failed"; return false;
+    const HRESULT hr = upload_to_tex(
+        impl_->context.Get(), impl_->tex[0].Get(),
+        data, width, height, src_stride, 4);
+    if (FAILED(hr)) {
+        last_error_ = d3d_error("Map(subtitle)", hr, impl_->device.Get());
+        return false;
     }
     return true;
 }
@@ -528,7 +583,7 @@ void NativeRenderer::resume() {
     paused_ = false;
 }
 
-bool NativeRenderer::present() {
+bool NativeRenderer::present(uint32_t sync_interval) {
     if (!impl_ || !impl_->swapchain || !impl_->context) { last_error_ = "present before initialize"; return false; }
     std::lock_guard<std::mutex> lk(impl_->mtx);
     if (paused_) return true;   // seek/pause gate: hold last frame, no GPU work
@@ -544,8 +599,9 @@ bool NativeRenderer::present() {
         if (GetClientRect(reinterpret_cast<HWND>(static_cast<uintptr_t>(hwnd_)), &rc)) {
             const uint32_t cw = static_cast<uint32_t>(rc.right - rc.left);
             const uint32_t ch = static_cast<uint32_t>(rc.bottom - rc.top);
-            if (cw > 0 && ch > 0 && (cw != width_ || ch != height_))
-                resize_backbuffer_locked(cw, ch);
+            if (cw > 0 && ch > 0 && (cw != width_ || ch != height_) &&
+                !resize_backbuffer_locked(cw, ch))
+                return false;
         }
     }
 
@@ -625,14 +681,183 @@ bool NativeRenderer::present() {
         ctx->Draw(4, 0);
     }
 
-    if (FAILED(impl_->swapchain->Present(1, 0))) { last_error_ = "Present failed"; return false; }
+    // DXGI accepts 0..4. The player uses 1 for the framepack timing authority
+    // and 0 for the simultaneous main-window preview.
+    const UINT interval = static_cast<UINT>(sync_interval > 4 ? 4 : sync_interval);
+    const HRESULT hr = impl_->swapchain->Present(interval, 0);
+    if (FAILED(hr)) {
+        last_error_ = d3d_error("Present", hr, impl_->device.Get());
+        return false;
+    }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// SyLC Cast (PC sender): offscreen NV12-SBS pack + NVENC HEVC encode.
+// Consumes the SAME six YUV plane SRVs the render path uploads (srv[1..6]);
+// never touches the swapchain / present(). See native_renderer.h.
+// ---------------------------------------------------------------------------
+bool NativeRenderer::cast_available() const {
+    // Pure NVENC probe (LoadLibrary + CreateInstance). Safe with no NVIDIA GPU.
+    return sylc::NvencEncoder::available();
+}
+
+bool NativeRenderer::cast_start(const std::string& mode, int fps, int64_t bitrate_bps,
+                                bool main10) {
+    last_error_.clear();
+    if (!impl_ || !impl_->device) { last_error_ = "cast_start: renderer not initialized"; return false; }
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    if (impl_->cast && impl_->cast->active) { last_error_ = "cast_start: already active"; return false; }
+
+    auto cp = std::make_unique<CastPipeline>();
+    sylc::NvencConfig cfg;
+    cfg.width  = 3840;
+    cfg.height = 1080;
+    cfg.fps    = (fps > 0) ? static_cast<uint32_t>(fps) : 24u;
+    cfg.mode   = (mode == "lossless") ? sylc::CastMode::LosslessWired
+                                      : sylc::CastMode::CbrLowLatency;
+    if (bitrate_bps > 0) cfg.cbrBitrateBps = static_cast<uint32_t>(bitrate_bps);
+    cfg.main10 = main10;
+    cp->fps    = cfg.fps;   // remembered for cast_reconfigure (its signature carries no fps)
+    cp->main10 = main10;
+
+    std::string err;
+    if (!cp->packer.init(impl_->device.Get(), err, main10)) {
+        last_error_ = "cast_start: packer.init: " + err; return false;
+    }
+    if (!cp->enc.open(impl_->device.Get(), cfg, err)) {
+        last_error_ = "cast_start: enc.open: " + err;
+        cp->packer.shutdown();
+        return false;
+    }
+    // Zero-copy: register the packer's NV12 output texture as the NVENC input surface.
+    if (!cp->enc.registerInput(cp->packer.outputTexture(), &cp->regInput, err)) {
+        last_error_ = "cast_start: registerInput: " + err;
+        cp->enc.close();
+        cp->packer.shutdown();
+        return false;
+    }
+    cp->active = true;
+    impl_->cast = std::move(cp);
+    return true;
+}
+
+std::vector<std::vector<uint8_t>> NativeRenderer::cast_encode(int64_t pts_ms, bool force_idr) {
+    std::vector<std::vector<uint8_t>> pkts;
+    if (!impl_) { return pkts; }
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    if (!impl_->cast || !impl_->cast->active) { last_error_ = "cast_encode: not started"; return pkts; }
+    CastPipeline& c = *impl_->cast;
+
+    // The six YUV plane SRVs uploaded by set_yuv_frame: srv[1..3]=L Y/U/V, srv[4..6]=R Y/U/V.
+    ID3D11ShaderResourceView* srv6[6] = {
+        impl_->srv[1].Get(), impl_->srv[2].Get(), impl_->srv[3].Get(),
+        impl_->srv[4].Get(), impl_->srv[5].Get(), impl_->srv[6].Get(),
+    };
+    for (int i = 0; i < 6; ++i) {
+        if (!srv6[i]) { last_error_ = "cast_encode: a YUV plane SRV is null (call set_yuv_frame first)"; return pkts; }
+    }
+
+    // Subtitle burn-in: mirror the DISPLAY's current subtitle state into the
+    // pack, so the cast shows exactly what the PC shows -- same RGBA overlay
+    // (srv[0], always valid: 1x1 transparent when none), same enable flag,
+    // same rect, same stereoscopic half-per-eye disparity. Toggling subtitles
+    // on the PC therefore toggles them on the headset, live.
+    sylc::CastSubtitle sub;
+    sub.srv       = impl_->srv[0].Get();
+    sub.enabled   = impl_->cb.subtitle_enabled;
+    sub.disparity = impl_->cb.subtitle_disparity;
+    sub.rect[0] = impl_->cb.subtitle_rect[0]; sub.rect[1] = impl_->cb.subtitle_rect[1];
+    sub.rect[2] = impl_->cb.subtitle_rect[2]; sub.rect[3] = impl_->cb.subtitle_rect[3];
+
+    // plane_scale mirrors the DISPLAY's per-source value (1.0 for 8-bit and HW
+    // P010 planes, 65535/1023 for SW-decoded 10-bit) so the pack writes
+    // correctly-aligned NV12/P010 regardless of how the planes were uploaded.
+    c.packer.pack(impl_->context.Get(), srv6, sub, impl_->cb.plane_scale);
+    std::string err;
+    if (!c.enc.encode(c.regInput, pts_ms, force_idr, pkts, err)) {
+        last_error_ = "cast_encode: " + err;   // pkts left as whatever encode appended (empty on error)
+    }
+    return pkts;
+}
+
+bool NativeRenderer::cast_reconfigure(const std::string& mode, int64_t bitrate_bps) {
+    last_error_.clear();
+    if (!impl_ || !impl_->device) { last_error_ = "cast_reconfigure: renderer not initialized"; return false; }
+    std::lock_guard<std::mutex> lk(impl_->mtx);   // serialized with cast_encode/cast_stop
+    if (!impl_->cast || !impl_->cast->active) { last_error_ = "cast_reconfigure: not started"; return false; }
+    CastPipeline& c = *impl_->cast;
+
+    // Cast is always the fixed 3840x1080 SBS surface; only bitrate/mode change here. Keep
+    // the fps cast_start ran with (the signature carries none) so the CBR VBV stays sized.
+    sylc::NvencConfig cfg;
+    cfg.width  = 3840;
+    cfg.height = 1080;
+    cfg.fps    = c.fps;
+    cfg.main10 = c.main10;   // the packer texture is fixed; bit depth must not drift
+    cfg.mode   = (mode == "lossless") ? sylc::CastMode::LosslessWired
+                                      : sylc::CastMode::CbrLowLatency;
+    if (bitrate_bps > 0) cfg.cbrBitrateBps = static_cast<uint32_t>(bitrate_bps);
+
+    std::string err;
+    // 1) Seamless path: NvEncReconfigureEncoder (no teardown; next frame forced to IDR).
+    //    This is the common Wi-Fi fallback — a same-mode CBR bitrate step.
+    if (c.enc.reconfigure(cfg, err)) return true;
+
+    // 2) The driver rejected the change (e.g. a lossless<->cbr mode switch alters the GOP
+    //    structure / tuning, which NvEncReconfigureEncoder does not support). Fall back to
+    //    an ENCODER-ONLY reopen: close the NVENC session, reopen it with the new config,
+    //    and re-register the SAME packer output texture. The packer and its NV12 texture
+    //    are untouched -> a brief hiccup + a fresh IDR, acceptable for a rare mode switch.
+    // This is a notable, rare event (a seamless hot-reconfigure would have been silent), so
+    // log it: absence of this line for a transition means it took the seamless path.
+    std::fprintf(stderr, "[cast] reconfigure -> '%s': seamless NvEncReconfigureEncoder "
+                         "rejected (%s); cycling the NVENC session\n",
+                 mode.c_str(), err.c_str());
+    c.enc.close();
+    c.regInput = nullptr;
+    if (!c.enc.open(impl_->device.Get(), cfg, err)) {
+        last_error_ = "cast_reconfigure: reopen enc.open: " + err;
+        c.active = false;   // pipeline unusable until a clean cast_stop() tears it down
+        return false;
+    }
+    if (!c.enc.registerInput(c.packer.outputTexture(), &c.regInput, err)) {
+        last_error_ = "cast_reconfigure: reopen registerInput: " + err;
+        c.active = false;
+        return false;
+    }
+    return true;
+}
+
+void NativeRenderer::cast_stop() {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    if (!impl_->cast) return;   // idempotent
+    CastPipeline& c = *impl_->cast;
+    // No enc.flush(): Task-1 forces frameIntervalP=1 (synchronous 1:1), so every frame's
+    // bitstream is emitted DURING its cast_encode() call and nothing is ever buffered.
+    // Task-1's flush() sends an EOS picture then nvEncLockBitstream on the single output
+    // buffer, which BUSY-WAITS forever when no frame is pending (proven hanging on the
+    // RTX 4090) -> calling it here would spin cast_stop indefinitely. Draining is
+    // unnecessary for a 1:1 encoder, so we close the session directly.
+    c.enc.close();
+    c.packer.shutdown();
+    impl_->cast.reset();
 }
 
 void NativeRenderer::shutdown() {
     if (!impl_) return;
     std::lock_guard<std::mutex> lk(impl_->mtx);
     if (impl_->context) impl_->context->ClearState();
+    // SyLC Cast: tear down the NVENC session + packer BEFORE releasing the device they
+    // were created on. Inlined (not cast_stop(), which re-locks the non-recursive mutex).
+    // No enc.flush() — see cast_stop(): frameIntervalP=1 buffers nothing, and Task-1's
+    // flush() busy-waits on the EOS bitstream lock when nothing is pending. Close directly.
+    if (impl_->cast) {
+        impl_->cast->enc.close();
+        impl_->cast->packer.shutdown();
+        impl_->cast.reset();
+    }
     for (int i = 0; i < kNumTex; ++i) { impl_->srv[i].Reset(); impl_->tex[i].Reset(); }
     impl_->raster.Reset(); impl_->sampler.Reset(); impl_->cbuffer.Reset();
     impl_->vbuffer.Reset(); impl_->input_layout.Reset();

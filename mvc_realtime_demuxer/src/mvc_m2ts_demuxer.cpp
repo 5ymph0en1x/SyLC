@@ -15,11 +15,13 @@ constexpr uint8_t NAL_TYPE_CODED_SLICE_EXTENSION = 20;
 constexpr uint8_t STREAM_TYPE_H264 = 0x1B;
 constexpr uint8_t STREAM_TYPE_MVC = 0x20;
 
-// Global debug counters (reset in open)
-static int g_debugCount = 0;
-static int g_nalHistCount = 0;
-static bool g_nalFirstCall = true;
-static int g_nalTypeHistogram[32] = {0};
+// Decoder instances can probe concurrently (playback + thumbnail service).
+// Thread-local diagnostics prevent one source's type-20 NALs from promoting a
+// different, flat AVC source to MVC.
+thread_local int g_debugCount = 0;
+thread_local int g_nalHistCount = 0;
+thread_local bool g_nalFirstCall = true;
+thread_local int g_nalTypeHistogram[32] = {0};
 
 MVCM2TSDemuxer::MVCM2TSDemuxer()
     : reader_(std::make_unique<M2TSReader>()),
@@ -37,6 +39,28 @@ MVCM2TSDemuxer::~MVCM2TSDemuxer() {
 }
 
 bool MVCM2TSDemuxer::open(const std::string& filePath) {
+    // A demuxer instance may be reused after a failed probe or a seek. Never let
+    // stale MVC/PID/frame state promote the next (possibly 2D) source to MVC.
+    if (reader_->isOpen()) {
+        reader_->close();
+    }
+    abortRequested_.store(false, std::memory_order_relaxed);
+    videoInfo_ = {};
+    hasVideoInfo_ = false;
+    hasCodecPrivate_ = false;
+    dualPidStartPos_ = 0;
+    externalDurationMs_ = 0;
+    streamStartPts90k_ = -1;
+    lastSeekTimestampMs_ = 0;
+    codecPrivate_.clear();
+    pesStates_.clear();
+    mvcBuffer_.clear();
+    h264Buffer_.clear();
+    replayFrames_.clear();
+    currentFrame_ = {};
+    pendingFrame_ = {};
+    pendingFrame_.hasData = false;
+
     // Reset debug counters
     g_debugCount = 0;
     g_nalHistCount = 0;
@@ -52,7 +76,9 @@ bool MVCM2TSDemuxer::open(const std::string& filePath) {
     int maxProbePackets = 10000;  // Reverted to 10000 for better SSIF detection
     int spsFound = 0;
 
-    for (int i = 0; i < maxProbePackets && reader_->readPacket(packet); i++) {
+    for (int i = 0; i < maxProbePackets &&
+                    !abortRequested_.load(std::memory_order_relaxed) &&
+                    reader_->readPacket(packet); i++) {
         // PAT/PMT parsing handled inside readPacket
 
         // Once we have video PIDs, start looking for SPS
@@ -107,6 +133,12 @@ bool MVCM2TSDemuxer::open(const std::string& filePath) {
         }
     }
 
+    if (abortRequested_.load(std::memory_order_relaxed)) {
+        std::cerr << "[MVCM2TSDemuxer] Probe aborted" << std::endl;
+        close();
+        return false;
+    }
+
     // Get video PIDs
     auto videoPids = reader_->getVideoPids();
     if (videoPids.empty()) {
@@ -115,14 +147,9 @@ bool MVCM2TSDemuxer::open(const std::string& filePath) {
         return false;
     }
 
-    // CRITICAL FIX: Detect MVC for both dual-PID and single-PID (Blu-ray 3D) modes
-    // Check if any PID has MVC descriptor (0x7A) for single-PID interleaved mode
-    // CRITICAL FIX: Force MVC detection for Blu-ray 3D M2TS files
-    // The descriptor 0x7A is not always present or correctly parsed,
-    // leading to videoInfo_.hasMVC being false for valid 3D streams.
-    // Forcing it to true allows edge264 to correctly initialize DPB for MVC.
-    videoInfo_.hasMVC = true;
-    std::cout << "[MVCM2TSDemuxer] WARNING: Forcing videoInfo_.hasMVC = true for debugging purposes." << std::endl;
+    // MVC must be evidence-based. A normal Blu-ray AVC clip commonly uses PID
+    // 0x1011; that number alone says nothing about stereoscopy.
+    videoInfo_.hasMVC = false;
     videoInfo_.baseVideoPid = 0;
     videoInfo_.mvcVideoPid = 0;
 
@@ -164,6 +191,10 @@ bool MVCM2TSDemuxer::open(const std::string& filePath) {
     // Sort PIDs to ensure deterministic assignment (Lowest = Base)
     std::sort(foundH264Pids.begin(), foundH264Pids.end());
     std::sort(foundMvcPids.begin(), foundMvcPids.end());
+    foundH264Pids.erase(std::unique(foundH264Pids.begin(), foundH264Pids.end()),
+                        foundH264Pids.end());
+    foundMvcPids.erase(std::unique(foundMvcPids.begin(), foundMvcPids.end()),
+                       foundMvcPids.end());
 
     uint16_t h264Pid = 0;
     uint16_t mvcPid = 0;
@@ -174,35 +205,13 @@ bool MVCM2TSDemuxer::open(const std::string& filePath) {
 
     if (!foundMvcPids.empty()) {
         mvcPid = foundMvcPids[0];
-    } else if (foundH264Pids.size() >= 2) {
-        // Heuristic: If we have 2+ H.264 streams and NO explicit MVC stream,
-        // assume the second one is the MVC Dependent View.
-        mvcPid = foundH264Pids[1];
-        std::cout << "[MVCM2TSDemuxer] Heuristic: Using second H.264 stream (0x" 
-                  << std::hex << mvcPid << std::dec << ") as MVC Dependent View" << std::endl;
-    }
-
-    // CRITICAL FIX for SSIF: If we found 0x1012 (likely MVC) but no 0x1011 (Base),
-    // force 0x1011 as Base. SSIF files are often bulk-interleaved and we might
-    // not have scanned far enough to see the H.264 chunk, but 0x1012 implies 0x1011.
-    if ((mvcPid == 0x1012 || h264Pid == 0x1012) && h264Pid != 0x1011) {
-        std::cout << "[MVCM2TSDemuxer] Heuristic: Found PID 0x1012 (MVC?), forcing Base PID to 0x1011" << std::endl;
-        h264Pid = 0x1011;
-        mvcPid = 0x1012;
-        videoInfo_.hasMVC = true;
-    }
-    // Also handle case where we only found 0x1011 and missed 0x1012
-    else if (h264Pid == 0x1011 && mvcPid == 0) {
-         std::cout << "[MVCM2TSDemuxer] Heuristic: Found Base PID 0x1011 in SSIF, forcing MVC PID to 0x1012" << std::endl;
-         mvcPid = 0x1012;
-         videoInfo_.hasMVC = true;
     }
 
     std::cout << "[MVCM2TSDemuxer] Final: h264Pid=0x" << std::hex << h264Pid
               << ", mvcPid=0x" << mvcPid << std::dec << std::endl;
 
-    // If we have BOTH H.264 and MVC PIDs, use H.264 as base and MVC as dependent
-    // This is the SSIF format (interleaved base + dependent in separate PIDs)
+    // Strong dual-PID evidence: the PMT explicitly advertises an H.264 base PID
+    // and an MVC (stream_type 0x20) PID.
     if (h264Pid != 0 && mvcPid != 0) {
         videoInfo_.hasMVC = true;
         videoInfo_.baseVideoPid = h264Pid;   // H.264 with IDR frames
@@ -211,11 +220,18 @@ bool MVCM2TSDemuxer::open(const std::string& filePath) {
         std::cout << "[MVCM2TSDemuxer]   Base PID: 0x" << std::hex << h264Pid << " (H.264)" << std::dec << std::endl;
         std::cout << "[MVCM2TSDemuxer]   MVC PID: 0x" << std::hex << mvcPid << " (MVC)" << std::dec << std::endl;
     }
-    // Otherwise check for single-PID MVC with descriptor 0x7A
-    else if (!videoPids.empty()) {
-        videoInfo_.baseVideoPid = videoPids[0];
+    // Otherwise use the real H.264 PID in mono-view mode unless the stream has
+    // explicit single-PID MVC evidence (descriptor 0x7A or observed type-20 NAL).
+    else if (h264Pid != 0) {
+        videoInfo_.baseVideoPid = h264Pid;
 
         for (const auto& prog : programs) {
+            if (prog.hasMvcProgramDescriptor) {
+                videoInfo_.hasMVC = true;
+                std::cout << "[MVCM2TSDemuxer] MVC detected via program descriptor 0x7A"
+                          << std::endl;
+                break;
+            }
             auto it = prog.mvcStreams.find(videoInfo_.baseVideoPid);
             if (it != prog.mvcStreams.end() && it->second) {
                 videoInfo_.hasMVC = true;
@@ -224,12 +240,21 @@ bool MVCM2TSDemuxer::open(const std::string& filePath) {
             }
         }
 
-        // Check for dual-PID MVC (legacy, same stream type)
-        if (!videoInfo_.hasMVC && videoPids.size() >= 2) {
+        if (!videoInfo_.hasMVC && g_nalTypeHistogram[NAL_TYPE_CODED_SLICE_EXTENSION] > 0) {
             videoInfo_.hasMVC = true;
-            videoInfo_.mvcVideoPid = videoPids[1];
-            std::cout << "[MVCM2TSDemuxer] MVC detected via dual-PID mode (legacy)" << std::endl;
+            std::cout << "[MVCM2TSDemuxer] MVC detected from observed NAL type 20 "
+                         "(single-PID interleaved)" << std::endl;
         }
+
+        if (!videoInfo_.hasMVC) {
+            std::cout << "[MVCM2TSDemuxer] 2D AVC detected: base PID 0x"
+                      << std::hex << videoInfo_.baseVideoPid << std::dec
+                      << ", mono-view edge264 mode" << std::endl;
+        }
+    } else {
+        std::cerr << "[MVCM2TSDemuxer] MVC PID found without an H.264 base PID" << std::endl;
+        close();
+        return false;
     }
 
     std::cout << "[MVCM2TSDemuxer] DEBUG: h264Pid=0x" << std::hex << h264Pid 
@@ -276,7 +301,7 @@ bool MVCM2TSDemuxer::open(const std::string& filePath) {
         std::cerr << "[MVCM2TSDemuxer] WARNING: Failed to seek to start (continuing anyway)" << std::endl;
         // Don't fail here, try to find IDR from current position
     } else {
-        std::cout << "[MVCM2TSDemuxer] Seeking to position 0 to read SSIF bulk-interleaved data" << std::endl;
+        std::cout << "[MVCM2TSDemuxer] Seeking to stream start for IDR scan" << std::endl;
     }
     
     if (dualPidStartPos_ > 0) {
@@ -304,33 +329,19 @@ bool MVCM2TSDemuxer::open(const std::string& filePath) {
             std::cout << "[MVCM2TSDemuxer] Found first IDR frame after scanning "
                       << framesScanned << " frames" << std::endl;
 
-            // CRITICAL FIX: For dual-PID SSIF files (bulk-interleaved format), DON'T seek back.
-            // The SSIF format has MVC data at position 0-6MB, then H.264 data at 6MB+.
-            // If we seek back to 0, frame boundary detection creates incomplete frames
-            // because it processes MVC data first without matching H.264 data.
+            // Do not seek back: dual-PID SSIF may be bulk-interleaved. Replay
+            // the IDR from a dedicated queue while preserving pendingFrame_.
             //
-            // Instead, save the IDR frame we found (which has both views properly matched)
-            // and use it as the first frame, just like single-PID files.
+            // readNextFramePair() has already consumed the first PES of the
+            // following AU to prove that this IDR is complete. Older code put
+            // the IDR back *into pendingFrame_* and overwrote that pre-read AU.
+            // Losing frame #2 corrupts H.264 reference state (persistent green
+            // band until the next IDR), especially on long Blu-ray GOPs.
+            replayFrames_.push_back(std::move(tempPair));
             if (dualPidStartPos_ > 0) {
-                std::cout << "[MVCM2TSDemuxer] Dual-PID SSIF detected - using IDR frame directly (not seeking back)" << std::endl;
-                // Put this IDR frame back as pending for the first readNextFramePair() call
-                pendingFrame_.baseView = std::move(tempPair.baseData);
-                pendingFrame_.dependentView = std::move(tempPair.dependentData);
-                pendingFrame_.pts = tempPair.timestamp * 90;  // Convert back to 90kHz
-                pendingFrame_.hasData = true;
-                pendingFrame_.alreadyPrefixed = true;  // codecPrivate already prepended
-                pendingFrame_.hasBasePidData = !tempPair.baseData.empty();
-                pendingFrame_.hasMvcPidData = !tempPair.dependentData.empty();
+                std::cout << "[MVCM2TSDemuxer] Dual-PID SSIF detected - queued IDR replay while preserving next AU" << std::endl;
             } else {
-                std::cout << "[MVCM2TSDemuxer] Single-PID MVC detected - using IDR frame directly" << std::endl;
-                // Put this IDR frame back as pending for the first readNextFramePair() call
-                pendingFrame_.baseView = std::move(tempPair.baseData);
-                pendingFrame_.dependentView = std::move(tempPair.dependentData);
-                pendingFrame_.pts = tempPair.timestamp * 90;  // Convert back to 90kHz
-                pendingFrame_.hasData = true;
-                pendingFrame_.alreadyPrefixed = true;  // codecPrivate already prepended
-                pendingFrame_.hasBasePidData = !tempPair.baseData.empty();
-                pendingFrame_.hasMvcPidData = !tempPair.dependentData.empty();
+                std::cout << "[MVCM2TSDemuxer] Single-PID/2D AVC - queued IDR replay while preserving next AU" << std::endl;
             }
         }
     }
@@ -347,14 +358,22 @@ bool MVCM2TSDemuxer::open(const std::string& filePath) {
 }
 
 void MVCM2TSDemuxer::close() {
+    abortRequested_.store(true, std::memory_order_relaxed);
     if (reader_) {
         reader_->close();
     }
     pesStates_.clear();
     mvcBuffer_.clear();
     h264Buffer_.clear();
+    replayFrames_.clear();
+    codecPrivate_.clear();
+    currentFrame_ = {};
+    pendingFrame_ = {};
+    pendingFrame_.hasData = false;
+    videoInfo_ = {};
     hasVideoInfo_ = false;
     hasCodecPrivate_ = false;
+    dualPidStartPos_ = 0;
 }
 
 bool MVCM2TSDemuxer::isOpen() const {
@@ -366,12 +385,18 @@ MVCM2TSDemuxer::VideoInfo MVCM2TSDemuxer::getVideoInfo() const {
 }
 
 std::vector<uint8_t> MVCM2TSDemuxer::getCodecPrivate() const {
-    return {};
+    return codecPrivate_;
 }
 
 bool MVCM2TSDemuxer::readNextFramePair(FramePair& framePair) {
     if (!isOpen()) {
         return false;
+    }
+
+    if (!replayFrames_.empty()) {
+        framePair = std::move(replayFrames_.front());
+        replayFrames_.pop_front();
+        return true;
     }
 
     // Reset current frame state
@@ -415,7 +440,14 @@ bool MVCM2TSDemuxer::readNextFramePair(FramePair& framePair) {
 
     // Read TS packets until we have a complete frame
     M2TSReader::TSPacket packet;
-    while (reader_->readPacket(packet)) {
+    // A malformed or misclassified dual-PID source must not make one call scan
+    // the entire disc while waiting for a second view. 64 MiB is comfortably
+    // above the observed SSIF interleave span while keeping shutdown bounded.
+    constexpr uint64_t MAX_PACKETS_PER_FRAME = (64ULL * 1024ULL * 1024ULL) / 188ULL;
+    uint64_t packetsRead = 0;
+    while (!abortRequested_.load(std::memory_order_relaxed) &&
+           packetsRead++ < MAX_PACKETS_PER_FRAME &&
+           reader_->readPacket(packet)) {
         // DEBUG: Log packet PIDs to diagnose filtering issues
         /*
         if (g_debugCount < 500) {
@@ -455,6 +487,13 @@ bool MVCM2TSDemuxer::readNextFramePair(FramePair& framePair) {
         }
     }
 
+    if (abortRequested_.load(std::memory_order_relaxed)) {
+        std::cerr << "[MVCM2TSDemuxer] Frame read aborted" << std::endl;
+    } else if (packetsRead >= MAX_PACKETS_PER_FRAME) {
+        std::cerr << "[MVCM2TSDemuxer] Frame assembly exceeded the 64 MiB safety window"
+                  << std::endl;
+    }
+
     // EOF reached
     return false;
 }
@@ -470,6 +509,9 @@ void MVCM2TSDemuxer::processVideoPacket(const M2TSReader::TSPacket& packet) {
             int64_t pts, dts;
             size_t headerLength;
             if (parsePESHeader(state.buffer, pts, dts, headerLength)) {
+                if (pts > 0 && streamStartPts90k_ < 0) {
+                    streamStartPts90k_ = pts;
+                }
                 // Extract NAL units from PES payload
                 std::vector<uint8_t> nalData(state.buffer.begin() + headerLength,
                                             state.buffer.end());
@@ -485,7 +527,7 @@ void MVCM2TSDemuxer::processVideoPacket(const M2TSReader::TSPacket& packet) {
 
                 // DEBUG: Log PID, PTS, and data sizes to diagnose dual-PID interleaving
                 g_debugCount++;
-                if (g_debugCount < 100) {  // Increased from 20 to 100 for better debugging
+                if (g_debugCount < 20) {
                     std::cout << "[MVCM2TSDemuxer] PES from PID 0x" << std::hex << packet.pid << std::dec
                               << ": PTS=" << pts << ", baseView=" << baseView.size() << "B"
                               << ", dependentView=" << dependentView.size() << "B" << std::endl;
@@ -530,8 +572,15 @@ void MVCM2TSDemuxer::processVideoPacket(const M2TSReader::TSPacket& packet) {
                         isNewFrame = true;
                     }
                 } else {
-                    // In single-PID mode, use AUD first
+                    // In single-PID mode, use AUD first. Plain 2D AVC has no
+                    // dependent NALs, so a PTS transition is also an authoritative
+                    // access-unit boundary (without it no-AUD streams mega-buffer).
                     if (hasAUD) {
+                        isNewFrame = true;
+                    }
+                    else if (!videoInfo_.hasMVC &&
+                             currentFrame_.pts != 0 &&
+                             pts != currentFrame_.pts) {
                         isNewFrame = true;
                     }
                     // CRITICAL FIX: If no AUD found but we have MVC data (NAL type 20),
@@ -795,17 +844,17 @@ void MVCM2TSDemuxer::separateNALUnits(const std::vector<uint8_t>& nalData,
             }
 
             // Find next start code
-            size_t nextStart = i + 1;
-            while (nextStart + 2 < nalData.size()) {
-                if (nalData[nextStart] == 0x00 &&
-                    nalData[nextStart + 1] == 0x00 &&
-                    (nalData[nextStart + 2] == 0x01 ||
-                     (nextStart + 3 < nalData.size() &&
-                      nalData[nextStart + 2] == 0x00 &&
-                      nalData[nextStart + 3] == 0x01))) {
+            size_t nextStart = nalData.size();
+            for (size_t scan = i + 1; scan + 2 < nalData.size(); ++scan) {
+                if (nalData[scan] == 0x00 &&
+                    nalData[scan + 1] == 0x00 &&
+                    (nalData[scan + 2] == 0x01 ||
+                     (scan + 3 < nalData.size() &&
+                      nalData[scan + 2] == 0x00 &&
+                      nalData[scan + 3] == 0x01))) {
+                    nextStart = scan;
                     break;
                 }
-                nextStart++;
             }
 
             // Extract NAL unit (with start code)
@@ -864,17 +913,17 @@ void MVCM2TSDemuxer::extractCodecPrivate(const std::vector<uint8_t>& nalData) {
                     uint8_t nalType = nalData[i] & 0x1F;
 
                     // Find next start code
-                    size_t nextStart = i + 1;
-                    while (nextStart + 2 < nalData.size()) {
-                        if (nalData[nextStart] == 0x00 &&
-                            nalData[nextStart + 1] == 0x00 &&
-                            (nalData[nextStart + 2] == 0x01 ||
-                             (nextStart + 3 < nalData.size() &&
-                              nalData[nextStart + 2] == 0x00 &&
-                              nalData[nextStart + 3] == 0x01))) {
+                    size_t nextStart = nalData.size();
+                    for (size_t scan = i + 1; scan + 2 < nalData.size(); ++scan) {
+                        if (nalData[scan] == 0x00 &&
+                            nalData[scan + 1] == 0x00 &&
+                            (nalData[scan + 2] == 0x01 ||
+                             (scan + 3 < nalData.size() &&
+                              nalData[scan + 2] == 0x00 &&
+                              nalData[scan + 3] == 0x01))) {
+                            nextStart = scan;
                             break;
                         }
-                        nextStart++;
                     }
 
                     // Accumulate SPS/PPS/Subset SPS
@@ -904,10 +953,222 @@ bool MVCM2TSDemuxer::isFrameComplete() const {
 }
 
 bool MVCM2TSDemuxer::seek(int64_t timestampMs) {
-    // Simplified seek - just reset to start
-    // Proper implementation would use PCR/PTS for seeking
-    (void)timestampMs;  // Unused parameter - reserved for future implementation
-    return reader_->seek(0);
+    if (!isOpen()) return false;
+    if (timestampMs < 0) timestampMs = 0;
+    abortRequested_.store(false, std::memory_order_relaxed);
+
+    auto clearReadState = [&]() {
+        pesStates_.clear();
+        mvcBuffer_.clear();
+        h264Buffer_.clear();
+        replayFrames_.clear();
+        currentFrame_ = {};
+        pendingFrame_ = {};
+        pendingFrame_.hasData = false;
+    };
+
+    if (timestampMs == 0) {
+        clearReadState();
+        lastSeekTimestampMs_ = 0;
+        return reader_->seek(0);
+    }
+    if (externalDurationMs_ <= 0 || streamStartPts90k_ < 0) {
+        std::cerr << "[M2TS-SEEK] Refusing non-zero seek without duration/PTS "
+                     "(would incorrectly restart at byte 0)" << std::endl;
+        return false;
+    }
+
+    const uint64_t fileSize = reader_->getFileSize();
+    int packetSize = reader_->getPacketSize();
+    if (fileSize == 0 || packetSize <= 0) return false;
+    const uint64_t ps = static_cast<uint64_t>(packetSize);
+    const int64_t targetPts90k =
+        streamStartPts90k_ + timestampMs * 90;
+
+    // A small interpolation search is much cheaper than scanning from the
+    // beginning and remains accurate when the title bitrate changes heavily
+    // between chapters. Each probe reads only until the next base-view PES
+    // header, so even optical media only performs short bounded reads.
+    auto ptsAt = [&](uint64_t bytePosition) -> int64_t {
+        if (!reader_->seek((bytePosition / ps) * ps)) return -1;
+        M2TSReader::TSPacket packet;
+        constexpr int kMaxPackets = 32768;  // ~6 MiB, beyond normal PID gaps
+        for (int i = 0; i < kMaxPackets && reader_->readPacket(packet); ++i) {
+            if ((i & 511) == 0 &&
+                abortRequested_.load(std::memory_order_relaxed)) {
+                return -1;
+            }
+            if (packet.pid != videoInfo_.baseVideoPid ||
+                !packet.payloadUnitStartIndicator ||
+                packet.payload.size() < 14) {
+                continue;
+            }
+            int64_t pts = 0, dts = 0;
+            size_t headerLength = 0;
+            if (parsePESHeader(packet.payload, pts, dts, headerLength) &&
+                pts > 0) {
+                return pts;
+            }
+        }
+        return -1;
+    };
+
+    uint64_t loByte = 0;
+    uint64_t hiByte = (fileSize / ps) * ps;
+    int64_t loPts = streamStartPts90k_;
+    int64_t hiPts = streamStartPts90k_ + externalDurationMs_ * 90;
+    uint64_t bestBefore = 0;
+    constexpr uint64_t kCoarseWindow = 16ULL * 1024ULL * 1024ULL;
+
+    constexpr int kMaxInterpolationProbes = 10;
+    constexpr int64_t kProbeTolerance90k = 2 * 90000;  // two seconds
+    for (int probe = 0;
+         probe < kMaxInterpolationProbes &&
+         loByte + kCoarseWindow < hiByte;
+         ++probe) {
+        if (abortRequested_.load(std::memory_order_relaxed)) return false;
+        double fraction = (hiPts > loPts)
+            ? static_cast<double>(targetPts90k - loPts) /
+              static_cast<double>(hiPts - loPts)
+            : 0.5;
+        fraction = std::clamp(fraction, 0.0, 1.0);
+        uint64_t byte = loByte +
+            static_cast<uint64_t>(fraction * (hiByte - loByte));
+        byte = (byte / ps) * ps;
+        if (byte <= loByte) byte = loByte + ps;
+        if (byte >= hiByte) byte = hiByte - ps;
+
+        const int64_t pts = ptsAt(byte);
+        if (pts < 0) {
+            hiByte = byte;
+            continue;
+        }
+        if (pts <= targetPts90k) {
+            bestBefore = byte;
+            loByte = byte;
+            loPts = pts;
+            if (targetPts90k - pts <= kProbeTolerance90k) break;
+        } else {
+            hiByte = byte;
+            hiPts = pts;
+        }
+    }
+
+    // If every probe landed after the target, start slightly before the best
+    // upper bracket rather than ever falling back to byte zero.
+    uint64_t startByte = bestBefore;
+    if (startByte == 0 && hiByte > kCoarseWindow) {
+        startByte = hiByte - kCoarseWindow;
+    }
+    startByte = (startByte / ps) * ps;
+
+    // Fast path for ordinary short GOPs: if a clean IDR is effectively at the
+    // requested position, avoid the historical scan altogether.
+    if (!reader_->seek(startByte)) return false;
+    clearReadState();
+    constexpr int kFastPathFrames = 120;
+    const int64_t fastAcceptFromMs = std::max<int64_t>(0, timestampMs - 750);
+    for (int i = 0;
+         i < kFastPathFrames &&
+         !abortRequested_.load(std::memory_order_relaxed);
+         ++i) {
+        FramePair pair;
+        if (!readNextFramePair(pair)) break;
+        const int64_t normalizedMs =
+            std::max<int64_t>(0, pair.timestamp - streamStartPts90k_ / 90);
+        if (pair.isKeyframe &&
+            normalizedMs >= fastAcceptFromMs &&
+            normalizedMs <= timestampMs + 1000) {
+            lastSeekTimestampMs_ = normalizedMs;
+            replayFrames_.push_back(std::move(pair));
+            std::cout << "[M2TS-SEEK] " << timestampMs
+                      << "ms -> byte " << startByte
+                      << ", nearby IDR " << lastSeekTimestampMs_ << "ms"
+                      << std::endl;
+            return true;
+        }
+        if (normalizedMs > timestampMs + 1500) break;
+    }
+
+    // Blu-ray AVC can legally use very long GOPs. Starting exactly at the
+    // requested PTS may therefore find the *next* IDR tens of seconds later.
+    // First scan a bounded history window to identify the closest preceding
+    // IDR, then perform a short second pass to replay it without retaining an
+    // entire GOP (which can otherwise consume hundreds of MiB).
+    const double averageBytesPerMs =
+        static_cast<double>(fileSize) /
+        static_cast<double>(externalDurationMs_);
+    const uint64_t historyBytes = std::clamp<uint64_t>(
+        static_cast<uint64_t>(averageBytesPerMs * 75000.0),
+        64ULL * 1024ULL * 1024ULL,
+        1024ULL * 1024ULL * 1024ULL);
+    const uint64_t historyStart =
+        startByte > historyBytes ? startByte - historyBytes : 0;
+    if (!reader_->seek((historyStart / ps) * ps)) return false;
+    clearReadState();
+
+    int64_t candidateIdrMs = -1;
+    uint64_t candidateReadPos = 0;
+    const int scanLimit = std::clamp(
+        static_cast<int>(std::max(24.0, videoInfo_.fps) * 100.0),
+        2400, 12000);
+    for (int i = 0;
+         i < scanLimit &&
+         !abortRequested_.load(std::memory_order_relaxed);
+         ++i) {
+        const uint64_t beforeRead = reader_->tell();
+        FramePair pair;
+        if (!readNextFramePair(pair)) break;
+        const int64_t normalizedMs =
+            std::max<int64_t>(0, pair.timestamp - streamStartPts90k_ / 90);
+        if (pair.isKeyframe && normalizedMs <= timestampMs) {
+            candidateIdrMs = normalizedMs;
+            candidateReadPos = beforeRead;
+        }
+        if (normalizedMs >= timestampMs && candidateIdrMs >= 0) break;
+    }
+
+    if (candidateIdrMs >= 0) {
+        // readNextFramePair pre-reads the first PES of the next AU. Rewind a
+        // small safety margin before the recorded logical position, resync,
+        // and select the same IDR again while preserving pendingFrame_.
+        constexpr uint64_t kIdrResyncBackoff = 16ULL * 1024ULL * 1024ULL;
+        uint64_t replayStart = candidateReadPos > kIdrResyncBackoff
+            ? candidateReadPos - kIdrResyncBackoff
+            : 0;
+        replayStart = (replayStart / ps) * ps;
+        if (!reader_->seek(replayStart)) return false;
+        clearReadState();
+
+        constexpr int kMaxResyncFrames = 1000;
+        const int64_t acceptFromMs =
+            std::max<int64_t>(0, candidateIdrMs - 250);
+        for (int i = 0;
+             i < kMaxResyncFrames &&
+             !abortRequested_.load(std::memory_order_relaxed);
+             ++i) {
+            FramePair pair;
+            if (!readNextFramePair(pair)) break;
+            const int64_t normalizedMs =
+                std::max<int64_t>(0, pair.timestamp -
+                                     streamStartPts90k_ / 90);
+            if (pair.isKeyframe && normalizedMs >= acceptFromMs) {
+                lastSeekTimestampMs_ = normalizedMs;
+                replayFrames_.push_back(std::move(pair));
+                std::cout << "[M2TS-SEEK] " << timestampMs
+                          << "ms -> byte " << replayStart
+                          << ", preceding IDR " << lastSeekTimestampMs_
+                          << "ms (preroll "
+                          << (timestampMs - lastSeekTimestampMs_) << "ms)"
+                          << std::endl;
+                return true;
+            }
+        }
+    }
+
+    std::cerr << "[M2TS-SEEK] No nearby IDR found for "
+              << timestampMs << "ms" << std::endl;
+    return false;
 }
 
 void MVCM2TSDemuxer::parseSPSForDimensions() {

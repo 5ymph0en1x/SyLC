@@ -608,8 +608,9 @@ bool MVCSSIFDemuxer::readNextFramePairStreaming(FramePair& framePair) {
     auto _t0 = std::chrono::steady_clock::now();
     long _r0 = ssifReader_ ? ssifReader_->getResyncCount() : 0;
     auto _logslow = [&](const char* where) {
-        double ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - _t0).count();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - _t0);
+        const double ms = static_cast<double>(elapsed.count());
         if (ms > 2000.0)
             fprintf(stderr, "[SSIF-SLOW] %s packets=%d resyncs=%ld elapsed=%.1fs baseBuf=%zu depBuf=%zu\n",
                     where, packetsRead,
@@ -666,7 +667,18 @@ bool MVCSSIFDemuxer::readNextFramePairStreaming(FramePair& framePair) {
             int64_t dmin = dependentFrameBuffer_.front().pts;
             for (const auto& dd : dependentFrameBuffer_) dmin = std::min(dmin, dd.pts);
             if (bf < dmin - PTS_MATCH_TOLERANCE) {
+                // Orphaned base front (its dependent partner is gone — typical right
+                // after a seek resync). With the strict pairing window this drop is
+                // what re-locks base/dep alignment EXACTLY instead of letting the
+                // nearest-match pair the neighbor and lock a one-frame shift in
+                // (the right-eye macroblock bug). Log it: a burst here is normal
+                // after a seek; a steady stream would mean a mux/reader problem.
                 baseFrameBuffer_.erase(baseFrameBuffer_.begin());
+                orphanBaseDrops_++;
+                if (orphanBaseDrops_ <= 10 || orphanBaseDrops_ % 100 == 0)
+                    fprintf(stderr, "[SSIF-PAIR] dropped orphaned base front pts=%.3fs "
+                            "(dep starts %.3fs later; drop #%ld)\n",
+                            bf / 90000.0, (dmin - bf) / 90000.0, orphanBaseDrops_);
             }
         }
     }
@@ -1010,17 +1022,17 @@ void MVCSSIFDemuxer::separateNALUnits(const std::vector<uint8_t>& nalData, int64
                     uint8_t nalType = nalData[i] & 0x1F;
 
                     // Find next start code
-                    size_t nextStart = i + 1;
-                    while (nextStart + 2 < nalData.size()) {
-                        if (nalData[nextStart] == 0x00 &&
-                            nalData[nextStart + 1] == 0x00 &&
-                            (nalData[nextStart + 2] == 0x01 ||
-                             (nextStart + 3 < nalData.size() &&
-                              nalData[nextStart + 2] == 0x00 &&
-                              nalData[nextStart + 3] == 0x01))) {
+                    size_t nextStart = nalData.size();
+                    for (size_t scan = i + 1; scan + 2 < nalData.size(); ++scan) {
+                        if (nalData[scan] == 0x00 &&
+                            nalData[scan + 1] == 0x00 &&
+                            (nalData[scan + 2] == 0x01 ||
+                             (scan + 3 < nalData.size() &&
+                              nalData[scan + 2] == 0x00 &&
+                              nalData[scan + 3] == 0x01))) {
+                            nextStart = scan;
                             break;
                         }
-                        nextStart++;
                     }
 
                     // Copy NAL unit
@@ -1225,17 +1237,17 @@ void MVCSSIFDemuxer::extractCodecPrivate(const std::vector<uint8_t>& nalData) {
                     uint8_t nalType = nalData[i] & 0x1F;
 
                     // Find next start code
-                    size_t nextStart = i + 1;
-                    while (nextStart + 2 < nalData.size()) {
-                        if (nalData[nextStart] == 0x00 &&
-                            nalData[nextStart + 1] == 0x00 &&
-                            (nalData[nextStart + 2] == 0x01 ||
-                             (nextStart + 3 < nalData.size() &&
-                              nalData[nextStart + 2] == 0x00 &&
-                              nalData[nextStart + 3] == 0x01))) {
+                    size_t nextStart = nalData.size();
+                    for (size_t scan = i + 1; scan + 2 < nalData.size(); ++scan) {
+                        if (nalData[scan] == 0x00 &&
+                            nalData[scan + 1] == 0x00 &&
+                            (nalData[scan + 2] == 0x01 ||
+                             (scan + 3 < nalData.size() &&
+                              nalData[scan + 2] == 0x00 &&
+                              nalData[scan + 3] == 0x01))) {
+                            nextStart = scan;
                             break;
                         }
-                        nextStart++;
                     }
 
                     // Extract SPS (type 7) - only if not already found
@@ -1600,6 +1612,48 @@ void MVCSSIFDemuxer::collectSubtitlePacket(const M2TSReader::TSPacket& packet) {
     if (state.hasStarted && !packet.payload.empty()) {
         state.buffer.insert(state.buffer.end(), packet.payload.begin(), packet.payload.end());
     }
+}
+
+// ---- Cast-audio stream tap (see header) -----------------------------------
+bool MVCSSIFDemuxer::enableStreamTap(size_t capacityBytes) {
+    // The audio travels in the stream the ACTIVE reader consumes: the
+    // interleaved .ssif in streaming mode, else the base .m2ts in dual-file
+    // mode (the dependent view carries no audio). The readers are pre-created
+    // by the constructor, so "exists" is meaningless — gate on actually OPEN.
+    M2TSReader* carrier = nullptr;
+    if (ssifReader_ && ssifReader_->isOpen())      carrier = ssifReader_.get();
+    else if (baseReader_ && baseReader_->isOpen()) carrier = baseReader_.get();
+    if (!carrier || capacityBytes == 0) return false;
+    if (!streamTap_) streamTap_ = std::make_shared<StreamTapBuffer>();
+    {
+        std::lock_guard<std::mutex> lk(streamTap_->m);
+        streamTap_->capacity = capacityBytes;
+    }
+    carrier->setStreamTap(streamTap_);
+    return true;
+}
+
+void MVCSSIFDemuxer::disableStreamTap() {
+    if (ssifReader_) ssifReader_->setStreamTap(nullptr);
+    if (baseReader_) baseReader_->setStreamTap(nullptr);
+    if (streamTap_) {
+        {
+            std::lock_guard<std::mutex> lk(streamTap_->m);
+            streamTap_->capacity = 0;
+        }
+        streamTap_->clear();
+    }
+}
+
+std::vector<uint8_t> MVCSSIFDemuxer::readStreamTap(size_t maxBytes) {
+    if (!streamTap_ || maxBytes == 0) return {};
+    return streamTap_->pop(maxBytes);
+}
+
+uint64_t MVCSSIFDemuxer::streamTapDropped() const {
+    if (!streamTap_) return 0;
+    std::lock_guard<std::mutex> lk(streamTap_->m);
+    return streamTap_->dropped;
 }
 
 } // namespace mvc_demux
