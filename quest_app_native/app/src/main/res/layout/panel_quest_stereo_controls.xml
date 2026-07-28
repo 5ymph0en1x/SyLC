@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/bg_panel_simple"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:paddingStart="20dp"
+    android:paddingTop="12dp"
+    android:paddingEnd="12dp"
+    android:paddingBottom="12dp">
+
+    <View
+        android:id="@+id/questStereoStatusDot"
+        android:layout_width="10dp"
+        android:layout_height="10dp"
+        android:background="@drawable/status_dot_off" />
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="12dp"
+        android:layout_weight="1"
+        android:orientation="vertical">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:fontFamily="sans-serif-medium"
+            android:letterSpacing="0.08"
+            android:text="@string/quest_stereo_title"
+            android:textColor="@color/sylc_grey"
+            android:textSize="11sp" />
+
+        <TextView
+            android:id="@+id/questStereoStatus"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="3dp"
+            android:fontFamily="sans-serif-medium"
+            android:text="@string/quest_stereo_connecting"
+            android:textColor="@color/sylc_white"
+            android:textSize="14sp" />
+    </LinearLayout>
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/questStereoCloseButton"
+        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+        android:layout_width="wrap_content"
+        android:layout_height="48dp"
+        android:contentDescription="@string/quest_stereo_close_description"
+        android:fontFamily="sans-serif-medium"
+        android:text="@string/quest_stereo_close"
+        android:textAllCaps="false"
+        android:textColor="@color/sylc_white"
+        app:backgroundTint="@color/sylc_button_surface"
+        app:cornerRadius="12dp"
+        app:rippleColor="@color/sylc_ripple_dark"
+        app:strokeColor="@color/sylc_button_stroke"
+        app:strokeWidth="1dp" />
+</LinearLayout>

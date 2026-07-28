@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="sylc_bg">#090D14</color>
+    <color name="sylc_video_bg">#000000</color>
+    <color name="sylc_accent">#45D7F1</color>
+    <color name="sylc_accent_dark">#079DBB</color>
+    <color name="sylc_accent_muted">#263547</color>
+    <color name="sylc_panel_bg">#F2111722</color>
+    <color name="sylc_white">#FFFFFF</color>
+    <color name="sylc_white_muted">#D7DEE8</color>
+    <color name="sylc_grey">#99A6B7</color>
+    <color name="sylc_ink">#061015</color>
+    <color name="sylc_button_surface">#182231</color>
+    <color name="sylc_button_stroke">#3B485A</color>
+    <color name="sylc_badge_stroke">#496276</color>
+    <color name="sylc_divider">#253243</color>
+    <color name="sylc_ripple_light">#33040A0D</color>
+    <color name="sylc_ripple_dark">#33FFFFFF</color>
+    <color name="sylc_launcher_bg">#090D14</color>
+</resources>

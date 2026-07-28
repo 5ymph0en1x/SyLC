@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 8-11 equivalent of data_extraction_rules.xml, which the platform only
+  honours from Android 12. Lowering minSdk to 26 for phone support brought those
+  versions into scope, and without this file they would fall back to the default
+  "back up everything" behaviour instead of the deliberate opt-out the newer
+  rules express. Same decision, stated in the older schema: nothing here (a PC
+  address and panel geometry) belongs in a cloud backup.
+-->
+<full-backup-content>
+    <exclude domain="root" path="." />
+</full-backup-content>

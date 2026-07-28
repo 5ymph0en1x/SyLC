@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SyLC Cast</string>
+    <string name="video_surface_description">SyLC video stream</string>
+
+    <string name="status_disconnected">Ready to receive</string>
+    <string name="status_connecting">Connecting</string>
+    <string name="status_waiting_video">Receiver connected</string>
+    <string name="status_decoding">Initializing video</string>
+    <string name="status_connected">Streaming active</string>
+    <string name="status_no_video">No video stream</string>
+    <string name="status_decoder_error">Decoder error</string>
+    <string name="status_connection_lost">Connection lost</string>
+    <string name="status_hint_ready">Connect SyLC to the headset to begin</string>
+    <string name="status_hint_connecting">Looking for the stream over USB-C</string>
+    <string name="status_hint_waiting_video">Connected to the PC, waiting for the first frame</string>
+    <string name="status_hint_decoding">First frame received, starting the HEVC decoder</string>
+    <string name="status_hint_connected">Secure USB-C link</string>
+    <string name="status_hint_no_video">The PC is connected but is not sending video</string>
+    <string name="status_hint_decode_timeout">Frames are arriving, but the HEVC decoder is not rendering them</string>
+    <string name="status_hint_connection_lost">The PC closed the streaming connection</string>
+    <string name="stats_empty">0.0 Mbps  •  0 fps</string>
+    <string name="stats_format">%1$.1f Mbps  •  %2$.0f fps</string>
+    <string name="telemetry_label">Real-time telemetry</string>
+
+    <string name="sender_address_label">PC</string>
+    <string name="sender_address_hint">127.0.0.1 (USB-C) or the PC address</string>
+    <string name="action_discover">Find PC</string>
+    <string name="discovery_searching">Looking for the PC on this network…</string>
+    <string name="discovery_found">PC found at %1$s</string>
+    <string name="discovery_none">No PC answered on Wi-Fi. Start casting on the PC, or type its address.</string>
+    <string name="discovery_usb">Connected over USB-C: 127.0.0.1 is already the right address, no search needed.</string>
+    <string name="action_connect">Connect</string>
+    <string name="action_stop">Stop</string>
+    <string name="action_fullscreen">Full screen</string>
+    <string name="action_exit_fullscreen">Exit full screen</string>
+    <string name="action_connect_description">Connect to the SyLC stream</string>
+    <string name="action_stop_description">Stop streaming</string>
+    <string name="action_fullscreen_description">Show video in full screen</string>
+    <string name="action_exit_fullscreen_description">Return to the controls</string>
+    <string name="fullscreen_enabled_announcement">Video shown in full screen</string>
+    <string name="fullscreen_disabled_announcement">Video controls shown</string>
+    <string name="quest_stereo_title">STEREOSCOPIC 3D • QUEST 3</string>
+    <string name="quest_stereo_connecting">Connecting to the SBS stream…</string>
+    <string name="quest_stereo_waiting">Connected — waiting for the first frame</string>
+    <string name="quest_stereo_active">Stereo active — one image per eye</string>
+    <string name="quest_stereo_error">Stream interrupted</string>
+    <string name="quest_stereo_close">Exit 3D</string>
+    <string name="quest_stereo_close_description">Close immersive 3D mode and return to the controls</string>
+    <string name="already_connected">Streaming is already active</string>
+    <string name="decoder_not_ready">The video surface is not ready yet</string>
+
+    <string name="mode_mono">Mono</string>
+    <string name="mode_2d">2D</string>
+    <string name="mode_3d">3D</string>
+    <string name="mode_mono_description">Mono mode, full-frame left eye</string>
+    <string name="mode_2d_description">Panoramic 2D mode</string>
+    <string name="mode_3d_description">Side-by-side stereoscopic 3D mode</string>
+    <string name="mode_badge_mono">Mono • Left eye</string>
+    <string name="mode_badge_2d">Preview • 2D</string>
+    <string name="mode_badge_3d">Stereo • SBS</string>
+</resources>

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.SyLC" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/sylc_accent</item>
+        <item name="colorPrimaryVariant">@color/sylc_accent_dark</item>
+        <item name="colorOnPrimary">@color/sylc_ink</item>
+        <item name="colorSecondary">@color/sylc_accent</item>
+        <item name="colorSecondaryVariant">@color/sylc_accent_dark</item>
+        <item name="colorOnSecondary">@color/sylc_ink</item>
+        <item name="android:statusBarColor">@color/sylc_bg</item>
+        <item name="android:navigationBarColor">@color/sylc_bg</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowBackground">@color/sylc_bg</item>
+        <item name="android:colorAccent">@color/sylc_accent</item>
+    </style>
+
+    <style name="Theme.SyLC.Immersive" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowBackground">@color/sylc_video_bg</item>
+        <item name="android:colorAccent">@color/sylc_accent</item>
+    </style>
+
+    <style name="Theme.SyLC.SpatialPanel" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:colorAccent">@color/sylc_accent</item>
+    </style>
+</resources>

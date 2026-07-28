@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<lint>
+    <!--
+      API 37 and AndroidX Core 1.19 are not present in the stable Android SDK
+      channel yet. The project intentionally stays on the latest compatible
+      stable pair: Android 36.1 and AndroidX Core 1.18.
+    -->
+    <issue id="GradleDependency">
+        <ignore path="build.gradle.kts" />
+    </issue>
+    <issue id="OldTargetApi">
+        <ignore path="build.gradle.kts" />
+    </issue>
+</lint>

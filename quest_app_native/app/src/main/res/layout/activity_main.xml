@@ -1,0 +1,478 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  NARROW-SCREEN layout: a phone held in portrait (~411dp wide).
+
+  The wide layout in res/layout-w600dp/ is the original one and is what the
+  Quest, tablets and phones in landscape still get, byte for byte. It packs the
+  transport buttons and the Mono/2D/3D group onto ONE row, which needs about
+  608dp; a portrait phone offers roughly 335dp inside the panel, so that row ran
+  off the screen and took the entire mode selector with it — on a phone there
+  was simply no way to leave 3D. Hence a second layout rather than a compromise
+  that would have degraded the headset.
+
+  Same view IDs, same types, same order of controls — ViewBinding generates one
+  ActivityMainBinding for both, so every id here must keep existing or the
+  generated fields turn nullable and MainActivity stops compiling.
+
+  What changes for a narrow screen:
+    * the mode selector gets its own full-width row under the buttons;
+    * Connect/Stop share the width by weight instead of fixed minimums, so
+      they stay whole down to very small screens;
+    * the video sits ABOVE the panel instead of behind it (on a phone the
+      panel would otherwise cover most of the picture).
+-->
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:clipToPadding="false"
+    tools:context=".MainActivity">
+
+    <FrameLayout
+        android:id="@+id/videoContainer"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:background="@color/sylc_video_bg"
+        android:clipChildren="true"
+        android:clipToPadding="true"
+        app:layout_constraintBottom_toTopOf="@id/controlPanel"
+        app:layout_constraintDimensionRatio="32:9"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent">
+
+        <SurfaceView
+            android:id="@+id/videoSurface"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:contentDescription="@string/video_surface_description" />
+
+        <TextView
+            android:id="@+id/modeBadge"
+            android:layout_width="wrap_content"
+            android:layout_height="32dp"
+            android:layout_gravity="top|start"
+            android:layout_margin="12dp"
+            android:background="@drawable/bg_video_badge"
+            android:fontFamily="sans-serif-medium"
+            android:gravity="center"
+            android:letterSpacing="0.08"
+            android:minWidth="110dp"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"
+            android:text="@string/mode_badge_3d"
+            android:textAllCaps="true"
+            android:textColor="@color/sylc_white"
+            android:textSize="10sp" />
+
+    </FrameLayout>
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/exitFullscreenButton"
+        style="@style/Widget.MaterialComponents.Button"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_marginTop="12dp"
+        android:layout_marginEnd="12dp"
+        android:contentDescription="@string/action_exit_fullscreen_description"
+        android:elevation="24dp"
+        android:insetTop="0dp"
+        android:insetBottom="0dp"
+        android:minWidth="0dp"
+        android:padding="12dp"
+        android:tooltipText="@string/action_exit_fullscreen"
+        android:visibility="invisible"
+        app:backgroundTint="@color/sylc_panel_bg"
+        app:cornerRadius="14dp"
+        app:icon="@drawable/ic_fullscreen_exit"
+        app:iconGravity="textStart"
+        app:iconPadding="0dp"
+        app:iconSize="24dp"
+        app:iconTint="@color/sylc_white"
+        app:layout_constraintEnd_toEndOf="@id/videoContainer"
+        app:layout_constraintTop_toTopOf="@id/videoContainer"
+        app:rippleColor="@color/sylc_ripple_dark" />
+
+    <androidx.constraintlayout.widget.ConstraintLayout
+        android:id="@+id/controlPanel"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="12dp"
+        android:layout_marginEnd="12dp"
+        android:layout_marginBottom="16dp"
+        android:background="@drawable/bg_panel_simple"
+        android:elevation="18dp"
+        android:paddingStart="14dp"
+        android:paddingTop="14dp"
+        android:paddingEnd="14dp"
+        android:paddingBottom="14dp"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent">
+
+        <View
+            android:id="@+id/accentLine"
+            android:layout_width="0dp"
+            android:layout_height="3dp"
+            android:background="@drawable/gradient_progress"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="parent" />
+
+        <LinearLayout
+            android:id="@+id/statusGroup"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            app:layout_constraintEnd_toStartOf="@id/statsGroup"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/accentLine">
+
+            <View
+                android:id="@+id/statusDot"
+                android:layout_width="10dp"
+                android:layout_height="10dp"
+                android:background="@drawable/status_dot_off" />
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="10dp"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:id="@+id/statusText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:ellipsize="end"
+                    android:fontFamily="sans-serif-medium"
+                    android:maxLines="1"
+                    android:text="@string/status_disconnected"
+                    android:textColor="@color/sylc_white"
+                    android:textSize="14sp" />
+
+                <TextView
+                    android:id="@+id/connectionHintText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:ellipsize="end"
+                    android:maxLines="2"
+                    android:text="@string/status_hint_ready"
+                    android:textColor="@color/sylc_grey"
+                    android:textSize="11sp" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/statsGroup"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:gravity="end"
+            android:orientation="vertical"
+            app:layout_constraintBottom_toBottomOf="@id/statusGroup"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintTop_toTopOf="@id/statusGroup">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:fontFamily="sans-serif-medium"
+                android:letterSpacing="0.06"
+                android:text="@string/telemetry_label"
+                android:textAllCaps="true"
+                android:textColor="@color/sylc_grey"
+                android:textSize="9sp" />
+
+            <TextView
+                android:id="@+id/statsText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="3dp"
+                android:fontFamily="monospace"
+                android:text="@string/stats_empty"
+                android:textColor="@color/sylc_white"
+                android:textSize="11sp" />
+        </LinearLayout>
+
+        <View
+            android:id="@+id/divider"
+            android:layout_width="0dp"
+            android:layout_height="1dp"
+            android:layout_marginTop="12dp"
+            android:background="@color/sylc_divider"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/statusGroup" />
+
+        <LinearLayout
+            android:id="@+id/senderRow"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:baselineAligned="false"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/divider">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="8dp"
+                android:fontFamily="sans-serif-medium"
+                android:text="@string/sender_address_label"
+                android:textColor="@color/sylc_grey"
+                android:textSize="12sp" />
+
+            <EditText
+                android:id="@+id/senderHostInput"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:autofillHints="none"
+                android:background="@color/sylc_button_surface"
+                android:hint="@string/sender_address_hint"
+                android:imeOptions="actionDone"
+                android:inputType="text"
+                android:maxLines="1"
+                android:paddingStart="10dp"
+                android:paddingEnd="10dp"
+                android:textColor="@color/sylc_white"
+                android:textColorHint="@color/sylc_grey"
+                android:textSize="14sp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/discoverButton"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="wrap_content"
+                android:layout_height="48dp"
+                android:layout_marginStart="8dp"
+                android:fontFamily="sans-serif-medium"
+                android:minWidth="0dp"
+                android:paddingStart="14dp"
+                android:paddingEnd="14dp"
+                android:text="@string/action_discover"
+                android:textAllCaps="false"
+                android:textColor="@color/sylc_white"
+                android:textSize="13sp"
+                app:backgroundTint="@color/sylc_button_surface"
+                app:cornerRadius="12dp"
+                app:rippleColor="@color/sylc_ripple_dark"
+                app:strokeColor="@color/sylc_button_stroke"
+                app:strokeWidth="1dp" />
+
+        </LinearLayout>
+
+        <!-- Weighted, not fixed-width: these three have to stay whole and
+             tappable on a 320dp screen as well as a 411dp one. -->
+        <LinearLayout
+            android:id="@+id/actionsRow"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:baselineAligned="false"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/senderRow">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/playButton"
+                style="@style/Widget.MaterialComponents.Button"
+                android:layout_width="0dp"
+                android:layout_height="52dp"
+                android:layout_weight="1"
+                android:contentDescription="@string/action_connect_description"
+                android:fontFamily="sans-serif-medium"
+                android:minWidth="0dp"
+                android:paddingStart="6dp"
+                android:paddingEnd="6dp"
+                android:text="@string/action_connect"
+                android:textAllCaps="false"
+                android:textColor="@color/sylc_ink"
+                android:textSize="14sp"
+                app:backgroundTint="@color/sylc_accent"
+                app:cornerRadius="14dp"
+                app:icon="@drawable/ic_play"
+                app:iconGravity="textStart"
+                app:iconPadding="7dp"
+                app:iconTint="@color/sylc_ink"
+                app:rippleColor="@color/sylc_ripple_light" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/stopButton"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="0dp"
+                android:layout_height="52dp"
+                android:layout_marginStart="8dp"
+                android:layout_weight="1"
+                android:contentDescription="@string/action_stop_description"
+                android:fontFamily="sans-serif-medium"
+                android:minWidth="0dp"
+                android:paddingStart="6dp"
+                android:paddingEnd="6dp"
+                android:text="@string/action_stop"
+                android:textAllCaps="false"
+                android:textColor="@color/sylc_white"
+                android:textSize="14sp"
+                app:backgroundTint="@color/sylc_button_surface"
+                app:cornerRadius="14dp"
+                app:icon="@drawable/ic_stop"
+                app:iconGravity="textStart"
+                app:iconPadding="7dp"
+                app:iconTint="@color/sylc_white"
+                app:rippleColor="@color/sylc_ripple_dark"
+                app:strokeColor="@color/sylc_button_stroke"
+                app:strokeWidth="1dp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/fullscreenButton"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="52dp"
+                android:layout_height="52dp"
+                android:layout_marginStart="8dp"
+                android:contentDescription="@string/action_fullscreen_description"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:minWidth="0dp"
+                android:padding="14dp"
+                android:tooltipText="@string/action_fullscreen"
+                app:backgroundTint="@color/sylc_button_surface"
+                app:cornerRadius="14dp"
+                app:icon="@drawable/ic_fullscreen"
+                app:iconGravity="textStart"
+                app:iconPadding="0dp"
+                app:iconSize="22dp"
+                app:iconTint="@color/sylc_white"
+                app:rippleColor="@color/sylc_ripple_dark"
+                app:strokeColor="@color/sylc_button_stroke"
+                app:strokeWidth="1dp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/modeDescriptionText"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:ellipsize="end"
+            android:fontFamily="sans-serif-medium"
+            android:letterSpacing="0.06"
+            android:maxLines="1"
+            android:text="@string/mode_3d_description"
+            android:textAllCaps="true"
+            android:textColor="@color/sylc_grey"
+            android:textSize="10sp"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/actionsRow" />
+
+        <!-- Its own full-width row: this is the control that used to be pushed
+             off a phone screen entirely. Each button takes an equal share so
+             the group can never overflow again. -->
+        <com.google.android.material.button.MaterialButtonToggleGroup
+            android:id="@+id/modeToggleGroup"
+            android:layout_width="0dp"
+            android:layout_height="52dp"
+            android:layout_marginTop="6dp"
+            app:checkedButton="@id/btn3D"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/modeDescriptionText"
+            app:selectionRequired="true"
+            app:singleSelection="true">
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnMono"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="0dp"
+                android:layout_height="52dp"
+                android:layout_weight="1"
+                android:checkable="true"
+                android:contentDescription="@string/mode_mono_description"
+                android:fontFamily="sans-serif-medium"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:minWidth="0dp"
+                android:paddingStart="4dp"
+                android:paddingEnd="4dp"
+                android:text="@string/mode_mono"
+                android:textAllCaps="false"
+                android:textColor="@color/mode_button_content"
+                android:textSize="13sp"
+                app:backgroundTint="@color/mode_button_background"
+                app:icon="@drawable/ic_mono"
+                app:iconGravity="textStart"
+                app:iconPadding="6dp"
+                app:iconSize="18dp"
+                app:iconTint="@color/mode_button_content"
+                app:rippleColor="@color/sylc_ripple_dark"
+                app:strokeColor="@color/mode_button_stroke"
+                app:strokeWidth="1dp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn2D"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="0dp"
+                android:layout_height="52dp"
+                android:layout_weight="1"
+                android:checkable="true"
+                android:contentDescription="@string/mode_2d_description"
+                android:fontFamily="sans-serif-medium"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:minWidth="0dp"
+                android:paddingStart="4dp"
+                android:paddingEnd="4dp"
+                android:text="@string/mode_2d"
+                android:textAllCaps="false"
+                android:textColor="@color/mode_button_content"
+                android:textSize="13sp"
+                app:backgroundTint="@color/mode_button_background"
+                app:icon="@drawable/ic_2d"
+                app:iconGravity="textStart"
+                app:iconPadding="6dp"
+                app:iconSize="18dp"
+                app:iconTint="@color/mode_button_content"
+                app:rippleColor="@color/sylc_ripple_dark"
+                app:strokeColor="@color/mode_button_stroke"
+                app:strokeWidth="1dp" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btn3D"
+                style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                android:layout_width="0dp"
+                android:layout_height="52dp"
+                android:layout_weight="1"
+                android:checkable="true"
+                android:contentDescription="@string/mode_3d_description"
+                android:fontFamily="sans-serif-medium"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:minWidth="0dp"
+                android:paddingStart="4dp"
+                android:paddingEnd="4dp"
+                android:text="@string/mode_3d"
+                android:textAllCaps="false"
+                android:textColor="@color/mode_button_content"
+                android:textSize="13sp"
+                app:backgroundTint="@color/mode_button_background"
+                app:icon="@drawable/ic_3d"
+                app:iconGravity="textStart"
+                app:iconPadding="6dp"
+                app:iconSize="18dp"
+                app:iconTint="@color/mode_button_content"
+                app:rippleColor="@color/sylc_ripple_dark"
+                app:strokeColor="@color/mode_button_stroke"
+                app:strokeWidth="1dp" />
+        </com.google.android.material.button.MaterialButtonToggleGroup>
+    </androidx.constraintlayout.widget.ConstraintLayout>
+</androidx.constraintlayout.widget.ConstraintLayout>
