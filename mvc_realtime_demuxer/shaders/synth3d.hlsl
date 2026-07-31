@@ -1,0 +1,310 @@
+// synth3d.hlsl — depth prep, DIBR warp, depth view. Entry points:
+//   VS_Full / PS_DepthPrep / PS_WarpLuma / PS_WarpChroma
+//   PS_DepthViewLuma / PS_DepthViewChroma
+//
+// Source of truth for src/synth3d_shaders.h (kSynth3dHLSL) — re-run
+// native_renderer/gen_shader_header.py after ANY edit here, then rebuild.
+// Compiled at runtime by d3dcompiler, once per entry point (synth3d.cpp),
+// the same idiom as sbs_nv12_packer.cpp.
+Texture2D<float> SrcY : register(t0);
+Texture2D<float> SrcU : register(t1);
+Texture2D<float> SrcV : register(t2);
+Texture2D<float> Nearness : register(t3);   // R16_UNORM grid width x height, 1 = closest
+SamplerState linSmp : register(s0);
+
+cbuffer SynthCB : register(b0) {
+    float max_disp;      // c0.x  disparity budget, fraction of image WIDTH
+    float convergence;   // c0.y  nearness at zero parallax (0..1)
+    float plane_scale;   // c0.z  same semantics as the display shader
+    float inv_w;         // c0.w  1 / luma plane width
+    int   yuv_matrix_sel;// c1.x  0=BT.601, 1=BT.709, 2=BT.2020nc
+    int   transfer_sel;  // c1.y  0=SDR, 2=PQ tonemap (for DepthPrep only)
+    int   diagnostics;   // c1.z  depth/disocclusion overlay
+    float edge_strength; // c1.w  joint-bilateral luma sensitivity
+    float2 depth_texel;  // c2.xy 1 / depth-map dimensions
+    float2 _pad;         // c2.zw
+    float crop_top;      // c3.x  encoded top matte, normalized source height
+    float crop_bottom;   // c3.y  encoded bottom matte
+    float2 _pad2;        // c3.zw
+};
+
+struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+VSOut VS_Full(uint id : SV_VertexID) {
+    VSOut o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = uv;
+    return o;
+}
+
+// ---- edge-aware upsampling -------------------------------------------------
+// A plain bilinear sample blurs a depth edge from the inference grid over
+// foreground/background pixels when the source is 1080p/4K. A joint-bilateral
+// cross keeps the depth on the same side as the full-resolution luma edge when
+// that edge lands ON a depth-grid texel boundary -- but a boundary that falls
+// BETWEEN two texels (~5 image px apart at 4K on the 756 grid, ~7.4 on 518)
+// still shows through: Nearness itself is sampled
+// with a linear filter, so the CENTER sample n0 is already a blended,
+// neither-side value there, and no amount of re-averaging nearby texels
+// removes that contour halo (round 1's known residual, the third mechanism).
+//
+// v2 (fix round 1, review R2-T4): guided_nearness returns a blend of two
+// candidates instead of one mean:
+//   A = the round-1 weighted mean, center + +-1 cross, UNCHANGED.
+//   B = a true side-snap that does NOT anchor to n0. The first attempt scored
+//       candidates by a joint weight built from |n(q)-n0|, but n0 is exactly
+//       the contaminated cross-boundary mixture at a between-texel uv, so
+//       anything penalized for differing from it can never recover a clean
+//       side (that review found B collapsed to n0 algebraically: both base
+//       weights, 0.72 and 0.5, are < the center's fixed 1.0). Instead: the
+//       four depth texels surrounding uv are point-sampled at their EXACT
+//       centers (a bilinear fetch at a texel center returns that texel's pure,
+//       unmixed value) and the one whose guide luma best matches this pixel's
+//       own luma wins, with no reference to n0 at all.
+// edge_mag is the max +-1 luma jump around uv (from A's cross, unchanged). On
+// a strong local edge the result snaps from the smooth mean A to the
+// side-matched B; flat regions and already-sharp, texel-aligned edges are
+// unaffected (A and B agree there already).
+float source_luma(float2 uv) {
+    return saturate(SrcY.SampleLevel(linSmp, uv, 0) * plane_scale);
+}
+
+float content_vscale() {
+    return max(1e-5, 1.0 - crop_top - crop_bottom);
+}
+
+bool in_active_content(float2 uv) {
+    return uv.y >= crop_top && uv.y <= (1.0 - crop_bottom);
+}
+
+float2 source_to_depth_uv(float2 uv) {
+    return float2(uv.x, (uv.y - crop_top) / content_vscale());
+}
+
+float2 depth_to_source_uv(float2 uv) {
+    return float2(uv.x, crop_top + uv.y * content_vscale());
+}
+
+float guided_nearness(float2 uv) {
+    // Encoded mattes remain at the convergence plane: zero disparity, no
+    // warped matte/content boundary and no depth lookup outside the ROI.
+    if (!in_active_content(uv)) return convergence;
+    float2 depth_uv = saturate(source_to_depth_uv(uv));
+    float y0 = source_luma(uv);
+    float n0 = Nearness.SampleLevel(linSmp, depth_uv, 0);
+    float sum = n0;
+    float weights = 1.0;
+    float edge_mag = 0.0;  // max +-1 luma jump, drives the A/B blend below
+    const float2 offsets[4] = {
+        float2(-1, 0), float2(1, 0), float2(0, -1), float2(0, 1)
+    };
+    [unroll] for (int k = 0; k < 4; ++k) {
+        float2 q = saturate(depth_uv + offsets[k] * depth_texel);
+        float edge = abs(source_luma(depth_to_source_uv(q)) - y0);
+        float nq = Nearness.SampleLevel(linSmp, q, 0);
+        // Joint range term: texture edges alone must not sculpt geometry, and
+        // a genuine foreground/background discontinuity must not be averaged
+        // away even when both sides have similar luma.
+        float depth_edge = abs(nq - n0);
+        float w = 0.72 * exp2(-edge_strength * edge - 18.0 * depth_edge);
+        sum += w * nq;
+        weights += w;
+        edge_mag = max(edge_mag, edge);
+    }
+    float A = sum / max(weights, 1e-5);
+
+    // True side-snap. The pixel's uv generally falls BETWEEN depth texels, so
+    // the center bilinear fetch n0 above is already a cross-boundary mixture;
+    // any weighting anchored to n0 cannot recover a clean side (review
+    // R2-T4). B is selected WITHOUT n0: the four surrounding depth texels are
+    // point-sampled at their exact centers (bilinear at a texel center = the
+    // pure texel value) and the one whose guide luma best matches this
+    // pixel's own luma wins.
+    float2 g    = depth_uv / depth_texel - 0.5;        // depth-grid coordinates
+    float2 base = (floor(g) + 0.5) * depth_texel;      // lower-left texel CENTER uv
+    float  best_dl = 1e9;
+    float  B = n0;
+    [unroll] for (int j = 0; j < 4; ++j) {
+        float2 tc = saturate(base + float2(j & 1, j >> 1) * depth_texel);
+        float  dl = abs(source_luma(depth_to_source_uv(tc)) - y0);
+        if (dl < best_dl) {
+            best_dl = dl;
+            B = Nearness.SampleLevel(linSmp, tc, 0);   // exact center: unmixed texel
+        }
+    }
+
+    // Snap window: below 0.06 the joint-bilateral mean stands untouched;
+    // above 0.22 a genuine silhouette wins outright; the smoothstep between
+    // the two avoids trading the old contour halo for a new hard seam.
+    float snap = smoothstep(0.06, 0.22, edge_mag);
+    return lerp(A, B, snap);
+}
+
+// ---- diagnostic palette (shared by full depth-view and live overlay) -------
+float3 falseColor(float n) {
+    float t = 0.125 + 0.75 * saturate(n);
+    return saturate(float3(1.5 - abs(4.0 * t - 3.0),
+                           1.5 - abs(4.0 * t - 2.0),
+                           1.5 - abs(4.0 * t - 1.0)));
+}
+float3 rgb_to_yuv709_full(float3 c) {
+    float y = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+    return float3(y * (219.0 / 255.0) + 16.0 / 255.0,
+                  (c.b - y) / 1.8556 * (224.0 / 255.0) + 0.5,
+                  (c.r - y) / 1.5748 * (224.0 / 255.0) + 0.5);
+}
+float3 diagnostic_yuv(float nearness, float fill) {
+    // Depth is a quiet translucent turbo ramp. Pixels reconstructed from the
+    // background turn progressively warm, making the disocclusion mask visible
+    // without replacing the movie with a debug-only view.
+    float3 depth_rgb = falseColor(nearness);
+    float3 fill_rgb = float3(1.0, 0.12, 0.02);
+    return rgb_to_yuv709_full(lerp(depth_rgb, fill_rgb, saturate(fill)));
+}
+
+// ---- signed disparity (image-width fraction) at a source-space uv ----
+float disp_at(float2 uv) {
+    return max_disp * (guided_nearness(uv) - convergence);
+}
+
+struct WarpInfo {
+    float2 uv;
+    float fill;       // continuous confidence that background pull is required
+    float nearness;
+};
+
+// Backward DIBR: find src x solving x_s = x_d - eyeSign * disp(x_s)/2.
+// eyeSign follows the subtitle convention (VERIFY in Task 5): +1 = left eye.
+// Three fixed-point iterations are followed by a continuous residual mask.
+// Across a depth edge, the farther probe supplies a background coordinate and
+// smoothstep blends toward it over roughly 1–6 luma pixels. This avoids both
+// the hard seam of the old binary branch and the double image of an indiscriminate
+// blur: only pixels with an unsatisfied inverse mapping receive the pull.
+//
+// inv_w is ALWAYS the LUMA plane's 1/width, including in the chroma pass: the
+// disocclusion probe (+-8 texels) is a search radius in DISPARITY space, which
+// is defined against the full-resolution image, and warp_src works in
+// normalized uv so the identical function serves both plane resolutions.
+WarpInfo warp_info(float2 uvd, float eyeSign) {
+    float xs = uvd.x;
+    [unroll] for (int i = 0; i < 3; ++i)
+        xs = uvd.x - eyeSign * 0.5 * disp_at(float2(xs, uvd.y));
+    float resid = abs(xs - (uvd.x - eyeSign * 0.5 * disp_at(float2(xs, uvd.y))));
+    // Gradient-aware parallax visibility. The forward map is
+    // xd(xs)=xs+eyeSign*disp(xs)/2. Its Jacobian expands above 1 in
+    // disocclusions and folds toward/below 0 at competing foreground samples.
+    const float grad_step = 1.5;
+    float dl = disp_at(float2(saturate(xs - grad_step * inv_w), uvd.y));
+    float dr = disp_at(float2(saturate(xs + grad_step * inv_w), uvd.y));
+    float ddisp_dx = (dr - dl) / max(2.0 * grad_step * inv_w, 1e-6);
+    float jacobian = 1.0 + eyeSign * 0.5 * ddisp_dx;
+
+    // Probe in proportion to the requested parallax rather than at a fixed
+    // eight pixels. Cap it to keep unrelated scene regions out of the blend.
+    float probe = clamp(0.75 * max_disp, 4.0 * inv_w, 48.0 * inv_w);
+    float2 ql = float2(saturate(uvd.x - probe), uvd.y);
+    float2 qr = float2(saturate(uvd.x + probe), uvd.y);
+    float nl = guided_nearness(ql), nr = guided_nearness(qr);
+    float dl_bg = max_disp * (nl - convergence);
+    float dr_bg = max_disp * (nr - convergence);
+    float xl = uvd.x - eyeSign * 0.5 * dl_bg;
+    float xr = uvd.x - eyeSign * 0.5 * dr_bg;
+
+    // Bi-Warp candidates: use the farther of the left/right probes, with a
+    // continuous tie blend. This retains texture from an actually nearby
+    // background candidate instead of stretching the foreground edge.
+    float choose_right = smoothstep(-0.015, 0.015, nl - nr);
+    float background_x = lerp(xl, xr, choose_right);
+
+    float residual_mask = smoothstep(1.0 * inv_w, 6.0 * inv_w, resid);
+    float edge_mask = smoothstep(0.025, 0.18, abs(nl - nr));
+    float expansion_mask = smoothstep(1.04, 1.55, jacobian);
+    float fold_mask = 1.0 - smoothstep(0.05, 0.55, jacobian);
+    float visibility_mask = max(expansion_mask, fold_mask);
+    float fill = max(residual_mask, visibility_mask) *
+                 (0.25 + 0.75 * edge_mask);
+    // Four-to-eight-pixel feather in disparity space: the Jacobian supplies
+    // accurate localization while this soft knee prevents a binary seam.
+    fill = smoothstep(0.08, 0.92, saturate(fill));
+    xs = lerp(xs, background_x, fill);
+
+    WarpInfo o;
+    o.uv = float2(saturate(xs), uvd.y);
+    o.fill = fill;
+    o.nearness = guided_nearness(o.uv);
+    return o;
+}
+
+struct Eyes2 { float L : SV_Target0; float R : SV_Target1; };
+Eyes2 PS_WarpLuma(VSOut i) {
+    WarpInfo wl = warp_info(i.uv, +1.0);
+    WarpInfo wr = warp_info(i.uv, -1.0);
+    Eyes2 o;
+    o.L = SrcY.SampleLevel(linSmp, wl.uv, 0);
+    o.R = SrcY.SampleLevel(linSmp, wr.uv, 0);
+    // The diagnostic palette describes synthesized content. Encoded mattes
+    // are deliberately outside the depth ROI and must remain byte-identical
+    // black; tinting them made a correctly detected crop look like a miss.
+    if (diagnostics != 0 && in_active_content(i.uv)) {
+        float3 dl = diagnostic_yuv(wl.nearness, wl.fill);
+        float3 dr = diagnostic_yuv(wr.nearness, wr.fill);
+        o.L = lerp(o.L, dl.x / plane_scale, 0.18 + 0.57 * wl.fill);
+        o.R = lerp(o.R, dr.x / plane_scale, 0.18 + 0.57 * wr.fill);
+    }
+    return o;
+}
+struct Eyes4 { float UL : SV_Target0; float VL : SV_Target1;
+               float UR : SV_Target2; float VR : SV_Target3; };
+Eyes4 PS_WarpChroma(VSOut i) {
+    WarpInfo wl = warp_info(i.uv, +1.0);
+    WarpInfo wr = warp_info(i.uv, -1.0);
+    Eyes4 o;
+    o.UL = SrcU.SampleLevel(linSmp, wl.uv, 0); o.VL = SrcV.SampleLevel(linSmp, wl.uv, 0);
+    o.UR = SrcU.SampleLevel(linSmp, wr.uv, 0); o.VR = SrcV.SampleLevel(linSmp, wr.uv, 0);
+    if (diagnostics != 0 && in_active_content(i.uv)) {
+        float3 dl = diagnostic_yuv(wl.nearness, wl.fill);
+        float3 dr = diagnostic_yuv(wr.nearness, wr.fill);
+        float al = 0.18 + 0.57 * wl.fill, ar = 0.18 + 0.57 * wr.fill;
+        o.UL = lerp(o.UL, dl.y / plane_scale, al);
+        o.VL = lerp(o.VL, dl.z / plane_scale, al);
+        o.UR = lerp(o.UR, dr.y / plane_scale, ar);
+        o.VR = lerp(o.VR, dr.z / plane_scale, ar);
+    }
+    return o;
+}
+
+// ---- depth prep: YUV -> normalized RGB for the model (RGBA32F side x side) ----
+float3 yuv_to_rgb_prep(float y, float u, float v) {
+    y = (y * plane_scale - 16.0 / 255.0) * 1.16438353;
+    u = u * plane_scale - 0.5; v = v * plane_scale - 0.5;
+    float3 rgb;
+    if (yuv_matrix_sel == 2)      rgb = float3(y + 1.4746 * v,
+        y - 0.16455 * u - 0.57135 * v, y + 1.8814 * u);
+    else if (yuv_matrix_sel == 1) rgb = float3(y + 1.5748 * v,
+        y - 0.18732 * u - 0.46812 * v, y + 1.8556 * u);
+    else                          rgb = float3(y + 1.402 * v,
+        y - 0.344136 * u - 0.714136 * v, y + 1.772 * u);
+    if (transfer_sel == 2) rgb = rgb / (1.0 + rgb);      // cheap PQ-ish rolloff
+    return saturate(rgb);
+}
+float4 PS_DepthPrep(VSOut i) : SV_Target {
+    float2 source_uv = depth_to_source_uv(i.uv);
+    float3 rgb = yuv_to_rgb_prep(SrcY.SampleLevel(linSmp, source_uv, 0),
+                                 SrcU.SampleLevel(linSmp, source_uv, 0),
+                                 SrcV.SampleLevel(linSmp, source_uv, 0));
+    return float4(rgb, 1.0);      // ImageNet mean/std applied CPU-side
+}
+
+// ---- depth view: turbo-ish false color, written straight as YUV planes ----
+Eyes2 PS_DepthViewLuma(VSOut i) {
+    float n = guided_nearness(i.uv);
+    Eyes2 o; o.L = o.R = rgb_to_yuv709_full(falseColor(n)).x / plane_scale;
+    return o;
+}
+Eyes4 PS_DepthViewChroma(VSOut i) {
+    float n = guided_nearness(i.uv);
+    float3 yuv = rgb_to_yuv709_full(falseColor(n));
+    Eyes4 o;
+    o.UL = o.UR = yuv.y / plane_scale; o.VL = o.VR = yuv.z / plane_scale;
+    return o;
+}

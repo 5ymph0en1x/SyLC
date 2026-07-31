@@ -2,7 +2,9 @@
 #include <pybind11/stl.h>
 #include <pybind11/functional.h>
 #include <pybind11/numpy.h>
+#include <algorithm>
 #include <cstring>
+#include <vector>
 #include "mvc_demuxer.h"
 #include "mvc_matroska_demuxer.h"
 #include "mvc_m2ts_demuxer.h"
@@ -12,6 +14,12 @@
 #include "mvc_decoder.h"
 #include "frame_ring_buffer.h"
 #include "native_renderer.h"   // gated internally on SYLC_NATIVE_RENDERER
+#include "depth_engine.h"      // DepthEngine itself is unguarded, but its .cpp is only
+                                // compiled under BUILD_NATIVE_RENDERER (see CMakeLists.txt);
+                                // usage below stays inside #ifdef SYLC_NATIVE_RENDERER
+#include "depth_stabilizer.h"  // same gating as depth_engine.h above
+#include "cut_gate.h"          // header-only; same gating as depth_engine.h above
+#include "shared_depth_service.h"  // synth3d_flow::estimate_flow test surface
 
 namespace py = pybind11;
 using namespace mvc_demux;
@@ -907,6 +915,11 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
              "1=BT.709 limited, 2=BT.2020nc limited. transfer_sel: 0=legacy gamma/sdr_white, "
              "1=PQ->scRGB absolute (HDR display), 2=PQ->tone-mapped SDR. Both 0 (DEFAULT) is "
              "byte-identical to the pre-HDR path.")
+        .def("set_video_time_ms", &sylc::NativeRenderer::set_video_time_ms,
+             py::arg("video_time_ms"),
+             "Attach the exact media PTS (milliseconds) to the planes uploaded "
+             "for the next present. Negative/non-finite selects the fallback "
+             "clock; inference cadence is never substituted for video time.")
         .def("set_yuv_frame",
              [](sylc::NativeRenderer& r, py::object yl, py::object ul, py::object vl,
                 py::object yr, py::object ur, py::object vr) {
@@ -1060,7 +1073,452 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
              "stay). The next encoded frame is an IDR. Returns False on error (see last_error()).")
         .def("cast_stop", &sylc::NativeRenderer::cast_stop,
              py::call_guard<py::gil_scoped_release>(),
-             "Flush + tear down the cast pipeline. Idempotent.");
+             "Flush + tear down the cast pipeline. Idempotent.")
+        // --- synth3d (2D->3D): AI depth + DIBR warp ----------------------------
+        .def("set_synth3d",
+              [](sylc::NativeRenderer& r, bool enabled, float strength_pct, float convergence,
+                 bool depth_view, const std::wstring& model_path, const std::wstring& ort_dir,
+                 bool diagnostics, int side, int grid_width, int grid_height,
+                 float crop_top, float crop_bottom) {
+                  if (side <= 0)
+                      throw std::runtime_error("side must be a positive inference grid");
+                  if ((grid_width > 0) != (grid_height > 0))
+                      throw std::runtime_error(
+                          "grid_width and grid_height must be provided together");
+                  py::gil_scoped_release nogil;   // shader compile + resource creation
+                  return r.set_synth3d(enabled, strength_pct, convergence, depth_view,
+                                       model_path, ort_dir, diagnostics, side,
+                                       grid_width, grid_height, crop_top, crop_bottom);
+             },
+             py::arg("enabled"), py::arg("strength_pct") = 1.5f,
+             py::arg("convergence") = 0.5f, py::arg("depth_view") = false,
+              py::arg("model_path") = std::wstring(), py::arg("ort_dir") = std::wstring(),
+              py::arg("diagnostics") = false, py::arg("side") = kDefaultDepthSide,
+              py::arg("grid_width") = 0, py::arg("grid_height") = 0,
+              py::arg("crop_top") = 0.0f, py::arg("crop_bottom") = 0.0f,
+             "Enable the real-time 2D->3D conversion. strength_pct = max disparity as a "
+             "% of image width; convergence = normalized nearness at zero parallax (0..1); "
+             "depth_view replaces the warp with a false-color depth visualization; "
+             "diagnostics overlays depth and disocclusion confidence on the movie; "
+              "side = the backward-compatible square grid; positive grid_width and "
+              "grid_height override it for a fixed rectangular export; crop_top and "
+              "crop_bottom remove normalized encoded mattes before inference. "
+             "Renderers share one asynchronous ORT service, so playback never waits "
+             "for the model. False on error (see last_error()).")
+        .def("synth3d_status", &sylc::NativeRenderer::synth3d_status,
+             py::call_guard<py::gil_scoped_release>(),
+             "One line with state/provider/fps, map age, shared-client and cut counts, "
+             "motion/adaptive-alpha/scene metrics, and err. State describes the shared "
+             "depth engine; a debug test depth drives the warp independently of it.")
+        .def("synth3d_notify_seek", &sylc::NativeRenderer::synth3d_notify_seek,
+             py::call_guard<py::gil_scoped_release>(),
+             "Tell synth3d a seek happened: the temporal depth filter re-primes on the "
+             "next inference instead of blending across the discontinuity. No-op when "
+             "synth3d has never been enabled.")
+        .def("synth3d_set_ramp_ms", &sylc::NativeRenderer::synth3d_set_ramp_ms,
+             py::arg("ramp_ms"), py::call_guard<py::gil_scoped_release>(),
+             "Debug: override the post-cut/seek ease-out ramp duration in ms "
+             "(default 300). 0 disables the ramp (full disparity always applied). "
+             "No-op when synth3d has never been enabled.")
+        .def("synth3d_set_test_depth",
+             [](sylc::NativeRenderer& r, py::object depth) {
+                 if (depth.is_none()) {
+                     py::gil_scoped_release nogil;
+                     r.synth3d_set_test_depth(nullptr, 0);
+                     return;
+                 }
+                 auto a = depth.cast<py::array_t<uint16_t,
+                              py::array::c_style | py::array::forcecast>>();
+                 // Shape sanity only: the grid this must match is the
+                 // renderer's LIVE one (it follows the depth preset, and a
+                 // 756-sized map on a 900 grid used to be read past its end),
+                 // and only synth3d_set_test_depth can compare against it
+                 // under the same lock that performs the copy.
+                  if (a.ndim() != 2)
+                      throw std::runtime_error(
+                          "test depth must be a 2-D uint16 array");
+                 const uint16_t* p = a.data();
+                 const size_t count =
+                     static_cast<size_t>(a.shape(0)) * a.shape(1);
+                 bool ok = false;
+                  int live_w = 0, live_h = 0;
+                 {
+                     py::gil_scoped_release nogil;
+                     ok = r.synth3d_set_test_depth(p, count);
+                      if (!ok) {
+                          live_w = r.synth3d_grid_width();
+                          live_h = r.synth3d_grid_height();
+                      }
+                 }
+                 if (!ok)
+                     throw std::runtime_error(
+                         "test depth is " + std::to_string(a.shape(0)) + "x" +
+                         std::to_string(a.shape(1)) +
+                         " but the renderer's inference grid is " +
+                          std::to_string(live_h) + "x" + std::to_string(live_w));
+             },
+             py::arg("depth"),
+              "Debug: arm a rectangular uint16 nearness map that BYPASSES inference (None "
+             "returns to the engine). It must match the renderer's live inference "
+             "grid exactly (see synth3d_grid()); any other shape raises. Copied "
+             "internally; the array is not retained.")
+        .def("synth3d_side", &sylc::NativeRenderer::synth3d_side,
+             py::call_guard<py::gil_scoped_release>(),
+             "Backward-compatible horizontal inference-grid dimension. Use "
+             "synth3d_grid() for rectangular shapes. 0 before synth3d has ever "
+             "been enabled.")
+        .def("synth3d_grid",
+             [](const sylc::NativeRenderer& r) {
+                 int width = 0, height = 0;
+                 {
+                     py::gil_scoped_release nogil;
+                     width = r.synth3d_grid_width();
+                     height = r.synth3d_grid_height();
+                 }
+                 return py::make_tuple(width, height);
+             },
+             "Return the live synth3d inference grid as (width, height).")
+        .def("synth3d_read_plane",
+             [](sylc::NativeRenderer& r, int slot) -> py::object {
+                 std::vector<uint8_t> buf;
+                 uint32_t w = 0, h = 0, bpp = 0;
+                 std::string err;
+                 bool ok;
+                 {
+                     py::gil_scoped_release nogil;   // CopyResource + blocking Map
+                     ok = r.synth3d_read_plane(slot, buf, w, h, bpp, err);
+                 }
+                 if (!ok) throw std::runtime_error("synth3d_read_plane: " + err);
+                 const py::ssize_t sh = static_cast<py::ssize_t>(h);
+                 const py::ssize_t sw = static_cast<py::ssize_t>(w);
+                 if (bpp == 2) {
+                     py::array_t<uint16_t> out({sh, sw});
+                     std::memcpy(out.mutable_data(), buf.data(), buf.size());
+                     return std::move(out);
+                 }
+                 py::array_t<uint8_t> out({sh, sw});
+                 std::memcpy(out.mutable_data(), buf.data(), buf.size());
+                 return std::move(out);
+             },
+             py::arg("slot"),
+             "Debug: read back one synth3d warp output (slot 0..5 = Y_L,U_L,V_L,Y_R,U_R,"
+             "V_R) as a 2-D numpy array (uint8 for R8 planes, uint16 for R16).");
+
+    // --- synth3d (2D->3D): DepthEngine test-only binding ------------------------
+    // Test-only entry point (used by tests/synth3d/test_depth_engine.py) that
+    // proves DLL loading, the provider ladder and I/O binding end-to-end,
+    // before any renderer/warp work exists. The CPU-side preprocessing (nearest
+    // resize + ImageNet normalization, HWC->CHW) mirrors what Task 4's real
+    // pipeline will eventually do on the GPU.
+    m.def("depth_infer_test",
+          [](const std::wstring& model, const std::wstring& ort_dir,
+             py::array_t<uint8_t, py::array::c_style | py::array::forcecast> rgb,
+              int side, int grid_width, int grid_height) {
+              if (rgb.ndim() != 3 || rgb.shape(2) != 3)
+                  throw std::runtime_error("rgb must be HxWx3 uint8");
+              if (side <= 0)
+                  throw std::runtime_error("side must be a positive inference grid");
+               if ((grid_width > 0) != (grid_height > 0))
+                   throw std::runtime_error(
+                       "grid_width and grid_height must be provided together");
+               const int W = grid_width > 0 ? grid_width : side;
+               const int H = grid_height > 0 ? grid_height : side;
+               std::vector<float> chw(3 * static_cast<size_t>(W) * H);
+              static const float kMean[3] = {0.485f, 0.456f, 0.406f};
+              static const float kStd[3] = {0.229f, 0.224f, 0.225f};
+              auto r = rgb.unchecked<3>();
+               const double sy = double(rgb.shape(0)) / H, sx = double(rgb.shape(1)) / W;
+               for (int y = 0; y < H; ++y)
+                   for (int x = 0; x < W; ++x) {
+                      const int py_ = std::min<int>(int(y * sy), static_cast<int>(rgb.shape(0)) - 1);
+                      const int px_ = std::min<int>(int(x * sx), static_cast<int>(rgb.shape(1)) - 1);
+                      for (int c = 0; c < 3; ++c)
+                           chw[c * W * H + y * W + x] =
+                              (r(py_, px_, c) / 255.0f - kMean[c]) / kStd[c];
+                  }
+              DepthEngine eng;
+              std::string err;
+              DepthConfig cfg;
+              cfg.model_path = model;
+              cfg.ort_dir = ort_dir;
+               cfg.side = side;
+               cfg.width = W;
+               cfg.height = H;
+              // F3: must match Synth3D::worker_main's cfg.invert_output (synth3d.cpp) so
+              // this test binding exercises the same shipped orientation as production.
+              cfg.invert_output = true;
+              if (!eng.init(cfg, err)) throw std::runtime_error("init: " + err);
+              std::vector<float> model_input(
+                  static_cast<size_t>(eng.input_views()) * chw.size());
+              for (int view = 0; view < eng.input_views(); ++view)
+                  std::copy(
+                      chw.begin(), chw.end(),
+                      model_input.begin() +
+                          static_cast<size_t>(view) * chw.size());
+               py::array_t<float> out({H, W});
+              {
+                  py::gil_scoped_release nogil;
+                  if (!eng.infer(model_input.data(), out.mutable_data(), err))
+                      throw std::runtime_error("infer: " + err);
+              }
+              return out;
+          },
+          py::arg("model_path"), py::arg("ort_dir"), py::arg("rgb"),
+          py::arg("side") = kDefaultDepthSide,
+          py::arg("grid_width") = 0, py::arg("grid_height") = 0,
+          "Test-only: uint8 HxWx3 RGB -> side x side float32 depth map via DepthEngine "
+          "(ORT provider ladder TensorRT/DirectML/CPU). CPU-side resize+normalize. "
+          "side must match the grid the model was exported for (756 default, 518 for "
+          "the faster presets); a fixed-shape mismatch fails init with a named error.");
+
+    m.def("_synth3d_detect_letterbox_test",
+          [](py::array_t<uint8_t,
+                         py::array::c_style | py::array::forcecast> luma) {
+              if (luma.ndim() != 2)
+                  throw std::runtime_error("luma must be a 2-D uint8 array");
+              const int height = static_cast<int>(luma.shape(0));
+              const int width = static_cast<int>(luma.shape(1));
+              const size_t n = static_cast<size_t>(width) * height;
+              std::vector<float> normalized(n);
+              const uint8_t* src = luma.data();
+              for (size_t i = 0; i < n; ++i)
+                  normalized[i] = src[i] / 255.0f;
+              synth3d_aspect::HorizontalBars bars;
+              {
+                  py::gil_scoped_release nogil;
+                  bars = synth3d_aspect::detect_horizontal_letterbox(
+                      normalized, width, height);
+              }
+              return py::make_tuple(bars.top, bars.bottom, bars.valid);
+          },
+          py::arg("luma"),
+          "Test the production encoded-horizontal-letterbox detector. Returns "
+          "(top_rows, bottom_rows, valid).");
+
+    // --- synth3d (2D->3D): DepthStabilizer (temporal fit/EMA/cut) ----------------
+    // Test-only-visible helper (the closed-form fit is also used internally by
+    // DepthStabilizer::step) plus the stabilizer itself, consumed by Task 4's
+    // inference thread. See tests/synth3d/test_depth_stabilizer.py.
+    m.def("_synth3d_fit_scale_shift",
+          [](py::array_t<float, py::array::c_style | py::array::forcecast> ref,
+             py::array_t<float, py::array::c_style | py::array::forcecast> cur) {
+              if (ref.ndim() != 1 || cur.ndim() != 1 || ref.shape(0) != cur.shape(0))
+                  throw std::runtime_error(
+                      "ref and cur must be 1D float32 arrays of equal length");
+              const size_t n = static_cast<size_t>(ref.shape(0));
+              float a = 1.0f, b = 0.0f;
+              {
+                  py::gil_scoped_release nogil;
+                  DepthStabilizer::fit_scale_shift(ref.data(), cur.data(), n, a, b);
+              }
+              return py::make_tuple(a, b);
+          },
+          py::arg("ref"), py::arg("cur"),
+          "Least-squares closed form: argmin_(a,b) sum (a*cur+b - ref)^2 -> (a, b).");
+
+    m.def("_synth3d_estimate_flow_test",
+          [](py::array_t<float, py::array::c_style | py::array::forcecast> source,
+             py::array_t<float, py::array::c_style | py::array::forcecast> destination,
+             int width, int height, int threads) {
+              const size_t expected =
+                  static_cast<size_t>(width) * static_cast<size_t>(height);
+              if (source.ndim() != 1 || destination.ndim() != 1 ||
+                  static_cast<size_t>(source.shape(0)) != expected ||
+                  static_cast<size_t>(destination.shape(0)) != expected)
+                  throw std::runtime_error(
+                      "source/destination must be 1D float32 arrays of length "
+                      "width*height");
+              std::vector<float> src(source.data(), source.data() + expected);
+              std::vector<float> dst(destination.data(),
+                                     destination.data() + expected);
+              synth3d_flow::DenseFlow flow;
+              {
+                  py::gil_scoped_release nogil;
+                  flow = synth3d_flow::estimate_flow(
+                      src, dst, width, height, threads);
+              }
+              const py::ssize_t n = static_cast<py::ssize_t>(expected);
+              py::array_t<float> fx(n), fy(n), fq(n);
+              std::memcpy(fx.mutable_data(), flow.x.data(),
+                          expected * sizeof(float));
+              std::memcpy(fy.mutable_data(), flow.y.data(),
+                          expected * sizeof(float));
+              std::memcpy(fq.mutable_data(), flow.quality.data(),
+                          expected * sizeof(float));
+              return py::make_tuple(fx, fy, fq);
+          },
+          py::arg("source"), py::arg("destination"),
+          py::arg("width"), py::arg("height"), py::arg("threads") = 1,
+          "Test surface for the worker's CPU optical flow (production code "
+          "path). Returns (flow_x, flow_y, quality); source->destination "
+          "displacement at destination coordinates, full resolution.");
+
+    py::class_<DepthStabilizer>(m, "DepthStabilizer")
+        .def(py::init<size_t>(), py::arg("n"))
+        .def("reset", &DepthStabilizer::reset,
+             "Re-prime on the next step() (seek / stream restart).")
+        .def("reproject",
+             [](DepthStabilizer& self,
+                py::array_t<float, py::array::c_style | py::array::forcecast> flow_x,
+                py::array_t<float, py::array::c_style | py::array::forcecast> flow_y,
+                py::object reliability_obj, size_t width, size_t height) {
+                 const size_t n = width * height;
+                 if (n != self.size() || flow_x.ndim() != 1 ||
+                     flow_y.ndim() != 1 ||
+                     static_cast<size_t>(flow_x.shape(0)) != n ||
+                     static_cast<size_t>(flow_y.shape(0)) != n)
+                     throw std::runtime_error(
+                         "flow_x/flow_y must be flat float32 arrays matching width*height");
+                 py::array_t<float, py::array::c_style | py::array::forcecast>
+                     reliability;
+                 const float* reliability_ptr = nullptr;
+                 if (!reliability_obj.is_none()) {
+                     reliability = reliability_obj.cast<py::array_t<
+                         float, py::array::c_style | py::array::forcecast>>();
+                     if (reliability.ndim() != 1 ||
+                         static_cast<size_t>(reliability.shape(0)) != n)
+                         throw std::runtime_error(
+                             "reliability must be None or a flat float32 array "
+                             "matching width*height");
+                     reliability_ptr = reliability.data();
+                 }
+                 py::gil_scoped_release nogil;
+                 self.reproject(flow_x.data(), flow_y.data(),
+                                reliability_ptr, width, height);
+             },
+             py::arg("flow_x"), py::arg("flow_y"),
+             py::arg("reliability") = py::none(),
+             py::arg("width"), py::arg("height"),
+             "Transport the running depth state with previous->current flow.")
+        .def("step",
+             [](DepthStabilizer& self,
+                py::array_t<float, py::array::c_style | py::array::forcecast> raw,
+                py::object motion_obj, float scene_change,
+                py::object confidence_obj, py::object boundary_obj) {
+                 if (raw.ndim() != 1 || static_cast<size_t>(raw.shape(0)) != self.size())
+                     throw std::runtime_error(
+                         "raw must be a 1D float32 array of length " +
+                         std::to_string(self.size()));
+                 py::array_t<float, py::array::c_style | py::array::forcecast> motion;
+                 const float* motion_ptr = nullptr;
+                 if (!motion_obj.is_none()) {
+                     motion = motion_obj.cast<py::array_t<float,
+                              py::array::c_style | py::array::forcecast>>();
+                     if (motion.ndim() != 1 ||
+                         static_cast<size_t>(motion.shape(0)) != self.size())
+                         throw std::runtime_error(
+                             "motion must be None or a 1D float32 array of length " +
+                             std::to_string(self.size()));
+                     motion_ptr = motion.data();
+                 }
+                 py::array_t<float, py::array::c_style | py::array::forcecast> confidence;
+                 const float* confidence_ptr = nullptr;
+                 if (!confidence_obj.is_none()) {
+                     confidence = confidence_obj.cast<py::array_t<float,
+                                  py::array::c_style | py::array::forcecast>>();
+                     if (confidence.ndim() != 1 ||
+                         static_cast<size_t>(confidence.shape(0)) != self.size())
+                         throw std::runtime_error(
+                             "confidence must be None or a 1D float32 array of length " +
+                             std::to_string(self.size()));
+                     confidence_ptr = confidence.data();
+                 }
+                 py::array_t<float, py::array::c_style | py::array::forcecast> boundary;
+                 const float* boundary_ptr = nullptr;
+                 if (!boundary_obj.is_none()) {
+                     boundary = boundary_obj.cast<py::array_t<float,
+                               py::array::c_style | py::array::forcecast>>();
+                     if (boundary.ndim() != 1 ||
+                         static_cast<size_t>(boundary.shape(0)) != self.size())
+                         throw std::runtime_error(
+                             "surface_boundary must be None or a 1D float32 "
+                             "array of length " + std::to_string(self.size()));
+                     boundary_ptr = boundary.data();
+                 }
+                 py::array_t<uint16_t> out(static_cast<py::ssize_t>(self.size()));
+                 bool was_cut = false;
+                 {
+                     py::gil_scoped_release nogil;
+                     was_cut = self.step(raw.data(), out.mutable_data(),
+                                         motion_ptr, scene_change,
+                                         confidence_ptr, boundary_ptr);
+                 }
+                 return py::make_tuple(out, was_cut);
+             },
+             py::arg("raw"), py::arg("motion") = py::none(),
+             py::arg("scene_change") = 0.0f,
+             py::arg("confidence") = py::none(),
+             py::arg("surface_boundary") = py::none(),
+             "raw model output (float32 1D, length n) -> (out_q16 uint16 1D, was_cut bool).")
+        .def_readwrite("alpha", &DepthStabilizer::alpha)
+        .def_readwrite("alpha_static", &DepthStabilizer::alpha_static)
+        .def_readwrite("alpha_motion", &DepthStabilizer::alpha_motion)
+        .def_readwrite("motion_low", &DepthStabilizer::motion_low)
+        .def_readwrite("motion_high", &DepthStabilizer::motion_high)
+        .def_readwrite("tone_alpha", &DepthStabilizer::tone_alpha)
+        .def_readwrite("depth_contrast", &DepthStabilizer::depth_contrast)
+        .def_readwrite("confidence_floor", &DepthStabilizer::confidence_floor)
+        .def_readwrite("temporal_surface_memory",
+                       &DepthStabilizer::temporal_surface_memory)
+        .def_readwrite("temporal_stable_low",
+                       &DepthStabilizer::temporal_stable_low)
+        .def_readwrite("temporal_stable_high",
+                       &DepthStabilizer::temporal_stable_high)
+        .def_readwrite("boundary_fast_motion",
+                       &DepthStabilizer::boundary_fast_motion)
+        .def_readwrite("cut_threshold", &DepthStabilizer::cut_threshold)
+        .def_readwrite("scene_cut_threshold", &DepthStabilizer::scene_cut_threshold)
+        .def_readwrite("snap_frac", &DepthStabilizer::snap_frac)
+        .def_property_readonly("last_motion", &DepthStabilizer::last_motion)
+        .def_property_readonly("last_effective_alpha",
+                               &DepthStabilizer::last_effective_alpha)
+        .def_property_readonly("last_scene_change",
+                               &DepthStabilizer::last_scene_change)
+        .def_property_readonly("last_confidence",
+                               &DepthStabilizer::last_confidence)
+        .def_property_readonly("last_cut", &DepthStabilizer::last_cut)
+        .def_property_readonly("last_stability",
+                               &DepthStabilizer::last_stability)
+        .def_property_readonly("last_history_support",
+                               &DepthStabilizer::last_history_support)
+        .def_property_readonly("cut_count", &DepthStabilizer::cut_count)
+        .def("snap_count", &DepthStabilizer::snap_count)
+        .def("set_dt_ms", &DepthStabilizer::set_dt_ms, py::arg("dt_ms"),
+             "Backward-compatible single-clock setter: applies the same "
+             "effective interval to map updates and source observations.")
+        .def("set_update_dt_ms", &DepthStabilizer::set_update_dt_ms,
+             py::arg("dt_ms"),
+             "Compute wall-clock interval between stabilized map updates, in "
+             "ms (clamped to [20, 500]); diagnostic only and deliberately "
+             "does not alter temporal geometry.")
+        .def("set_source_dt_ms", &DepthStabilizer::set_source_dt_ms,
+             py::arg("dt_ms"),
+             "Video PTS interval between the source frames being compared, in "
+             "ms (clamped to [4, 500]); drives every content-temporal rule.")
+        .def_property_readonly("dt_ms", &DepthStabilizer::dt_ms)
+        .def_property_readonly("update_dt_ms", &DepthStabilizer::update_dt_ms)
+        .def_property_readonly("source_dt_ms", &DepthStabilizer::source_dt_ms)
+        .def_property_readonly("history_count", &DepthStabilizer::history_count)
+        .def_readwrite("snap_confirm_ms", &DepthStabilizer::snap_confirm_ms)
+        .def_readwrite("history_commit_ms", &DepthStabilizer::history_commit_ms)
+        .def_readwrite("worker_threads", &DepthStabilizer::worker_threads)
+        .def_property_readonly_static("kReferenceDtMs",
+             [](const py::object&) { return DepthStabilizer::kReferenceDtMs; });
+
+    // --- synth3d (2D->3D): CutGate (anti-flash histogram confirmation) ----------
+    // See include/cut_gate.h. tests/synth3d/test_cut_gate.py drives this directly;
+    // SharedDepthService's worker uses the same type internally (shared_depth_service.cpp).
+    py::class_<CutGate>(m, "CutGate")
+        .def(py::init<>())
+        .def("update", &CutGate::update, py::arg("depth_cut"), py::arg("histogram_distance"),
+             "depth_cut passes instantly and re-arms; histogram_distance alone needs "
+             "two CONSECUTIVE calls >= histogram_threshold to confirm (a single spike "
+             "sets pending() without confirming). Returns True exactly on the "
+             "confirming cycle.")
+        .def("pending", &CutGate::pending,
+             "True while a single histogram spike awaits a second confirming frame.")
+        .def_readwrite("histogram_threshold", &CutGate::histogram_threshold);
+
     m.attr("NATIVE_RENDERER_AVAILABLE") = true;
 #else
     m.attr("NATIVE_RENDERER_AVAILABLE") = false;

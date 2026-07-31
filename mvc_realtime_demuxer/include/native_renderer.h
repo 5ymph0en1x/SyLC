@@ -16,9 +16,12 @@
 #pragma once
 #ifdef SYLC_NATIVE_RENDERER
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
+
+#include "depth_engine.h"   // kDefaultDepthSide (default synth3d inference grid)
 
 namespace sylc {
 
@@ -77,6 +80,13 @@ public:
     bool upload_plane16(int plane_index, const uint16_t* data,
                         uint32_t width, uint32_t height, uint32_t src_stride);
 
+    // Media presentation timestamp of the planes uploaded for the next
+    // present, in milliseconds. Negative/non-finite means unavailable and
+    // activates the renderer-side steady-clock fallback. This value travels
+    // with the exact readback pixels; it is never reconstructed from inference
+    // or GUI cadence.
+    void set_video_time_ms(double video_time_ms);
+
     // Per-sample scale multiplied into every Y/U/V texel BEFORE the YUV->RGB math
     // (stored in the cbuffer). 1.0 = 8-bit R8 (identity); 65535/1023 ~= 64.06 maps a
     // 10-bit value stored low in an R16_UNORM texel back to [0,1]. Takes effect on
@@ -97,9 +107,77 @@ public:
     // aspect (width/height) used by the letterbox/pillarbox geometry instead of deriving
     // it from the uploaded eye dimensions. Needed for half-SBS/half-TAB, where each eye is
     // squeezed (e.g. 960x1080) yet must display at the ORIGINAL 2D aspect (the packed
-    // frame's own W/H). 0.0f = derive from planes (default; full formats, MVC, 2D). Takes
-    // effect on the next present; serialized by the same mutex as the sibling setters.
+    // frame's own W/H). 0.0f = derive from planes (default; full formats, MVC, 2D).
+    // 2D, SBS and TAB main-window canvases all preserve this source aspect; only the
+    // physical FramePack canvas remains fixed at 1920/2205. Takes effect on the next
+    // present; serialized by the same mutex as the sibling setters.
     void set_source_aspect(float aspect);
+
+    // --- synth3d (2D->3D): AI depth + DIBR warp ------------------------------
+    // Turns the uploaded 2D source into a synthesized stereo pair, in place: the six
+    // plane SRVs the display draw (and cast_encode) consume are substituted with six
+    // warp outputs produced on the GPU from a monocular depth map. The depth itself is
+    // inferred by a process-wide worker (ONNX Runtime) that NEVER touches D3D or a
+    // renderer mutex. Surfaces using the same model share that worker and its latest
+    // immutable depth map, so a slow or failed model only lowers the depth refresh
+    // rate — decode and present never wait for it (spec Sec.7).
+    //
+    // set_synth3d(true, ...): create the GPU pipeline and attach to the shared service.
+    //   The ORT session is built on its worker (it takes seconds), so this returns
+    //   immediately. strength_pct = max disparity as a % of image width; convergence =
+    //   the normalized nearness placed at zero parallax (0..1); depth_view replaces the
+    //   warp with a false-color visualization of the depth map; diagnostics overlays
+    //   depth and the continuous disocclusion mask on the live stereo result.
+    //   model_path/ort_dir may be empty when a debug test depth drives the warp.
+    //   side preserves the square API. Positive grid_width/grid_height override
+    //   it for a fixed rectangular model and are part of the shared-service key.
+    //   crop_top/crop_bottom are normalized source-image mattes removed before
+    //   inference; the warp maps the rectangular depth back into that same ROI.
+    // set_synth3d(false): detach and return to untouched source planes on the next
+    //   present. The service remains warm and is never joined under a renderer mutex.
+    // synth3d_status(): one parseable line beginning with
+    //   "state=... provider=... side=... fps=... source_ms=... update_ms=... "
+    //   "age_ms=... clients=... cuts=... motion=... alpha=... scene=... "
+    //   "crop=top:bottom:sourceW:sourceH crop_conf=... grid=WxH err=...".
+    //   source_ms is media-PTS spacing; update_ms is compute/map cadence.
+    //   state is the shared engine's state;
+    //   a debug test depth drives the warp independently of it. side is 0 when
+    //   nothing is attached (the running line also carries views= before side=).
+    bool set_synth3d(bool enabled, float strength_pct = 1.5f, float convergence = 0.5f,
+                     bool depth_view = false,
+                      const std::wstring& model_path = std::wstring(),
+                      const std::wstring& ort_dir = std::wstring(),
+                      bool diagnostics = false,
+                      int side = kDefaultDepthSide,
+                      int grid_width = 0, int grid_height = 0,
+                      float crop_top = 0.0f, float crop_bottom = 0.0f);
+    std::string synth3d_status() const;
+    // Debug/tests. set_test_depth(nullptr, 0) returns to the engine; otherwise q16
+    // points at a synth3d_grid_width()*synth3d_grid_height() map that bypasses inference
+    // entirely, and `count` is how many uint16 elements that buffer actually holds.
+    // Returns false (arming nothing) when count does not match the live grid --
+    // the grid follows the depth preset, so a caller CAN hold a map of the wrong
+    // size, and neither over-reading it nor cropping it is acceptable. True when
+    // no pipeline exists yet: that stays the historic silent no-op, and nothing
+    // is read. read_plane stages one warp output back to the CPU (slot 0..5 =
+    // Y_L,U_L,V_L,Y_R,U_R,V_R); it MAPs blocking, never on the playback path.
+    bool synth3d_set_test_depth(const uint16_t* q16_or_null, size_t count);
+    // The live inference grid every depth-side resource is sized for (and the
+    // element count per side that set_test_depth demands); 0 before any synth3d
+    // pipeline has been created.
+    int synth3d_side() const;
+    int synth3d_grid_width() const;
+    int synth3d_grid_height() const;
+    bool synth3d_read_plane(int slot, std::vector<uint8_t>& out, uint32_t& w,
+                            uint32_t& h, uint32_t& bpp, std::string& err);
+    // Seek: re-prime the temporal depth filter on the next inference rather than let it
+    // blend the EMA across the discontinuity (the same mechanism as its scene-cut snap).
+    // Cheap, and a no-op when no synth3d pipeline exists.
+    void synth3d_notify_seek();
+    // Debug: override the post-cut/seek ease-out ramp duration (ms, default
+    // 300). 0 disables the ramp (full disparity always). No-op when no
+    // synth3d pipeline exists yet.
+    void synth3d_set_ramp_ms(float ramp_ms);
 
     // Upload the RGBA8 subtitle overlay (texture slot t0). Straight alpha.
     bool upload_subtitle(const uint8_t* data,
@@ -196,6 +274,7 @@ private:
     uint32_t    src_h_  = 0;
     int         stereo_mode_ = 0;
     float       plane_scale_ = 1.0f;           // cbuffer plane_scale (guarded by impl_->mtx)
+    double      video_time_ms_ = -1.0;          // current source-frame PTS (mtx-guarded)
     int         yuv_matrix_sel_ = 0;           // cbuffer yuv_matrix_sel (mtx-guarded), 0=legacy BT.601
     int         transfer_sel_   = 0;           // cbuffer transfer_sel (mtx-guarded), 0=legacy
     float       aspect_ = 0.0f;                 // C2 display-aspect override, 0=derive (mtx-guarded)

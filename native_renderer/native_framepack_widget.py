@@ -150,6 +150,35 @@ class NativeFramepackWidget(QWidget):
         self.transfer_sel = 0
         self._have_color_params = True         # False after an old .pyd rejects set_color_params
         self._color_params_unsupported_logged = False
+        # Exact media PTS of the frame currently being delivered. The player
+        # writes it beside present_vsync immediately before this slot. It is
+        # forwarded independently from GUI arrival/compute time.
+        self.video_time_ms = -1.0
+        self._have_video_time = True
+
+        # 2D->3D AI synthesis (spec 2026-07-28): pushed to the renderer on change only.
+        self.synth3d_enabled = False
+        self.synth3d_strength = 1.5      # % of image width
+        self.synth3d_convergence = 0.5
+        self.synth3d_depth_view = False
+        self.synth3d_diagnostics = False
+        self.synth3d_model_path = ""
+        self.synth3d_ort_dir = ""
+        # Square inference grid the model was exported for, set by the host next
+        # to synth3d_model_path (round 4 depth presets: 756 or 518). 0 = the host
+        # named none, so the renderer's own default applies -- the binding
+        # rejects a non-positive side.
+        self.synth3d_side = 0
+        # Optional fixed rectangular export selected after the shared worker has
+        # observed stable encoded mattes. Zero keeps the square preset above.
+        self.synth3d_grid_width = 0
+        self.synth3d_grid_height = 0
+        self.synth3d_crop_top = 0.0
+        self.synth3d_crop_bottom = 0.0
+        self._have_synth3d = True        # old-.pyd probe, same idiom as _have_yuv16
+        self._synth3d_takes_side = True  # False after an old .pyd rejects side=
+        self._synth3d_takes_rect = True  # False after a pre-aspect .pyd rejects ROI=
+        self._synth3d_pushed = None
 
         # Public attrs some call sites read on the Qt widget.
         self.has_video = False
@@ -205,6 +234,11 @@ class NativeFramepackWidget(QWidget):
         self.has_video = False
         if self._sub is not None:
             self._sub_dirty = True
+        # The rebuilt instance has never received the synth3d state -- force a
+        # re-push on the next delivered frame instead of trusting the stale cache
+        # from the old (now-discarded) renderer object. _have_synth3d (the old-.pyd
+        # verdict) stays as-is: it describes this .pyd build, not this instance.
+        self._synth3d_pushed = None
         error = str(exception) if exception is not None else ""
         if not error and r and r is not False:
             try:
@@ -279,8 +313,10 @@ class NativeFramepackWidget(QWidget):
 
         # A 2D presentation samples only t1..t3. Do not upload the unused right
         # eye to an embedded preview: this halves its CPU->GPU traffic when the
-        # framepack window is being presented simultaneously.
-        if self._stereo_mode == 0:
+        # framepack window is being presented simultaneously. Same reasoning when
+        # synth3d is active: the renderer synthesizes the right eye itself, so a
+        # duplicated right-eye upload from the source would be wasted bandwidth.
+        if self._stereo_mode == 0 or (self.synth3d_enabled and self._have_synth3d):
             yr = ur = vr = None
 
         if not self._ensure():
@@ -342,12 +378,77 @@ class NativeFramepackWidget(QWidget):
                         logger.warning("[NATIVE-WIDGET] set_color_params unavailable "
                                        "(old .pyd); HDR/PQ color disabled (legacy render)")
                         self._color_params_unsupported_logged = True
+            # 2D->3D AI synthesis: push the state to the renderer only when it changed
+            # (the call locks the renderer mutex and (re)configures the warp pipeline;
+            # a per-frame call would churn it needlessly). Same old-.pyd probe idiom as
+            # set_source_aspect/set_color_params above.
+            if self._have_synth3d:
+                state = (bool(self.synth3d_enabled), float(self.synth3d_strength),
+                         float(self.synth3d_convergence), bool(self.synth3d_depth_view),
+                         bool(self.synth3d_diagnostics),
+                         str(self.synth3d_model_path), str(self.synth3d_ort_dir),
+                         int(self.synth3d_side),
+                         int(self.synth3d_grid_width),
+                         int(self.synth3d_grid_height),
+                         float(self.synth3d_crop_top),
+                         float(self.synth3d_crop_bottom))
+                if state != self._synth3d_pushed:
+                    kwargs = dict(model_path=state[5], ort_dir=state[6],
+                                  diagnostics=state[4])
+                    # The grid is part of the shared depth service's key, so a
+                    # preset switch must reach the renderer with it. A .pyd from
+                    # before round 4 has no side= parameter: retry without it
+                    # (the renderer then uses its own 756 default) instead of
+                    # losing synthesis entirely -- same probe idiom as
+                    # _uniforms_take_disparity.
+                    if self._synth3d_takes_side and state[7] > 0:
+                        kwargs['side'] = state[7]
+                    if (self._synth3d_takes_rect
+                            and state[8] > 0 and state[9] > 0):
+                        kwargs.update(grid_width=state[8],
+                                      grid_height=state[9],
+                                      crop_top=state[10],
+                                      crop_bottom=state[11])
+                    try:
+                        ok = self._r.set_synth3d(*state[:4], **kwargs)
+                    except (AttributeError, TypeError) as exc:
+                        if isinstance(exc, TypeError) and 'grid_width' in kwargs:
+                            # A renderer old enough not to understand rectangular
+                            # grids cannot safely open the rectangular ONNX path.
+                            # Do not cache the attempted state; the host will keep
+                            # square operation on builds whose status has no crop.
+                            self._synth3d_takes_rect = False
+                            logger.warning("[NATIVE-WIDGET] set_synth3d has no "
+                                           "rectangular-grid/ROI arguments "
+                                           "(old .pyd); adaptive aspect disabled")
+                        elif isinstance(exc, TypeError) and 'side' in kwargs:
+                            # Only side= is unsupported: leave _synth3d_pushed
+                            # alone so the next frame retries without it.
+                            self._synth3d_takes_side = False
+                            logger.warning("[NATIVE-WIDGET] set_synth3d has no "
+                                           "side= (old .pyd); depth presets fall "
+                                           "back to the renderer's default grid")
+                        else:
+                            self._have_synth3d = False
+                            logger.warning("[NATIVE-WIDGET] set_synth3d unavailable "
+                                           "(old .pyd); 2D->3D synthesis disabled")
+                    else:
+                        # A False return means the renderer refused the push (e.g. before
+                        # initialize) -- do not cache it as pushed, so it retries next frame.
+                        if ok:
+                            self._synth3d_pushed = state
             # The subtitle texture persists on the GPU (slot t0) — upload only
             # when the image actually changed, not on every frame.
             if self._sub is not None and self._sub_dirty:
                 if not self._r.set_subtitle_rgba(self._sub[0]):
                     return self._invalidate_renderer("subtitle upload")
                 self._sub_dirty = False
+            if self._have_video_time:
+                try:
+                    self._r.set_video_time_ms(float(self.video_time_ms))
+                except (AttributeError, TypeError):
+                    # Compatibility with a pyd predating the timed frame path.
+                    self._have_video_time = False
             # Route by plane dtype: uint16 (10-bit HEVC) -> R16 path with plane_scale;
             # uint8 -> the existing R8 path. Same TypeError/AttributeError-probe idiom
             # as _uniforms_take_disparity: an old .pyd without set_yuv_frame16 drops

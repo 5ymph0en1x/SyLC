@@ -6,6 +6,7 @@
 #include "native_renderer_shaders.h"   // kVertexHLSL / kFragmentHLSL (exact, embedded)
 #include "nvenc_encoder.h"             // SyLC Cast: Task-1 NVENC HEVC encoder wrapper
 #include "sbs_nv12_packer.h"           // SyLC Cast: Task-2 YUV -> NV12 SBS packer
+#include "synth3d.h"                   // synth3d (2D->3D): depth prep + DIBR warp passes
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -13,6 +14,7 @@
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -107,6 +109,13 @@ struct NativeRenderer::Impl {
     // cast_start() builds it on `device`; reset by cast_stop()/shutdown(). Held by
     // unique_ptr so the non-copyable packer/encoder live at a stable address.
     std::unique_ptr<CastPipeline> cast;
+
+    // synth3d (2D->3D): the depth-prep / inference / DIBR-warp pipeline. Null until
+    // set_synth3d(true) builds it on `device`; inference is supplied by the
+    // process-wide SharedDepthService while warp textures stay device-local. Its
+    // six warp outputs are substituted for srv[1..6] in present()/cast_encode().
+    std::unique_ptr<Synth3D> synth3d;
+    Synth3DParams            synth3d_params;
 
     // Last-written constant-buffer contents. set_uniforms rebuilds this fully each
     // call; set_plane_scale mutates only .plane_scale and re-uploads — so a
@@ -515,13 +524,22 @@ void NativeRenderer::set_color_params(int yuv_matrix_sel, int transfer_sel) {
 }
 
 // C2: display-aspect override. It only affects the CPU-side viewport/letterbox math in
-// set_uniforms (framepack per-eye fit) and present (2D target aspect), not the cbuffer,
-// so there is no GPU write here — just a mutex-guarded store, mirroring how set_plane_scale
-// serializes against the geometry readers.
+// set_uniforms (framepack per-eye fit) and present (every main-window layout), not the
+// cbuffer, so there is no GPU write here — just a mutex-guarded store, mirroring how
+// set_plane_scale serializes against the geometry readers.
 void NativeRenderer::set_source_aspect(float aspect) {
     if (!impl_) { aspect_ = aspect; return; }
     std::lock_guard<std::mutex> lk(impl_->mtx);
     aspect_ = aspect;
+}
+
+void NativeRenderer::set_video_time_ms(double video_time_ms) {
+    const double value =
+        std::isfinite(video_time_ms) && video_time_ms >= 0.0
+            ? video_time_ms : -1.0;
+    if (!impl_) { video_time_ms_ = value; return; }
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    video_time_ms_ = value;
 }
 
 void NativeRenderer::set_uniforms(int stereo_mode, int subtitle_enabled,
@@ -567,8 +585,16 @@ void NativeRenderer::set_uniforms(int stereo_mode, int subtitle_enabled,
 void NativeRenderer::clear_frame() {
     // C2: reset the display-aspect override so a subsequent full/MVC/2D source derives its
     // aspect from planes again (the widget/player also re-sets it per frame).
-    if (impl_) { std::lock_guard<std::mutex> lk(impl_->mtx); has_frame_ = false; aspect_ = 0.0f; }
-    else { has_frame_ = false; aspect_ = 0.0f; }
+    if (impl_) {
+        std::lock_guard<std::mutex> lk(impl_->mtx);
+        has_frame_ = false;
+        aspect_ = 0.0f;
+        video_time_ms_ = -1.0;
+    } else {
+        has_frame_ = false;
+        aspect_ = 0.0f;
+        video_time_ms_ = -1.0;
+    }
 }
 
 void NativeRenderer::pause() {
@@ -608,6 +634,27 @@ bool NativeRenderer::present(uint32_t sync_interval) {
     if (!impl_->rtv && !create_rtv_for_backbuffer()) return false;
 
     ID3D11DeviceContext* ctx = impl_->context.Get();
+
+    // synth3d (2D->3D): run the depth-prep / readback / warp passes BEFORE any display
+    // state is set. process() binds its own render targets, viewport, shaders, sampler,
+    // constant buffer and resources — every one of which the display path below re-sets
+    // — so the only thing it must leave clean is the OM stage, which it unbinds itself.
+    // A false return (no depth yet, a creation failure) leaves the untouched source
+    // SRVs bound: the 2D picture keeps playing, it never waits for depth.
+    bool synth_ok = false;
+    if (has_frame_ && pipeline_ready_ && impl_->synth3d && impl_->synth3d_params.enabled) {
+        ID3D11ShaderResourceView* src[3] = { impl_->srv[1].Get(), impl_->srv[2].Get(),
+                                             impl_->srv[3].Get() };
+        if (src[0] && src[1] && src[2]) {
+            synth_ok = impl_->synth3d->process(
+                ctx, src, impl_->tex_w[1], impl_->tex_h[1], impl_->tex_w[2], impl_->tex_h[2],
+                impl_->tex_fmt[1] == TexFormat::R16 ? DXGI_FORMAT_R16_UNORM
+                                                    : DXGI_FORMAT_R8_UNORM,
+                impl_->cb.plane_scale, impl_->cb.yuv_matrix_sel,
+                impl_->cb.transfer_sel, video_time_ms_);
+        }
+    }
+
     ID3D11RenderTargetView* rtv = impl_->rtv.Get();
     ctx->OMSetRenderTargets(1, &rtv, nullptr);
     const float black[4] = { 0.f, 0.f, 0.f, 1.f };
@@ -623,13 +670,16 @@ bool NativeRenderer::present(uint32_t sync_interval) {
         // aspect mismatch, e.g. a 1921-wide window on 16:9 content) to FULL FILL removes
         // the band entirely; any genuine >=2px letterbox/pillarbox is kept and centered
         // symmetrically (an odd leftover puts the extra pixel on the right/bottom).
-        float target_aspect;
-        if (stereo_mode_ == 1)       target_aspect = 1920.0f / 2205.0f;
-        // C2: 2D uses the display-aspect override when set (half-SBS/half-TAB base eye is
-        // squeezed), else derives it from the uploaded plane dimensions.
-        else if (stereo_mode_ == 0)  target_aspect = (aspect_ > 0.0f ? aspect_
-                                                       : (src_h_ ? float(src_w_) / float(src_h_) : 1920.0f / 1080.0f));
-        else                         target_aspect = 1920.0f / 1080.0f;
+        // FramePack has a physical 1920x2205 transport canvas. Every main-window
+        // layout (2D/SBS/TAB), however, inherits the SOURCE display aspect: a
+        // synthesized 2.39:1 movie remains 2.39:1 instead of being forced into
+        // 16:9 merely because its two eyes are arranged side-by-side or stacked.
+        const float source_aspect =
+            aspect_ > 0.0f ? aspect_
+                           : (src_h_ ? float(src_w_) / float(src_h_)
+                                     : 1920.0f / 1080.0f);
+        const float target_aspect =
+            stereo_mode_ == 1 ? 1920.0f / 2205.0f : source_aspect;
 
         D3D11_VIEWPORT vp = {};
         vp.MinDepth = 0.f; vp.MaxDepth = 1.f;
@@ -674,6 +724,22 @@ bool NativeRenderer::present(uint32_t sync_interval) {
         for (int i = 0; i < kNumTex; ++i) {
             srvs[i]  = impl_->srv[i].Get();         // may be null for unused stereo slots (not sampled)
             samps[i] = impl_->sampler.Get();
+        }
+        // synth3d: swap the six plane slots (t1..t6) for the synthesized stereo pair.
+        // t0 (subtitle) is untouched — the overlay is composited exactly as in 2D.
+        if (synth_ok) {
+            ID3D11ShaderResourceView* const* o = impl_->synth3d->output_srvs();
+            for (int i = 0; i < 6; ++i) srvs[1 + i] = o[i];
+        } else if (impl_->synth3d && impl_->synth3d_params.enabled) {
+            // Depth may be warming up, a newly-created presentation surface may
+            // not have uploaded the shared snapshot yet, or a warp pass may fail.
+            // The widget deliberately omits the duplicate source-right upload
+            // while synthesis is enabled. Alias L into R for this transitional
+            // frame so FramePack/SBS/TAB degrade to honest mono, never an
+            // uninitialised green eye.
+            srvs[4] = srvs[1];
+            srvs[5] = srvs[2];
+            srvs[6] = srvs[3];
         }
         ctx->PSSetShaderResources(0, kNumTex, srvs);
         ctx->PSSetSamplers(0, kNumTex, samps);
@@ -754,6 +820,19 @@ std::vector<std::vector<uint8_t>> NativeRenderer::cast_encode(int64_t pts_ms, bo
         impl_->srv[1].Get(), impl_->srv[2].Get(), impl_->srv[3].Get(),
         impl_->srv[4].Get(), impl_->srv[5].Get(), impl_->srv[6].Get(),
     };
+    // synth3d: cast exactly what the PC shows — the synthesized pair, not the 2D
+    // source. No process() here: this frame's present() already produced it (and
+    // running the warp twice per frame would double the GPU cost for nothing).
+    if (impl_->synth3d && impl_->synth3d_params.enabled && impl_->synth3d->outputs_valid()) {
+        ID3D11ShaderResourceView* const* o = impl_->synth3d->output_srvs();
+        for (int i = 0; i < 6; ++i) srv6[i] = o[i];
+    } else if (impl_->synth3d && impl_->synth3d_params.enabled) {
+        // Same warm-up/failure contract as present(): send mono duplicated to
+        // the headset rather than failing on the intentionally absent R upload.
+        srv6[3] = srv6[0];
+        srv6[4] = srv6[1];
+        srv6[5] = srv6[2];
+    }
     for (int i = 0; i < 6; ++i) {
         if (!srv6[i]) { last_error_ = "cast_encode: a YUV plane SRV is null (call set_yuv_frame first)"; return pkts; }
     }
@@ -845,9 +924,134 @@ void NativeRenderer::cast_stop() {
     impl_->cast.reset();
 }
 
+// ---------------------------------------------------------------------------
+// synth3d (2D->3D): AI depth + DIBR warp. See native_renderer.h.
+// Every method below takes impl_->mtx, so the GPU passes in present() and the
+// enable/parameter/debug calls from the GUI thread are serialized. Inference lives
+// in a process-cached service and never touches this renderer's D3D state.
+// ---------------------------------------------------------------------------
+bool NativeRenderer::set_synth3d(bool enabled, float strength_pct, float convergence,
+                                  bool depth_view, const std::wstring& model_path,
+                                  const std::wstring& ort_dir, bool diagnostics,
+                                  int side, int grid_width, int grid_height,
+                                  float crop_top, float crop_bottom) {
+    last_error_.clear();
+    if (!impl_) { last_error_ = "set_synth3d: no impl"; return false; }
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    if (!impl_->device) { last_error_ = "set_synth3d before initialize"; return false; }
+
+    if (!enabled) {
+        impl_->synth3d_params.enabled = false;
+        // Detach only. SharedDepthService remains warm in the process registry,
+        // therefore disabling can never wait for ORT under this renderer mutex.
+        if (impl_->synth3d) impl_->synth3d->request_stop();
+        return true;
+    }
+
+    Synth3DParams p;
+    p.enabled      = true;
+    p.strength_pct = strength_pct;
+    p.convergence  = convergence;
+    p.depth_view   = depth_view;
+    p.diagnostics  = diagnostics;
+    p.model_path   = model_path;
+    p.ort_dir      = ort_dir;
+    p.side         = side > 0 ? side : kDefaultDepthSide;
+    if (grid_width > 0 && grid_height > 0) {
+        p.grid_width = grid_width;
+        p.grid_height = grid_height;
+    }
+    p.crop_top = std::clamp(crop_top, 0.0f, 1.0f);
+    p.crop_bottom = std::clamp(crop_bottom, 0.0f, 1.0f);
+    if (p.crop_top + p.crop_bottom >= 0.95f) {
+        p.crop_top = 0.0f;
+        p.crop_bottom = 0.0f;
+    }
+
+    if (!impl_->synth3d) impl_->synth3d = std::make_unique<Synth3D>();
+    std::string err;
+    if (!impl_->synth3d->start(impl_->device.Get(), p, err)) {
+        last_error_ = "set_synth3d: " + err;
+        impl_->synth3d_params.enabled = false;
+        return false;
+    }
+    impl_->synth3d_params = p;
+    return true;
+}
+
+std::string NativeRenderer::synth3d_status() const {
+    // BYTE-IDENTICAL to the off line Synth3D::status() returns (synth3d.cpp):
+    // nothing is attached, so there is no inference grid and side= reads 0.
+    // Any field added to one of these two lines MUST be added to the other.
+    static const char* kOff =
+        "state=off provider=none side=0 fps=0.0 flow_ms=0.0 infer_ms=0.0 "
+        "stab_ms=0.0 "
+        "source_ms=120.0 update_ms=120.0 age_ms=-1 clients=0 cuts=0 "
+        "motion=0.000 alpha=0.000 stable=0.000 history=1.00 scene=0.000 "
+        "crop=0:0:0:0 crop_conf=0.00 grid=0x0 err=-";
+    if (!impl_) return kOff;
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    if (!impl_->synth3d || !impl_->synth3d_params.enabled) return kOff;
+    return impl_->synth3d->status();
+}
+
+void NativeRenderer::synth3d_notify_seek() {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    if (!impl_->synth3d) return;   // no pipeline yet: nothing to re-prime
+    impl_->synth3d->notify_seek();
+}
+
+void NativeRenderer::synth3d_set_ramp_ms(float ramp_ms) {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    if (!impl_->synth3d) return;   // no pipeline yet: nothing to configure
+    impl_->synth3d->set_ramp_ms(ramp_ms);
+}
+
+bool NativeRenderer::synth3d_set_test_depth(const uint16_t* q16_or_null,
+                                            size_t count) {
+    if (!impl_) return true;
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    // No pipeline: nothing to arm and nothing read from q16 -- the historic
+    // no-op, reported as success. The size check below happens under THIS lock,
+    // together with the copy, so the grid cannot change between them.
+    if (!impl_->synth3d) return true;
+    return impl_->synth3d->set_test_depth(q16_or_null, count);
+}
+
+int NativeRenderer::synth3d_side() const {
+    if (!impl_) return 0;
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    return impl_->synth3d ? impl_->synth3d->side() : 0;
+}
+
+int NativeRenderer::synth3d_grid_width() const {
+    if (!impl_) return 0;
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    return impl_->synth3d ? impl_->synth3d->grid_width() : 0;
+}
+
+int NativeRenderer::synth3d_grid_height() const {
+    if (!impl_) return 0;
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    return impl_->synth3d ? impl_->synth3d->grid_height() : 0;
+}
+
+bool NativeRenderer::synth3d_read_plane(int slot, std::vector<uint8_t>& out, uint32_t& w,
+                                        uint32_t& h, uint32_t& bpp, std::string& err) {
+    if (!impl_ || !impl_->context) { err = "synth3d_read_plane: not initialized"; return false; }
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    if (!impl_->synth3d) { err = "synth3d_read_plane: synth3d not enabled"; return false; }
+    return impl_->synth3d->read_plane(impl_->context.Get(), slot, out, w, h, bpp, err);
+}
+
 void NativeRenderer::shutdown() {
     if (!impl_) return;
     std::lock_guard<std::mutex> lk(impl_->mtx);
+    // Detach from the process-wide service before releasing device-local resources.
+    // stop() is non-blocking: the cached service owns the ORT worker.
+    if (impl_->synth3d) impl_->synth3d->stop();
     if (impl_->context) impl_->context->ClearState();
     // SyLC Cast: tear down the NVENC session + packer BEFORE releasing the device they
     // were created on. Inlined (not cast_stop(), which re-locks the non-recursive mutex).
@@ -858,6 +1062,10 @@ void NativeRenderer::shutdown() {
         impl_->cast->packer.shutdown();
         impl_->cast.reset();
     }
+    // synth3d: the worker is already joined (above); destroy the object so its D3D
+    // resources are released BEFORE the device they were created on.
+    impl_->synth3d.reset();
+    impl_->synth3d_params = Synth3DParams{};
     for (int i = 0; i < kNumTex; ++i) { impl_->srv[i].Reset(); impl_->tex[i].Reset(); }
     impl_->raster.Reset(); impl_->sampler.Reset(); impl_->cbuffer.Reset();
     impl_->vbuffer.Reset(); impl_->input_layout.Reset();
@@ -865,6 +1073,7 @@ void NativeRenderer::shutdown() {
     impl_->rtv.Reset(); impl_->swapchain.Reset();
     impl_->context.Reset(); impl_->device.Reset();
     hdr_enabled_ = false; pipeline_ready_ = false; has_frame_ = false;
+    video_time_ms_ = -1.0;
     hwnd_ = 0;   // forget the window; a later initialize() rebinds to the current HWND
 }
 

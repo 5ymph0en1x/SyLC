@@ -510,6 +510,24 @@ if(BUILD_NATIVE_RENDERER)
     # into one NV12 3840x1080 SBS texture (the NVENC input). HLSL compiled at runtime via
     # d3dcompiler (already linked below), same idiom as native_renderer.cpp.
     target_sources(mvc_demuxer_cpp PRIVATE src/sbs_nv12_packer.cpp)
+    # synth3d (2D->3D): ONNX Runtime depth inference wrapper. ORT is dynamic-loaded
+    # at runtime (LoadLibraryExW + GetProcAddress) -- no onnxruntime.lib is linked,
+    # only the vendored C API headers are compiled in (see depth_engine.cpp).
+    target_sources(mvc_demuxer_cpp PRIVATE src/depth_engine.cpp)
+    # synth3d: temporal depth stabilizer (fit scale/shift + EMA + scene-cut snap
+    # + percentile normalization). Pure C++ math, no ORT/D3D dependency.
+    target_sources(mvc_demuxer_cpp PRIVATE src/depth_stabilizer.cpp)
+    # One process-wide inference/stabilization service shared by every renderer
+    # surface. GPU warp resources remain device-local; the immutable depth map
+    # and ORT session do not.
+    target_sources(mvc_demuxer_cpp PRIVATE src/shared_depth_service.cpp)
+    # synth3d: the GPU half -- side^2 depth-prep pass (side = the depth preset's
+    # inference grid), non-blocking staging readback ring, inference worker thread
+    # (DepthEngine + DepthStabilizer), depth upload and
+    # the DIBR warp / depth-view passes. HLSL compiled at runtime via d3dcompiler
+    # (already linked below) from the generated src/synth3d_shaders.h.
+    target_sources(mvc_demuxer_cpp PRIVATE src/synth3d.cpp)
+    target_include_directories(mvc_demuxer_cpp PRIVATE third_party/onnxruntime/include)
     target_compile_definitions(mvc_demuxer_cpp PRIVATE SYLC_NATIVE_RENDERER)
     # Windows SDK (MSVC) and MinGW both resolve these to the system D3D libs.
     # d3dcompiler is used to compile the embedded HLSL at runtime (S2+).
