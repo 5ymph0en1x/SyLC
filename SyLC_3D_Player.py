@@ -325,6 +325,34 @@ _TRACK_CODEC_NAMES = {
 }
 _TRACK_CHANNELS = {1: 'Mono', 2: 'Stereo', 3: '2.1', 6: '5.1', 7: '6.1', 8: '7.1'}
 
+# The VU meter's astats filter, attached once per mpv instance by _ensure_vu_af.
+#
+# The measure_* restrictions are LOAD-BEARING, not tidiness. Without them astats
+# computes its full statistic set -- bit depth, DC offset, crest/flat factors,
+# entropy, dynamic range, zero crossings, ~30 measures -- FOR EVERY CHANNEL, and
+# `reset=1` makes it redo all of that every frame. on_vu_metadata reads exactly
+# four values out of that: RMS_level and Peak_level for channels 1 and 2.
+#
+# On stereo and 5.1 the waste is invisible. On a lossless TrueHD 7.1 track --
+# 8 channels of s32 at 48 kHz -- it stalls mpv's audio filter chain outright.
+# Measured on No Time To Die (TrueHD 7.1) after a seek to 600 s, sampling
+# time-pos every 250 ms for 8 s:
+#
+#   TrueHD 7.1, no filter                  0 stalls / 31   (baseline)
+#   TrueHD 7.1, unrestricted astats        8 stalls / 26   <-- ~1 s on, ~1 s off
+#   TrueHD 7.1, this filter                0 stalls / 31
+#   AC3 5.1,    unrestricted astats        0 stalls / 31   (why it looked 7.1-only)
+#
+# The restricted form also more than doubled the meter's update rate (79 -> 174
+# callbacks in the same window), because the chain no longer stalls.
+#
+# If a future meter needs another statistic, add it HERE as well as in
+# on_vu_metadata -- tests/test_vu_filter.py pins the two equal so they cannot
+# drift apart, which is the failure this comment exists to prevent.
+VU_ASTATS_FILTER = ('@vu:lavfi=[astats=metadata=1:reset=1'
+                    ':measure_perchannel=Peak_level+RMS_level'
+                    ':measure_overall=none]')
+
 
 def _humanize_lang(code):
     if not code:
@@ -7386,6 +7414,7 @@ class PlayerWindow(QMainWindow):
 
     # ===================== Audio VU meter =====================
     def _ensure_vu_af(self):
+        # See VU_ASTATS_FILTER for why the measure_* restrictions are load-bearing.
         """Attach the astats audio filter (label 'vu') so af-metadata/vu exposes
         per-channel RMS/peak for the on_vu_metadata observer. Called ONCE per mpv
         instance from _setup_observers (a controlled init point — mpv idle, no file
@@ -7396,7 +7425,7 @@ class PlayerWindow(QMainWindow):
         try:
             chain = self.player._get_property('af') or []
             if not any(isinstance(f, dict) and f.get('label') == 'vu' for f in chain):
-                self.player.command('af', 'add', '@vu:lavfi=[astats=metadata=1:reset=1]')
+                self.player.command('af', 'add', VU_ASTATS_FILTER)
         except Exception:
             pass
 
