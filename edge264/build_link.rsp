@@ -1,0 +1,12 @@
+-shared
+-O3
+-static-libgcc
+-Wl,--export-all-symbols
+-o
+edge264_candidate.dll
+e264_base.o
+e264_v2.o
+e264_v3.o
+-Wl,-Bstatic
+-lwinpthread
+-Wl,-Bdynamic

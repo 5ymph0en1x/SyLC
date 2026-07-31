@@ -1,0 +1,13 @@
+-std=gnu17
+-O3
+-fno-strict-aliasing
+-flax-vector-conversions
+-march=x86-64-v3
+-DADD_VARIANT(f)=f##_v3
+-include
+src/edge264_internal.h
+-Isrc
+-c
+src/edge264_headers.c
+-o
+e264_v3.o

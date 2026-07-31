@@ -1,0 +1,11 @@
+-std=gnu17
+-O3
+-fno-strict-aliasing
+-flax-vector-conversions
+-DHAS_X86_64_V2
+-DHAS_X86_64_V3
+-Isrc
+-c
+src/edge264.c
+-o
+e264_base.o
