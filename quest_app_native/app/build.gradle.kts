@@ -20,8 +20,13 @@ android {
         // 26, while the Meta Spatial and androidx.xr AARs merge happily as low
         // as 24. Quest 3 runs Android 12+, so nothing about it changes.
         minSdk = 26
-        targetSdk = 36
-        versionCode = 4
+        // 34, not 36: Horizon OS accepts 32-36 for a 2D panel app but only
+        // 32-34 for an immersive one, and QuestStereoActivity makes this an
+        // immersive app. The store rejects the upload above 34. Nothing here
+        // needs an API above 34; compileSdk stays at 36 so the newer AndroidX
+        // artifacts still compile.
+        targetSdk = 34
+        versionCode = 5
         versionName = "1.3"
     }
 
@@ -44,6 +49,15 @@ android {
 
     buildTypes {
         release {
+            // Horizon OS is arm64-only, so the armeabi-v7a / x86 / x86_64
+            // slices the Meta Spatial, ARCore and androidx.xr AARs contribute
+            // are pure download weight on every device that can run this app
+            // (the store flags the 32-bit ones outright). Filtering on the
+            // release build only keeps x86_64 available in debug, which is what
+            // the Android XR emulator needs to load those same libraries.
+            ndk {
+                abiFilters += "arm64-v8a"
+            }
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             // The release keystore is NOT distributed (it asserts update

@@ -8,9 +8,18 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!--
+        required="true" is a Horizon Store gate, not a device gate: an APK that
+        declares BOUNDARYLESS_APP is rejected at upload unless 6DoF headtracking
+        is declared required. Phones are unaffected — <uses-feature> filters
+        store listings, it is never enforced by the package installer, so the
+        same APK still sideloads on a phone (minSdk is the only real install
+        gate, see build.gradle.kts).
+    -->
     <uses-feature
         android:name="android.hardware.vr.headtracking"
-        android:required="false" />
+        android:version="1"
+        android:required="true" />
     <uses-feature
         android:name="com.oculus.feature.BOUNDARYLESS_APP"
         android:required="false" />
@@ -20,9 +29,16 @@
     <uses-feature
         android:name="android.software.xr.api.spatial"
         android:required="false" />
+    <!--
+        The store validator reads the declared graphics API off the required
+        features only; with required="false" it reported "neither a Vulkan
+        version nor a GLES version". GLES 3.1 is the floor the Spatial SDK
+        compositor is driven at here, and Android ignores `required` for
+        glEsVersion anyway, so this changes nothing at runtime.
+    -->
     <uses-feature
         android:glEsVersion="0x00030001"
-        android:required="false" />
+        android:required="true" />
 
     <application
         android:allowBackup="true"
@@ -45,9 +61,18 @@
             android:name="libossdk.oculus.so"
             android:required="false" />
 
+        <!--
+            singleTask is mandatory for every MAIN activity on Horizon OS (the
+            store rejects `standard`), and it is what the headset does anyway:
+            relaunching from the panel resumes this instance instead of stacking
+            a second one. Nothing here reads the launch Intent, and the stereo
+            re-entry flag is re-armed in onResume, so the reused instance is
+            equivalent to a fresh one.
+        -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:configChanges="orientation|keyboardHidden|screenSize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
