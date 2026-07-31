@@ -43,6 +43,9 @@ def split_packed_stereo(planes, mode):
 
 class HevcDecodeThread(QThread):
     frameYUVReady = Signal(object, object)
+    # Exact per-frame PTS for content-temporal consumers. The legacy two-arg
+    # signal remains available to callers that only need pixels.
+    frameYUVTimedReady = Signal(object, object, object)  # (left, right, pts_ms)
     endOfStream = Signal()
     decodeFailed = Signal(str)
     # Position of the frame just emitted, in SECONDS, throttled to ~4 Hz.
@@ -258,6 +261,7 @@ class HevcDecodeThread(QThread):
                         _m_master_lo = None
                         _m_master_hi = None
                 self.frameYUVReady.emit(left, right)
+                self.frameYUVTimedReady.emit(left, right, float(pts_ms))
                 # Timeline feed: throttled (250 ms of pts progress, or any
                 # backward jump = seek) so the GUI never sees a per-frame storm.
                 if pts_ms >= 0 and (last_pos_emit_ms is None

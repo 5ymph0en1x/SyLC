@@ -31,6 +31,10 @@ import os
 import re
 import struct
 
+from synth3d_aspect import (
+    MIN_NATIVE_WIDE_RATIO,
+    select_installed_aspect_model,
+)
 from stereo_eye_order import (
     LEFT_FIRST, RIGHT_FIRST, UNKNOWN, classify_stereo_value,
     eye_order_from_stereo_value, normalise_eye_order,
@@ -290,7 +294,7 @@ except ImportError as e:
 print("[STARTUP] Base imports succeeded")
 
 os.environ["PATH"] = os.path.dirname(__file__) + os.pathsep + os.environ["PATH"]
-from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QRectF, QPointF, Slot, QEvent, QObject, QThread
+from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QRectF, QPointF, Slot, QEvent, QObject, QThread, QSettings
 from PySide6.QtGui import QPainter, QColor, QFont, QFontMetrics, QPen, QBrush, QPainterPath, QBitmap, QImage, QPixmap, QIcon, QCursor
 
 
@@ -603,6 +607,194 @@ try:
 except Exception:
     NATIVE_RENDER_AVAILABLE = False
 print(f"[STARTUP] NATIVE_RENDER_AVAILABLE = {NATIVE_RENDER_AVAILABLE}")
+
+
+# =============================================================================
+# 2D->3D AI DEPTH PRESETS — (model candidates, inference grid) pairs
+# =============================================================================
+# Display order in the AI menu AND the inter-preset fallback order.
+#
+# Each entry pairs its candidate models with the square inference grid those
+# graphs were exported for, and the two ALWAYS travel together from here to
+# NativeRenderer.set_synth3d(..., side=): the grid is part of the shared depth
+# service's cache key and of the ONNX graph's own fixed input shape, so a model
+# opened against a service built for another grid is rejected by DepthEngine —
+# after having already paid for a full ORT session build. Nothing downstream
+# re-derives the grid from a filename, a resolution or a default, which is what
+# makes that mismatch unreachable rather than merely unlikely.
+#
+# Candidates within one preset are therefore SAME-SIDE only. `da3_small.onnx` is
+# the round-2 dynamic-axes export (no grid in its name because it accepts any),
+# kept last in the Quality chain so an install directory holding only that file
+# still works. A preset with no candidate on disk is greyed out in the menu, and
+# if it is somehow the active one the resolution walks this order from the top —
+# each preset with ITS OWN grid, so however far down it lands the pair is still
+# one entry's.
+SYNTH3D_DEPTH_PRESETS = (
+    ("Quality",     ("da3_base_756.onnx", "da3_small_756.onnx",
+                     "da3_small.onnx"),                          756),
+    ("Balanced",    ("da3_base_518.onnx", "da3_small_518.onnx"),  518),
+    ("Performance", ("da3_small_518.onnx",),                      518),
+)
+SYNTH3D_DEPTH_PRESET_DEFAULT = SYNTH3D_DEPTH_PRESETS[0][0]
+# Fixed adaptive graphs shipped outside the user-facing square preset table.
+# The selector itself discovers compatible HxW files generically; this literal
+# is the offline TensorRT engine-probe/packaging contract and is pinned in tests.
+SYNTH3D_ADAPTIVE_MODEL_GRIDS = (
+    ("da3_base_756x406.onnx", 756, 406),
+    ("da3_base_756x378.onnx", 756, 378),
+    ("da3_base_756x350.onnx", 756, 350),
+    ("da3_base_756x322.onnx", 756, 322),
+    ("da3_small_756x406.onnx", 756, 406),
+    ("da3_small_756x378.onnx", 756, 378),
+    ("da3_small_756x350.onnx", 756, 350),
+    ("da3_small_756x322.onnx", 756, 322),
+    ("da3_base_518x280.onnx", 518, 280),
+    ("da3_base_518x266.onnx", 518, 266),
+    ("da3_base_518x238.onnx", 518, 238),
+    ("da3_base_518x210.onnx", 518, 210),
+    ("da3_small_518x280.onnx", 518, 280),
+    ("da3_small_518x266.onnx", 518, 266),
+    ("da3_small_518x238.onnx", 518, 238),
+    ("da3_small_518x210.onnx", 518, 210),
+)
+
+# The preset choice is a per-user preference that must survive a restart, so it
+# lives in QSettings rather than in the JSON app-settings file (which holds the
+# per-session playback tuning). Organization/application are passed explicitly
+# so the lookup works without a configured QCoreApplication.
+SYNTH3D_SETTINGS_ORG = "SyLC"
+SYNTH3D_SETTINGS_APP = "SyLC3DPlayer"
+SYNTH3D_DEPTH_PRESET_KEY = "synth3d/depth_preset"
+
+
+# The directory this module was loaded from. Under Nuitka standalone it is the
+# dist directory, which is also where sys.argv[0] lives -- the two collapse and
+# the de-duplication below drops the repeat. In a dev checkout run from another
+# working directory they differ, and this is the one that finds models/.
+_SOURCE_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def sylc_user_data_dir():
+    """Per-user writable directory. The install directory is the preferred home
+    for models, but a copy unzipped under Program Files is not writable, and a
+    4.6 GB download must not fail on that."""
+    base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+    return os.path.join(base, 'SyLC')
+
+
+def sylc_models_download_dir():
+    """Where the in-app downloader writes: next to the executable when that is
+    writable, otherwise the per-user directory. Both are searched by
+    _synth3d_models_dirs(), so either choice resolves afterwards."""
+    beside_exe = os.path.join(
+        os.path.dirname(os.path.abspath(sys.argv[0])), 'models')
+    try:
+        os.makedirs(beside_exe, exist_ok=True)
+        probe = os.path.join(beside_exe, '.write_probe')
+        with open(probe, 'wb'):
+            pass
+        os.remove(probe)
+        return beside_exe
+    except OSError:
+        return os.path.join(sylc_user_data_dir(), 'models')
+
+
+def _synth3d_models_dirs():
+    """The directories searched for depth models, in order: next to the running
+    executable, the source tree this module came from (a dev checkout run from
+    elsewhere), then the per-user directory the in-app downloader falls back to
+    when the install directory is read-only.
+
+    Order matters: an install-directory copy must win over a stale per-user one
+    left behind by an earlier version.
+    """
+    base = os.path.dirname(os.path.abspath(sys.argv[0]))
+    candidates = (os.path.join(base, 'models'),
+                  os.path.join(_SOURCE_ROOT, 'models'),
+                  os.path.join(sylc_user_data_dir(), 'models'))
+    seen, ordered = set(), []
+    for directory in candidates:
+        key = os.path.normcase(os.path.abspath(directory))
+        if key not in seen:
+            seen.add(key)
+            ordered.append(directory)
+    return tuple(ordered)
+
+
+def synth3d_find_model(candidates):
+    """First candidate present on disk, or None. Preference order is the
+    caller's; each candidate is looked for in both model directories."""
+    for models_dir in _synth3d_models_dirs():
+        for name in candidates:
+            path = os.path.join(models_dir, name)
+            if os.path.exists(path):
+                return path
+    return None
+
+
+def synth3d_depth_preset_entry(name):
+    """The (name, candidates, side) entry called `name`, or None."""
+    for entry in SYNTH3D_DEPTH_PRESETS:
+        if entry[0] == name:
+            return entry
+    return None
+
+
+def synth3d_depth_preset_available(name):
+    """True iff at least one of this preset's own models is installed. Drives
+    the menu's greying: selecting a preset with nothing behind it would silently
+    resolve to another grid."""
+    entry = synth3d_depth_preset_entry(name)
+    return bool(entry) and synth3d_find_model(entry[1]) is not None
+
+
+def synth3d_depth_preset_stored():
+    """The persisted preset name, validated against the table.
+
+    Read on every resolution rather than cached: the value is a single QSettings
+    lookup, and a cache would have to be invalidated from the setter, from a
+    second window and (in tests) between cases.
+    """
+    try:
+        stored = QSettings(SYNTH3D_SETTINGS_ORG, SYNTH3D_SETTINGS_APP).value(
+            SYNTH3D_DEPTH_PRESET_KEY, SYNTH3D_DEPTH_PRESET_DEFAULT)
+    except Exception:
+        logger.warning("[2D3D] could not read the persisted depth preset",
+                       exc_info=True)
+        return SYNTH3D_DEPTH_PRESET_DEFAULT
+    name = str(stored) if stored is not None else ''
+    # An unknown name (hand-edited setting, a preset dropped by a later
+    # version) must not leave synthesis pointing at nothing.
+    return name if synth3d_depth_preset_entry(name) else SYNTH3D_DEPTH_PRESET_DEFAULT
+
+
+def synth3d_marker_attests(marker, model_path):
+    """True iff a `.trt_verified` marker covers the graph about to be opened.
+
+    TensorRT's engine cache is keyed PER GRAPH, so a marker written for
+    `da3_base_756.onnx` says nothing about a 518 preset: opening one against
+    that runtime would pay a full cold engine compile on the first in-playback
+    enable — minutes — which is exactly the wait the offline probe exists to
+    absorb, and this feature never builds an engine during playback.
+
+    A marker that names NO graph (unreadable, or written by a probe from before
+    model names were recorded) attests the directory as a whole, as it did in
+    round 3: its presence still proves a real engine build succeeded against
+    these DLLs, which is what guards against the hard native abort an
+    incomplete TensorRT assembly causes. Absent information is not negative
+    information — the per-graph refinement applies only once the probe has said
+    which graphs it built.
+    """
+    try:
+        with open(marker, 'r', encoding='utf-8', errors='replace') as f:
+            probed = [line.split('=', 1)[1].strip() for line in f
+                      if line.startswith('probe_model=')]
+    except OSError:
+        return True
+    if not probed:
+        return True
+    return os.path.basename(model_path).lower() in {n.lower() for n in probed}
 
 
 # =============================================================================
@@ -2435,7 +2627,21 @@ class MVHEVCExportDialog(QDialog):
 # is built mid-playback: the same four attributes _try_start_hevc writes on the
 # embedded/framepack pair at load time.
 _EYE_INHERITED_RENDER_PARAMS = ('plane_scale', 'source_aspect',
-                                'yuv_matrix_sel', 'transfer_sel')
+                                'yuv_matrix_sel', 'transfer_sel',
+                                'synth3d_enabled', 'synth3d_strength',
+                                'synth3d_convergence', 'synth3d_depth_view',
+                                'synth3d_diagnostics',
+                                # `synth3d_side` MUST stay next to
+                                # `synth3d_model_path`: they are one preset entry's
+                                # (model, grid) pair, and an eye window seeded with
+                                # the model but not the grid would hand a 518 graph
+                                # to the renderer's default 756 service -- a named
+                                # DepthEngine rejection that kills synthesis on BOTH
+                                # projectors while the embedded preview keeps it.
+                                'synth3d_model_path', 'synth3d_ort_dir',
+                                'synth3d_side',
+                                'synth3d_grid_width', 'synth3d_grid_height',
+                                'synth3d_crop_top', 'synth3d_crop_bottom')
 
 
 def _select_stereo_presentation_targets(embedded, framepacking_window, active,
@@ -2636,7 +2842,34 @@ class PlayerWindow(QMainWindow):
         # V60: persisted per-install settings (currently: the A/V sync trim set
         # with [ and ] — re-applied to every new decoder thread).
         self._app_settings = self._load_app_settings()
-        
+
+        # 2D->3D AI synthesis (real-time depth-based stereo synthesis on the
+        # native decode path): state + persisted strength/convergence.
+        self._synth3d_active = False
+        try:
+            self._synth3d_strength = max(0.5, min(3.0,
+                float(self._app_settings.get('synth3d_strength_pct', 1.5))))
+            self._synth3d_convergence = max(0.0, min(1.0,
+                float(self._app_settings.get('synth3d_convergence', 0.5))))
+        except Exception:
+            self._synth3d_strength, self._synth3d_convergence = 1.5, 0.5
+        self._synth3d_depth_view = False
+        self._synth3d_diagnostics = False
+        # (absolute square-model path, square side, AspectSelection). Kept for
+        # the current medium so toggling AI off/on does not repeat detection;
+        # cleared on file or depth-preset changes.
+        self._synth3d_aspect_override = None
+        self._synth3d_aspect_unavailable_key = None
+        # True only inside _synth3d_set_depth_preset's toggle-off/toggle-on pair:
+        # tells _on_framepacking_visibility_changed that the framepack hide it is
+        # about to see is deliberate and momentary.
+        self._synth3d_rearming = False
+        self._synth3d_preset = str(
+            self._app_settings.get('synth3d_preset', 'custom')).lower()
+        if self._synth3d_preset not in {
+                'comfort', 'cinema', 'immersion', 'custom'}:
+            self._synth3d_preset = 'custom'
+
         # --- SEEK / SCRUBBING STATE ---
         # Standard "Seek on Release" logic to prevent decoder saturation
         self._is_scrubbing = False         # True while user is dragging the slider
@@ -2824,7 +3057,35 @@ class PlayerWindow(QMainWindow):
         # Fix: Position floating overlays on startup
         QTimer.singleShot(0, self._update_overlays_geometry)
 
+        # First launch on an empty models/ directory: name the action once,
+        # without a modal. Someone who opened the player to watch a Blu-ray
+        # should not be met by a 4.6 GB prompt.
+        QTimer.singleShot(2000, self._maybe_prompt_for_models)
+
         print("[STARTUP] PlayerWindow initialized successfully")
+
+    def _maybe_prompt_for_models(self):
+        try:
+            settings = QSettings(SYNTH3D_SETTINGS_ORG, SYNTH3D_SETTINGS_APP)
+            if settings.value("synth3d/models_prompted", False, type=bool):
+                return
+            manifest_path = self._synth3d_manifest_path()
+            if manifest_path is None:
+                return
+            import model_fetcher
+            manifest = model_fetcher.load_manifest(manifest_path)
+            for models_dir in _synth3d_models_dirs():
+                if any(s.installed for s in
+                       model_fetcher.pack_status(manifest, models_dir).values()):
+                    return
+            settings.setValue("synth3d/models_prompted", True)
+            settings.sync()
+            self.show_3d_notification(
+                "2D→3D AI: depth models not installed — see “Depth models” "
+                "at the top of the 2D→3D menu")
+        except Exception:
+            logger.warning("[2D3D] first-launch model prompt failed",
+                           exc_info=True)
 
     def _check_3d_vision_availability(self):
         """
@@ -3044,6 +3305,26 @@ class PlayerWindow(QMainWindow):
         self.controls_overlay.stereo_mode_changed.connect(self.change_stereo_mode)
         self.controls_overlay.audio_track_changed.connect(self.change_audio_track)
         self.controls_overlay.subtitle_track_changed.connect(self.change_subtitle_track)
+        # 2D->3D (AI) conversion (Task 8): sliders are single-purpose -- the
+        # *_preview signals (live, valueChanged) push without persisting;
+        # the *_changed signals (sliderReleased) are what persists to disk.
+        self.controls_overlay.synth3d_toggled.connect(self.toggle_synth3d)
+        self.controls_overlay.synth3d_depth_view_toggled.connect(self.set_synth3d_depth_view)
+        self.controls_overlay.synth3d_diagnostics_toggled.connect(
+            self.set_synth3d_diagnostics)
+        self.controls_overlay.synth3d_preset_selected.connect(
+            self.apply_synth3d_preset)
+        self.controls_overlay.synth3d_depth_preset_selected.connect(
+            self._synth3d_set_depth_preset)
+        self.controls_overlay.synth3d_download_models_requested.connect(
+            self._open_model_download_dialog)
+        self.controls_overlay.synth3d_strength_preview.connect(
+            lambda v: self.set_synth3d_strength(v, persist=False))
+        self.controls_overlay.synth3d_strength_changed.connect(self.set_synth3d_strength)
+        self.controls_overlay.synth3d_convergence_preview.connect(
+            lambda v: self.set_synth3d_convergence(v, persist=False))
+        self.controls_overlay.synth3d_convergence_changed.connect(self.set_synth3d_convergence)
+        self.controls_overlay.synth3d_menu.aboutToShow.connect(self._update_synth3d_menu_state)
         self.info_overlay.file_clicked.connect(self.open_file_dialog)
         self.controls_overlay.installEventFilter(self)
 
@@ -3354,6 +3635,7 @@ class PlayerWindow(QMainWindow):
                 self._subtitle_manager.on_seek()
             except Exception:
                 logger.exception("[SEEK] subtitle on_seek failed")
+        self._synth3d_notify_seek_widgets()
         if self._text_sub_active and self._text_subtitle_renderer:
             try:
                 self._text_subtitle_renderer.clear()
@@ -4521,7 +4803,7 @@ class PlayerWindow(QMainWindow):
 
     def toggle_3d_mode(self, enabled):
         """Enables or disables 3D mode."""
-        if enabled and not self._content_is_3d():
+        if enabled and not self._effective_3d():
             # 2D content: refuse 3D — toggling it mis-drives the MVC pipeline on a
             # plain 2D stream (runaway speed + audio desync). Keep the button off.
             try:
@@ -4560,7 +4842,13 @@ class PlayerWindow(QMainWindow):
         window's, and — in Dual Projector mode — each eye window's.
         Several call sites used to hardcode the first two as a pair, which
         silently excluded the eye windows from subtitles and from every
-        per-source render parameter."""
+        per-source render parameter.
+
+        Pushing through here is necessary but NOT sufficient: an eye window
+        built mid-playback never saw any of those pushes, so every per-source
+        attribute must ALSO be listed in `_EYE_INHERITED_RENDER_PARAMS` (see
+        `_seed_eye_window_params`). Adding one here and forgetting it there is
+        the same trap wearing a second face."""
         seen = set()
         windows = (getattr(self, 'framepacking_window', None),
                    *(getattr(self, 'eye_windows', None) or ()))
@@ -4595,7 +4883,8 @@ class PlayerWindow(QMainWindow):
         if (getattr(self, '_hevc_mode_active', False)
                 and getattr(self, 'hevc_thread', None)
                 and mode in ('sbs', 'tab')
-                and not _mvhevc):
+                and not _mvhevc
+                and not getattr(self, '_synth3d_active', False)):
             try:
                 self.hevc_thread.set_mode(mode)
                 # Keep the display aspect consistent when the source is half-packed: for
@@ -4612,6 +4901,13 @@ class PlayerWindow(QMainWindow):
                             pass
             except Exception:
                 pass
+        elif getattr(self, '_synth3d_active', False):
+            # During 2D->3D conversion SBS/TAB/MultiView are OUTPUT layouts.
+            # They must never be forwarded to the HEVC decoder as INPUT layouts:
+            # doing so slices the genuine 2D source in half, and selecting
+            # MultiView later cannot undo it because that branch only accepted
+            # 'sbs'/'tab'. Reassert the mono-source invariant on every switch.
+            self._synth3d_restore_mono_source()
         if self.has_media and self.is_3d_enabled:
             self.configure_3d_output(True, mode)
 
@@ -4622,6 +4918,805 @@ class PlayerWindow(QMainWindow):
         if not info:
             return False
         return bool(info.get('is_3d')) or info.get('stereo_mode') not in (None, 'none')
+
+    def _effective_3d(self):
+        """3D presentation is justified: real 3D content OR AI synthesis active."""
+        return self._content_is_3d() or getattr(self, '_synth3d_active', False)
+
+    def _synth3d_supported(self):
+        # Expressed through the reason helper rather than beside it: two copies
+        # of the same three conditions would eventually disagree, and the one
+        # that disagrees is the one naming a cause in a tooltip.
+        return self._synth3d_unsupported_reason() is None
+
+    def _synth3d_unsupported_reason(self):
+        """Which of _synth3d_supported()'s three requirements is unmet, or None.
+
+        Every "unavailable" tooltip is an instruction in disguise, and the
+        instruction differs per cause: a missing onnxruntime.dll is NOT fixed by
+        downloading 3.67 GB of weights. Resolved in the same order the support
+        check applies them so the two can never disagree.
+        """
+        if not NATIVE_RENDER_AVAILABLE:
+            return 'renderer'
+        model, _side = self._synth3d_model_path()
+        if not os.path.exists(model):
+            return 'models'
+        if not os.path.exists(os.path.join(self._synth3d_ort_dir(model),
+                                           'onnxruntime.dll')):
+            return 'runtime'
+        return None
+
+    def _synth3d_depth_preset(self):
+        """Name of the active depth preset (persisted; default Quality)."""
+        return synth3d_depth_preset_stored()
+
+    def _synth3d_set_depth_preset(self, name):
+        """Persist a depth-preset choice and re-arm a running session on it.
+
+        The inference grid is baked into the shared depth service's key and into
+        the renderer's warp pipeline, so an in-flight session cannot be
+        re-pointed at another preset: it goes down and comes straight back up
+        through the ordinary toggle path, which re-resolves model+side and
+        rebuilds the ORT session with all the usual teardown, notification and
+        status-poll wiring. With synthesis idle there is nothing to re-arm and
+        the new choice simply applies to the next enable.
+        """
+        name = str(name)
+        if synth3d_depth_preset_entry(name) is None:
+            logger.warning("[2D3D] ignoring unknown depth preset %r", name)
+            return
+        if name == self._synth3d_depth_preset():
+            self._update_synth3d_menu_state()
+            return
+        self._synth3d_aspect_override = None
+        self._synth3d_aspect_unavailable_key = None
+        try:
+            settings = QSettings(SYNTH3D_SETTINGS_ORG, SYNTH3D_SETTINGS_APP)
+            settings.setValue(SYNTH3D_DEPTH_PRESET_KEY, name)
+            settings.sync()
+        except Exception:
+            logger.warning("[2D3D] could not persist depth preset %s", name,
+                           exc_info=True)
+        model, side = self._synth3d_model_path()
+        logger.info("[2D3D] depth preset %s -> %s side=%d", name,
+                    os.path.basename(model), side)
+        if getattr(self, '_synth3d_active', False):
+            # The off leg hides the framepack window for the few microseconds
+            # until the on leg re-shows it (both legs run synchronously on the
+            # GUI thread, so no frame can be delivered in between). That hide
+            # reaches _on_framepacking_visibility_changed, which would read it as
+            # a user close and tear the session down -- including auto-stopping
+            # an active cast. `_synth3d_rearming` is that handler's fourth
+            # "deliberate hide" reason, set ONLY around this pair. Keeping the
+            # live cast rather than restarting it also keeps the Quest attached:
+            # a stop/start drops the client and forces a re-discovery.
+            cast_transport = (self._cast_transport
+                              if getattr(self, '_cast', None) is not None
+                              else None)
+            self._synth3d_rearming = True
+            try:
+                self.toggle_synth3d(False)
+                self.toggle_synth3d(True)
+            finally:
+                self._synth3d_rearming = False
+            # Self-heal: should the session have died down some other teardown
+            # path, bring it back through the ordinary start path -- never by
+            # re-wiring a CastController by hand, that wiring is its own.
+            if cast_transport is not None and getattr(self, '_cast', None) is None:
+                logger.info("[CAST] restarting after the depth-preset re-arm (%s)",
+                            cast_transport)
+                self._on_cast_requested(cast_transport)
+        self.show_3d_notification(f"2D->3D depth preset: {name}")
+        self._update_synth3d_menu_state()
+
+    def _synth3d_depth_preset_tooltip(self, name):
+        """What an available depth preset will actually run: the model it
+        resolves to and the grid it infers on (the grid is the speed lever)."""
+        entry = synth3d_depth_preset_entry(name)
+        model = synth3d_find_model(entry[1]) if entry else None
+        if model is None:
+            return "model file not installed"
+        return f"{os.path.basename(model)} at {entry[2]}x{entry[2]}"
+
+    def _synth3d_model_path(self):
+        """(absolute model path, inference grid side) for the active preset.
+
+        Both come from ONE SYNTH3D_DEPTH_PRESETS entry and are returned
+        together: see that table's header for why the grid must never be
+        re-derived anywhere else.
+
+        Round 3's preference order lives on inside the Quality chain.
+        `da3_small_756.onnx` outranks `da3_small.onnx`: same DA3-SMALL weights,
+        but re-exported at a FIXED grid. The older onnx-community export
+        declares height/width as dynamic axes, so its position-embedding Resize
+        has no DirectML kernel and silently falls back to the CPU at ~229 ms for
+        that one node -- 342 ms per map versus 55 ms for the fixed-shape
+        re-export, measured.
+        """
+        entry = synth3d_depth_preset_entry(self._synth3d_depth_preset())
+        if entry is not None:
+            found = synth3d_find_model(entry[1])
+            if found:
+                return found, entry[2]
+        # The active preset has no export installed. Fall through to the Quality
+        # chain, which carries QUALITY's grid -- pairing the model we actually
+        # found with the grid that was asked for is the one mismatch this whole
+        # design exists to prevent.
+        #
+        # Spelled out as a literal rather than read back from
+        # SYNTH3D_DEPTH_PRESETS[0]: this is the last-resort chain, and it should
+        # keep working even if the preset table is ever reordered or emptied.
+        # That leaves a duplicate of Quality's candidates, which
+        # test_player_gating.py::test_quality_fallback_chain_in_the_source_matches_the_table
+        # pins equal to the table so the two cannot drift apart. (Round 3 had a
+        # second reason -- the engine-probe cross-check parsed this literal out
+        # of the source with `ast`. Round 4 retired that: test_trt_optin.py now
+        # compares setup_tensorrt.py's candidates against the whole preset table
+        # directly, models AND grids.)
+        quality = ('da3_base_756.onnx', 'da3_small_756.onnx', 'da3_small.onnx')
+        quality_side = 756
+        found = synth3d_find_model(quality)
+        if found:
+            return found, quality_side
+        # Quality's own exports are missing too (a partial models/ directory).
+        # Keep walking the display order -- which is also the inter-preset
+        # fallback order -- rather than reporting synthesis unsupported while a
+        # usable export sits on disk. Each preset is tried with ITS OWN grid, so
+        # the pair stays consistent however far down we go. Index 0 is Quality,
+        # already tried just above.
+        for _name, candidates, side in SYNTH3D_DEPTH_PRESETS[1:]:
+            found = synth3d_find_model(candidates)
+            if found:
+                return found, side
+        return os.path.join(_synth3d_models_dirs()[0], quality[0]), quality_side
+
+    def _synth3d_ort_dir(self, model_path=None):
+        """Directory whose onnxruntime.dll the depth engine will load.
+
+        `model_path` is the graph the caller is about to open: the marker is
+        checked for THAT graph (see synth3d_marker_attests -- TensorRT's engine
+        cache is per-graph, so attesting one model says nothing about another).
+        Naming no graph keeps the round-3 behaviour, presence and freshness
+        only; both real call sites resolve model+side once and pass the model
+        in, so a preset switch takes the runtime decision with it.
+        """
+        base = os.path.dirname(os.path.abspath(sys.argv[0]))
+        # Opt-in TensorRT runtime (see tools_dev/setup_tensorrt.py): preferred
+        # over the DirectML-only root whenever it is COMPLETE -- both
+        # onnxruntime.dll and at least one nvinfer*.dll must coexist there, so
+        # a half-populated staging leftover is never picked -- AND the
+        # `.trt_verified` marker must be present AND FRESH. That marker is
+        # written ONLY after a REAL engine build + inference actually
+        # succeeds (`setup_tensorrt.py --engine-probe`), never merely on DLL
+        # presence: an incomplete/incompatible TensorRT assembly can crash
+        # the whole process during a real engine build (a hard native abort,
+        # not a graceful error -- see task-4-report.md, "The crash"), and
+        # "playback never dies for 3D" means the player must never gamble on
+        # an unverified opt-in runtime. Freshness (fix round 1, F2): if any
+        # *.dll in the directory is newer than the marker, the DLLs were
+        # replaced (a rerun of setup_tensorrt.py, a manual SDK drop, ...)
+        # WITHOUT a matching --engine-probe rerun -- the marker's verification
+        # no longer describes what's actually on disk, so it must be treated
+        # as absent. (A driver/GPU change invalidating an otherwise-fresh
+        # marker is a narrower, less common case not handled here -- this
+        # closes the realistic path at acquisition time, not every path.)
+        # Checked next to the exe first, then the repo root -- the same
+        # two-root order as the DirectML fallback below.
+        for root in dict.fromkeys((base, _SOURCE_ROOT)):
+            trt_dir = os.path.join(root, 'ort_tensorrt')
+            marker = os.path.join(trt_dir, '.trt_verified')
+            if (os.path.exists(os.path.join(trt_dir, 'onnxruntime.dll'))
+                    and glob.glob(os.path.join(trt_dir, 'nvinfer*.dll'))
+                    and os.path.exists(marker)):
+                dlls = glob.glob(os.path.join(trt_dir, '*.dll'))
+                newest_dll_mtime = max((os.path.getmtime(p) for p in dlls), default=0.0)
+                if (os.path.getmtime(marker) >= newest_dll_mtime
+                        and (model_path is None
+                             or synth3d_marker_attests(marker, model_path))):
+                    return trt_dir
+        if os.path.exists(os.path.join(base, 'onnxruntime.dll')):
+            return base
+        return _SOURCE_ROOT
+
+    def _synth3d_trt_dir(self):
+        """The `ort_tensorrt` directory the opt-in TensorRT runtime lives in.
+
+        The CANDIDATE, not the runtime actually loaded. `_synth3d_ort_dir`
+        answers a different question -- which onnxruntime.dll to load -- and
+        falls back to the DirectML root, which has an onnxruntime.dll of its
+        own; describing that root as a half-installed TensorRT would be a false
+        statement about a perfectly good default install. Same two-root order
+        as `_synth3d_ort_dir`; when neither exists the answer is the one beside
+        the executable, because that is where an install would go.
+        """
+        roots = list(dict.fromkeys(
+            (os.path.dirname(os.path.abspath(sys.argv[0])), _SOURCE_ROOT)))
+        for root in roots:
+            candidate = os.path.join(root, 'ort_tensorrt')
+            if os.path.isdir(candidate):
+                return candidate
+        return os.path.join(roots[0], 'ort_tensorrt')
+
+    def _synth3d_eligible(self):
+        return ((getattr(self, 'mvc_mode_active', False)
+                 or getattr(self, '_hevc_mode_active', False))
+                and not self._content_is_3d() and bool(self.has_media))
+
+    def toggle_synth3d(self, enabled):
+        if enabled and not (self._synth3d_supported() and self._synth3d_eligible()):
+            self._synth3d_active = False
+            self.show_3d_notification(
+                "2D->3D AI needs a 2D video on the native decoder", success=False)
+            self._update_synth3d_menu_state()
+            return
+        self._synth3d_active = bool(enabled)
+        # A synth3d session only ever runs on 2D content (_synth3d_eligible requires
+        # `not self._content_is_3d()`), so this can never clobber a real-3D session.
+        # Without it, change_stereo_mode/_set_dual_projector_enabled's `is_3d_enabled`
+        # gate left every stereo-mode combo pick a silent no-op during synth3d.
+        self.is_3d_enabled = bool(enabled)
+        self._push_synth3d_to_widgets()
+        if enabled:
+            self._synth3d_restore_mono_source()
+            self.show_3d_notification("2D->3D AI active - depth model warming up")
+            logger.info("[2D3D] enabled strength=%.1f%% convergence=%.2f",
+                        self._synth3d_strength, self._synth3d_convergence)
+            # Keep the selector and the actual presentation in lockstep. 'auto'
+            # visually means MultiView (combo index 0); persisting a previous
+            # SBS/TAB/Dual choice is also legitimate and should be honoured.
+            presentation = getattr(self, 'current_stereo_mode', 'auto')
+            if presentation not in ('mvc', 'sbs', 'tab', 'dual'):
+                presentation = 'mvc'
+                self.current_stereo_mode = presentation
+            self.configure_3d_output(True, presentation)
+            # F2: replaces the old one-shot 2.5s _log_synth3d_status peek -- a
+            # single early log said nothing about a failure hours into playback.
+            self._synth3d_start_poll()
+        else:
+            self.show_3d_notification("2D->3D AI off")
+            self.configure_3d_output(False)
+            self._synth3d_stop_poll()
+        self._update_3d_button_state()
+        self._update_synth3d_menu_state()
+
+    def _synth3d_restore_mono_source(self):
+        """Keep a synthesized session's input as the original unsplit 2D frame.
+
+        Stereo-mode choices describe only how the generated L/R pair is shown.
+        They are never evidence that a 2D HEVC source suddenly became packed
+        SBS/TAB. Reset the display-aspect override too: the real mono plane
+        dimensions are again the sole source of truth.
+        """
+        thread = getattr(self, 'hevc_thread', None)
+        if getattr(self, '_hevc_mode_active', False) and thread is not None:
+            try:
+                thread.set_mode(None)
+            except Exception:
+                logger.exception("[2D3D] could not restore HEVC mono input mode")
+        for widget in self._display_widgets():
+            try:
+                widget.source_aspect = 0.0
+            except Exception:
+                pass
+
+    def _push_synth3d_to_widgets(self):
+        # Resolved once per push, not once per widget: both do a couple of
+        # os.path.exists calls, wasted work repeated identically for every
+        # widget on the (potential per-slider-tick) hot path.
+        model_path, side = self._synth3d_model_path()
+        base_key = os.path.normcase(os.path.abspath(model_path))
+        grid_width = grid_height = 0
+        crop_top = crop_bottom = 0.0
+        override = getattr(self, '_synth3d_aspect_override', None)
+        if override is not None:
+            override_model, override_side, selection = override
+            if (override_model == base_key and override_side == side
+                    and os.path.isfile(selection.model_path)):
+                model_path = selection.model_path
+                grid_width = selection.grid_width
+                grid_height = selection.grid_height
+                crop_top = selection.crop_top_norm
+                crop_bottom = selection.crop_bottom_norm
+            else:
+                # A model was removed/replaced or the active preset changed.
+                # Never retain a rectangular graph with the wrong base family.
+                self._synth3d_aspect_override = None
+        ort_dir = self._synth3d_ort_dir(model_path)
+        for w in self._display_widgets():
+            w.synth3d_enabled = self._synth3d_active
+            w.synth3d_strength = self._synth3d_strength
+            w.synth3d_convergence = self._synth3d_convergence
+            w.synth3d_depth_view = self._synth3d_depth_view
+            w.synth3d_diagnostics = self._synth3d_diagnostics
+            w.synth3d_model_path = model_path
+            w.synth3d_ort_dir = ort_dir
+            # Set next to the model it was resolved WITH, never anywhere else:
+            # the grid is half of the (model, side) pair SYNTH3D_DEPTH_PRESETS
+            # keeps together.
+            w.synth3d_side = side
+            w.synth3d_grid_width = grid_width
+            w.synth3d_grid_height = grid_height
+            w.synth3d_crop_top = crop_top
+            w.synth3d_crop_bottom = crop_bottom
+
+    @staticmethod
+    def _synth3d_status_fields(status):
+        fields = {}
+        for token in str(status or '').split():
+            if '=' in token:
+                key, value = token.split('=', 1)
+                fields[key] = value
+        return fields
+
+    def _maybe_apply_synth3d_aspect(self, status):
+        """Promote stable wide content to an installed rectangular graph.
+
+        Encoded mattes require eight agreeing depth observations.  A crop-free
+        source may promote immediately because its coded dimensions are stable;
+        a minimum native ratio prevents ordinary 16:9 video from doing so.
+        Once promoted, retain the choice for this medium.
+        """
+        if (not getattr(self, '_synth3d_active', False)
+                or getattr(self, '_synth3d_aspect_override', None) is not None):
+            return False
+        fields = self._synth3d_status_fields(status)
+        if fields.get('state') != 'running':
+            return False
+        try:
+            confidence = float(fields.get('crop_conf', '0'))
+            top, bottom, source_width, source_height = (
+                int(value) for value in fields.get('crop', '').split(':'))
+        except (TypeError, ValueError):
+            return False
+        if (source_width <= 0 or source_height <= 0
+                or top < 0 or bottom < 0):
+            return False
+        has_matte = top > 0 or bottom > 0
+        if has_matte:
+            if confidence < 0.999 or top <= 0 or bottom <= 0:
+                return False
+        elif source_width / float(source_height) < MIN_NATIVE_WIDE_RATIO:
+            return False
+
+        square_model, side = self._synth3d_model_path()
+        selection = select_installed_aspect_model(
+            square_model, side, source_width, source_height, top, bottom)
+        if selection is None:
+            miss_key = (os.path.normcase(os.path.abspath(square_model)), side,
+                        source_width, source_height, top, bottom)
+            if miss_key != getattr(self, '_synth3d_aspect_unavailable_key', None):
+                if has_matte:
+                    logger.info(
+                        "[2D3D] stable matte %d+%d on %dx%d; no compatible "
+                        "%d-wide rectangular export installed, keeping square grid",
+                        top, bottom, source_width, source_height, side)
+                else:
+                    logger.info(
+                        "[2D3D] native wide frame %dx%d (%.3f:1); no compatible "
+                        "%d-wide rectangular export installed, keeping square grid",
+                        source_width, source_height,
+                        source_width / float(source_height), side)
+                self._synth3d_aspect_unavailable_key = miss_key
+            return False
+
+        # TensorRT engines are per graph. A square service that is already on
+        # TensorRT must not silently fall back to DirectML just because the
+        # new rectangle has not yet been built/attested in .trt_verified.
+        # Keep the faster known-good square until setup_tensorrt.py has probed
+        # this exact rectangular graph.
+        candidate_runtime = self._synth3d_ort_dir(selection.model_path)
+        if (fields.get('provider', '').lower() == 'tensorrt'
+                and os.path.basename(os.path.normpath(
+                    candidate_runtime)).lower() != 'ort_tensorrt'):
+            miss_key = ('trt-unattested',
+                        os.path.normcase(os.path.abspath(selection.model_path)))
+            if miss_key != getattr(self, '_synth3d_aspect_unavailable_key', None):
+                logger.info(
+                    "[2D3D] %s is not attested by the current TensorRT marker; "
+                    "keeping the square TensorRT graph",
+                    os.path.basename(selection.model_path))
+                self._synth3d_aspect_unavailable_key = miss_key
+            return False
+
+        base_key = os.path.normcase(os.path.abspath(square_model))
+        self._synth3d_aspect_override = (base_key, side, selection)
+        self._synth3d_aspect_unavailable_key = None
+        if has_matte:
+            source_desc = "stable matte %d+%d on %dx%d" % (
+                top, bottom, source_width, source_height)
+        else:
+            source_desc = "native wide frame %dx%d (%.3f:1)" % (
+                source_width, source_height,
+                source_width / float(source_height))
+        logger.info(
+            "[2D3D] %s -> %s grid=%dx%d (%d%% fewer depth pixels)",
+            source_desc, os.path.basename(selection.model_path),
+            selection.grid_width, selection.grid_height,
+            round(100 * (1.0 - selection.grid_height / float(side))))
+        self._push_synth3d_to_widgets()
+        return True
+
+    def _log_synth3d_status(self):
+        try:
+            w = self.mvc_embedded_widget
+            if w is not None and getattr(w, '_r', None):
+                logger.info("[2D3D] %s", w._r.synth3d_status())
+        except Exception:
+            pass
+
+    def _synth3d_start_poll(self):
+        """F2: nothing previously observed `state=error` once synth3d was running --
+        a mid-run engine failure (ORT session lost, DirectML driver reset, ...) left
+        the toggle stuck "on" with nothing displaying its output and no notification.
+        Poll the depth engine's status every 2s and auto-disable on state=error."""
+        timer = getattr(self, '_synth3d_poll_timer', None)
+        if timer is None:
+            try:
+                timer = QTimer(self)
+            except TypeError:
+                # Non-QObject host (e.g. a test stub): still usable, just unparented.
+                timer = QTimer()
+            timer.timeout.connect(self._synth3d_poll_status)
+            self._synth3d_poll_timer = timer
+        self._synth3d_poll_last_log = 0.0
+        timer.start(2000)
+
+    def _synth3d_stop_poll(self):
+        timer = getattr(self, '_synth3d_poll_timer', None)
+        if timer is not None:
+            timer.stop()
+
+    def _synth3d_poll_status(self):
+        """Status comes from the first _display_widgets() entry with a live renderer --
+        NOT hard-coded to mvc_embedded_widget (house rule, see _display_widgets), since
+        the active 3D presentation may be the framepack or an eye-window widget."""
+        st = None
+        for w in self._display_widgets():
+            r = getattr(w, '_r', None)
+            if r is None:
+                continue
+            try:
+                st = r.synth3d_status()
+            except (AttributeError, TypeError, RuntimeError):
+                st = None
+            break
+        if st is None:
+            return
+        maybe_apply_aspect = getattr(self, '_maybe_apply_synth3d_aspect', None)
+        if maybe_apply_aspect is not None:
+            maybe_apply_aspect(st)
+        self._update_synth3d_status_label(st)
+        now = time.monotonic()
+        last = getattr(self, '_synth3d_poll_last_log', 0.0)
+        if now - last >= 10.0:
+            logger.info("[2D3D] %s", st)
+            self._synth3d_poll_last_log = now
+        if "state=error" in st:
+            err_tail = st.split("err=", 1)[-1] if "err=" in st else st
+            self.toggle_synth3d(False)
+            self.show_3d_notification(
+                f"2D->3D AI failed - disabled ({err_tail})", success=False)
+
+    def set_synth3d_depth_view(self, enabled):
+        self._synth3d_depth_view = bool(enabled)
+        self._push_synth3d_to_widgets()
+
+    def set_synth3d_diagnostics(self, enabled):
+        """Overlay depth and the continuous disocclusion confidence on the
+        synthesized movie. Unlike depth-view this keeps the content visible,
+        so it is useful for live tuning and qualification."""
+        self._synth3d_diagnostics = bool(enabled)
+        self._push_synth3d_to_widgets()
+
+    _SYNTH3D_PRESETS = {
+        # strength is % of image width; convergence is normalized nearness.
+        # Comfort keeps most content behind the screen plane, Cinema balances
+        # positive/negative parallax, Immersion permits more foreground pop.
+        'comfort': (0.8, 0.62),
+        'cinema': (1.4, 0.52),
+        'immersion': (2.2, 0.42),
+    }
+
+    def apply_synth3d_preset(self, name):
+        name = str(name).lower()
+        if name == 'custom':
+            self._synth3d_preset = 'custom'
+        elif name in self._SYNTH3D_PRESETS:
+            self._synth3d_strength, self._synth3d_convergence = \
+                self._SYNTH3D_PRESETS[name]
+            self._synth3d_preset = name
+        else:
+            return
+        self._app_settings['synth3d_preset'] = self._synth3d_preset
+        self._app_settings['synth3d_strength_pct'] = self._synth3d_strength
+        self._app_settings['synth3d_convergence'] = self._synth3d_convergence
+        self._save_app_settings()
+        self._push_synth3d_to_widgets()
+        self._update_synth3d_menu_state()
+        if name != 'custom':
+            self.show_3d_notification(
+                f"2D->3D preset: {name.title()}", success=True)
+
+    def _mark_synth3d_custom(self):
+        if getattr(self, '_synth3d_preset', 'custom') != 'custom':
+            self._synth3d_preset = 'custom'
+            self._app_settings['synth3d_preset'] = 'custom'
+
+    def set_synth3d_strength(self, tenths_pct, persist=True):
+        self._synth3d_strength = max(0.5, min(3.0, tenths_pct / 10.0))
+        self._mark_synth3d_custom()
+        if persist:
+            self._app_settings['synth3d_strength_pct'] = self._synth3d_strength
+            self._save_app_settings()
+        self._push_synth3d_to_widgets()
+
+    def set_synth3d_convergence(self, percent, persist=True):
+        self._synth3d_convergence = max(0.0, min(1.0, percent / 100.0))
+        self._mark_synth3d_custom()
+        if persist:
+            self._app_settings['synth3d_convergence'] = self._synth3d_convergence
+            self._save_app_settings()
+        self._push_synth3d_to_widgets()
+
+    def _synth3d_on_native_path_lost(self):
+        """Native decode path gone (mpv fallback, stop): synthesis cannot run."""
+        if getattr(self, '_synth3d_active', False):
+            self._synth3d_active = False
+            # F1b: a synth3d session only ever runs on 2D content (_synth3d_eligible
+            # requires `not self._content_is_3d()`), so this can never clobber a
+            # real-3D session -- same invariant toggle_synth3d(True) relies on.
+            # Without it, is_3d_enabled stayed True after the native path died,
+            # leaving change_stereo_mode/_set_dual_projector_enabled's gate open
+            # on a session with no synthesis and no real 3D content behind it.
+            self.is_3d_enabled = False
+            self._synth3d_stop_poll()
+            self._push_synth3d_to_widgets()
+            # Push the disable to the renderer promptly (not on a next frame that
+            # may never come) so the ORT session/GPU memory is released now.
+            for w in self._display_widgets():
+                try:
+                    r = getattr(w, '_r', None)
+                    if r is not None:
+                        r.set_synth3d(False)
+                except (AttributeError, TypeError):
+                    pass
+            self.show_3d_notification("2D->3D AI off (native decoder lost)",
+                                      success=False)
+        self._update_synth3d_menu_state()
+        # The AI button's grey/white/blue cycle lives in _update_3d_button_state;
+        # refresh it on every path that kills the synthesis (guarded: some
+        # teardown callers run on minimal hosts without the overlay).
+        try:
+            self._update_3d_button_state()
+        except Exception:
+            pass
+
+    def _synth3d_handle_decoder_stop(self, restarting):
+        """`_stop_mvc_decoder` runs on every MVC teardown path, including a
+        same-session restart (edge264 crash recovery, seek-queue decoder restart)
+        where `_mvc_restarting` is already True by the time it gets here --
+        `_start_mvc_decoder` sets that flag BEFORE calling `_stop_mvc_decoder()`.
+        Only a genuine stop should kill synthesis; notifying "native decoder
+        lost" mid-restart would be a false alarm while the path is coming right
+        back. NOTE: deliberately keyed on `_mvc_restarting` alone, NOT on
+        `_terminating_mpv` too (unlike the sibling mpv-video-output-restore
+        guard just above this call site in `_stop_mvc_decoder`) -- stop_playback
+        sets `_terminating_mpv` for a genuine, permanent stop; that flag only
+        skips restoring mpv's D3D11 output (crash-avoidance), it does not mean
+        the decoder is coming back, so synthesis must still be torn down then."""
+        if restarting:
+            return
+        if hasattr(self, '_synth3d_on_native_path_lost'):
+            self._synth3d_on_native_path_lost()
+
+    def _synth3d_notify_seek_widgets(self):
+        """Deterministic depth-EMA reset on seek (spec: same mechanic as a cut snap)."""
+        if not getattr(self, '_synth3d_active', False):
+            return
+        # A seek may jump across an aspect-ratio transition (Scope/IMAX cuts are
+        # common enough to make retaining the old crop unsafe). Return briefly
+        # to the warm square service and let the new position earn its own
+        # eight-observation verdict.
+        if getattr(self, '_synth3d_aspect_override', None) is not None:
+            self._synth3d_aspect_override = None
+            self._synth3d_aspect_unavailable_key = None
+            self._push_synth3d_to_widgets()
+        for w in self._display_widgets():
+            r = getattr(w, '_r', None)
+            try:
+                if r is not None:
+                    r.synth3d_notify_seek()
+            except (AttributeError, TypeError):
+                pass
+
+    def _synth3d_manifest_path(self):
+        """The manifest travels with the code, so it is found the same way the
+        models are -- next to the executable first, then the source tree."""
+        for root in dict.fromkeys(
+                (os.path.dirname(os.path.abspath(sys.argv[0])), _SOURCE_ROOT)):
+            candidate = os.path.join(root, 'models', 'MANIFEST.json')
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
+    def _open_model_download_dialog(self):
+        manifest = self._synth3d_manifest_path()
+        if manifest is None:
+            self.show_3d_notification(
+                "models/MANIFEST.json is missing from this install",
+                success=False)
+            return
+        try:
+            from model_download_dialog import ModelDownloadDialog
+            dialog = ModelDownloadDialog(
+                manifest, sylc_models_download_dir(), self,
+                ort_dir=self._synth3d_trt_dir(),
+                # Downloads land in ONE directory; the player OPENS models from
+                # three. TensorRT's engine cache is per graph, so the probe has
+                # to build every graph the player can reach, not just the ones
+                # this dialog would have written.
+                models_dirs=_synth3d_models_dirs(),
+                # An engine build saturates the GPU for minutes at a time and
+                # the dialog's modality does not stop a decode. With a file
+                # loaded the TensorRT action is refused outright rather than
+                # competing with playback for the card.
+                playback_active=bool(getattr(self, 'has_media', False)))
+            dialog.exec()
+        except Exception:
+            logger.exception("[2D3D] model download dialog failed")
+            self.show_3d_notification("Could not open the model downloader",
+                                      success=False)
+            return
+        # The dialog wrote to disk; every gate re-reads it. The BUTTON's own
+        # enabled state and tooltip are computed by _update_3d_button_state,
+        # not by the menu refresh -- without this second call a successful
+        # download leaves the button reading "unavailable" until the next
+        # media event happens to recompute it.
+        self._update_synth3d_menu_state()
+        self._update_3d_button_state()
+
+    def _update_synth3d_menu_state(self):
+        ov = getattr(self, 'controls_overlay', None)
+        if ov is None or not hasattr(ov, 'synth3d_enable_action'):
+            return
+        supported, eligible = self._synth3d_supported(), self._synth3d_eligible()
+        act = ov.synth3d_enable_action
+        act.blockSignals(True)
+        act.setChecked(bool(self._synth3d_active))
+        act.setEnabled(supported and (eligible or self._synth3d_active))
+        if not supported:
+            # Naming the WRONG missing piece here sends the user to download
+            # 3.67 GB that would not help: onnxruntime.dll is part of the
+            # install, not of the packs.
+            reason = self._synth3d_unsupported_reason()
+            if reason == 'runtime':
+                act.setToolTip(
+                    "onnxruntime.dll is missing from this install — "
+                    "downloading depth models will not enable this")
+            elif reason == 'renderer':
+                act.setToolTip(
+                    "The native renderer is not available in this build")
+            else:
+                act.setToolTip(
+                    "Depth models are not installed — use “Depth models” at "
+                    "the top of this menu to download them")
+        elif not eligible and not self._synth3d_active:
+            act.setToolTip("Available on 2D video decoded by the native pipeline")
+        else:
+            act.setToolTip("Synthesize stereo 3D from this 2D video")
+        act.blockSignals(False)
+        ov.synth3d_depth_view_action.setEnabled(bool(self._synth3d_active))
+        ov.synth3d_diagnostics_action.blockSignals(True)
+        ov.synth3d_diagnostics_action.setChecked(
+            bool(self._synth3d_diagnostics))
+        ov.synth3d_diagnostics_action.setEnabled(bool(self._synth3d_active))
+        ov.synth3d_diagnostics_action.blockSignals(False)
+        # Programmatic synchronisation must not look like a user's manual edit:
+        # otherwise merely opening the menu would turn a preset into "Custom".
+        for slider, value in (
+                (ov.synth3d_strength_slider,
+                 int(round(self._synth3d_strength * 10))),
+                (ov.synth3d_convergence_slider,
+                 int(round(self._synth3d_convergence * 100)))):
+            slider.blockSignals(True)
+            slider.setValue(value)
+            slider.blockSignals(False)
+        selected = getattr(self, '_synth3d_preset', 'custom')
+        for name, action in ov.synth3d_preset_actions.items():
+            action.blockSignals(True)
+            action.setChecked(name == selected)
+            action.setEnabled(bool(self._synth3d_active) or name == 'custom')
+            action.blockSignals(False)
+        # Depth presets, unlike the comfort ones, are pickable with synthesis
+        # idle too (the choice then applies to the next enable). A preset with no
+        # export installed is greyed out rather than silently resolving to
+        # another grid.
+        active_depth = self._synth3d_depth_preset()
+        for name, action in ov.synth3d_depth_preset_actions.items():
+            available = synth3d_depth_preset_available(name)
+            action.blockSignals(True)
+            action.setChecked(name == active_depth)
+            action.setEnabled(available)
+            action.setToolTip(
+                self._synth3d_depth_preset_tooltip(name) if available
+                else "model file not installed")
+            action.blockSignals(False)
+        # The two submenu rows and the gateway row state the current
+        # configuration on their own faces, so it reads without opening
+        # anything. The overlay stays player-blind: it is told, it never looks.
+        if hasattr(ov, 'set_synth3d_selection_summary'):
+            ov.set_synth3d_selection_summary(active_depth, selected)
+        if hasattr(ov, 'set_synth3d_models_summary'):
+            packs = self._synth3d_installed_packs()
+            ov.set_synth3d_models_summary(
+                " + ".join(packs) + " installed" if packs else "none installed",
+                bool(packs))
+        st = None
+        for w in self._display_widgets():
+            r = getattr(w, '_r', None)
+            if r is None:
+                continue
+            try:
+                st = r.synth3d_status()
+            except (AttributeError, TypeError, RuntimeError):
+                st = None
+            if st is not None:
+                break
+        self._update_synth3d_status_label(st)
+
+    @staticmethod
+    def _synth3d_installed_packs():
+        """Which depth-model packs are on disk, best first.
+
+        The gateway row reports the LIBRARY, not the selection: naming only the
+        model the active preset happens to resolve to would call an install
+        "Small" while Base sits beside it. Same disk lookup the preset gating
+        already does on every menu refresh.
+        """
+        packs = []
+        for label, candidates in (
+                ("Base", ("da3_base_756.onnx", "da3_base_518.onnx")),
+                ("Small", ("da3_small_756.onnx", "da3_small_518.onnx",
+                           "da3_small.onnx"))):
+            if synth3d_find_model(candidates) is not None:
+                packs.append(label)
+        return tuple(packs)
+
+    def _update_synth3d_status_label(self, status):
+        ov = getattr(self, 'controls_overlay', None)
+        if ov is None or not hasattr(ov, 'set_synth3d_status'):
+            return
+        if not status:
+            ov.set_synth3d_status("Engine: off")
+            return
+        fields = self._synth3d_status_fields(status)
+        state = fields.get('state', 'off')
+        if state == 'init':
+            text = "Engine: warming up · shared session"
+        elif state == 'running':
+            provider = fields.get('provider', 'GPU')
+            fps = fields.get('fps', '0.0')
+            age = fields.get('age_ms', '-')
+            clients = fields.get('clients', '1')
+            # Name the active preset AND the grid the engine actually reports:
+            # if the preset's own export were missing, the resolution would have
+            # fallen back to another grid, and that shows here rather than
+            # hiding behind the preset's name.
+            grid = fields.get('grid')
+            side = fields.get('side')
+            preset = self._synth3d_depth_preset()
+            if grid and grid not in ('0x0', '-'):
+                preset = f"{preset} {grid}px"
+            elif side and side not in ('0', '-'):
+                preset = f"{preset} {side}px"
+            text = (f"{provider} · {preset} · {fps} depth fps · {age} ms · "
+                    f"{clients} surface{'s' if clients != '1' else ''}")
+        elif state == 'error':
+            text = "Engine error · returned to 2D"
+        else:
+            text = "Engine: off"
+        ov.set_synth3d_status(text)
 
     def _update_3d_button_state(self):
         """Single authority for the availability of BOTH 3D controls (the 3D toggle button
@@ -4636,10 +5731,18 @@ class PlayerWindow(QMainWindow):
             combo = self.controls_overlay.stereo_mode_combo
         except Exception:
             return
-        capable = self._content_is_3d() and getattr(self, 'has_media', False)
+        capable = self._effective_3d() and getattr(self, 'has_media', False)
         if capable:
             btn.setEnabled(True)
             btn.setToolTip("Toggle 3D mode")
+            # Keep the visual check in step with reality: a synth3d enable sets
+            # is_3d_enabled programmatically, which never went through the
+            # button's own toggle — sync it here (single authority).
+            want_checked = bool(getattr(self, 'is_3d_enabled', False))
+            if btn.isChecked() != want_checked:
+                btn.blockSignals(True)
+                btn.setChecked(want_checked)
+                btn.blockSignals(False)
             # setEnabled does not emit currentTextChanged; blockSignals is defensive.
             combo.blockSignals(True)
             combo.setEnabled(True)
@@ -4656,6 +5759,47 @@ class PlayerWindow(QMainWindow):
             combo.setEnabled(False)
             combo.blockSignals(False)
             combo.setToolTip("2D video — stereo mode unavailable")
+        # AI (2D->3D) button: same three-state cycle as the 3D button —
+        # greyed when nothing can be synthesized, white letters when
+        # available, blue background while the synthesis is running.
+        try:
+            ai = getattr(self.controls_overlay, 'synth3d_button', None)
+            if ai is not None:
+                active = bool(getattr(self, '_synth3d_active', False))
+                supported = self._synth3d_supported()
+                # The 2D->3D menu hangs off THIS button (setMenu), and it is
+                # also where "Depth models..." lives -- the only in-app way to
+                # acquire the models that make `supported` true. Greying the
+                # button when nothing is installed therefore locks the user out
+                # of the one action that would unlock it. Stay enabled while
+                # unsupported so the menu opens; the individual entries inside
+                # are gated separately by _update_synth3d_menu_state().
+                ai.setEnabled(not supported
+                              or self._synth3d_eligible() or active)
+                if hasattr(ai, 'set_active_look'):
+                    ai.set_active_look(active)
+                if not supported:
+                    # Ordered so the DEFAULT is the common, actionable case:
+                    # only the two narrow causes claim their own wording.
+                    reason = self._synth3d_unsupported_reason()
+                    if reason == 'runtime':
+                        ai.setToolTip(
+                            "2D->3D AI unavailable - onnxruntime.dll is "
+                            "missing from this install")
+                    elif reason == 'renderer':
+                        ai.setToolTip(
+                            "2D->3D AI unavailable - the native renderer is "
+                            "not available in this build")
+                    else:
+                        ai.setToolTip(
+                            "2D->3D AI unavailable - open this menu and choose "
+                            "“Depth models” at the top to download them")
+                elif active:
+                    ai.setToolTip("2D->3D AI conversion - active")
+                else:
+                    ai.setToolTip("2D->3D AI conversion")
+        except Exception:
+            pass
 
     def _format_badge_label(self):
         """Adaptive 3D-format label for the controls badge, or None for 2D content.
@@ -6944,6 +8088,10 @@ class PlayerWindow(QMainWindow):
     def _continue_play_file(self, file_path):
         """Continue loading file after cleanup delay."""
         self.current_file_path = file_path
+        # Encoded mattes are per-medium. A rectangular choice from the previous
+        # title must never crop a new source before its own detector has spoken.
+        self._synth3d_aspect_override = None
+        self._synth3d_aspect_unavailable_key = None
         # I3: a manual SBS/TAB pick in the stereo combo is per-file — don't let it stick
         # to the NEXT file (which would override that file's own auto-detection, e.g. force
         # a 2D or MVC clip into SBS). Reset to 'auto' so detection wins on a fresh load.
@@ -7547,7 +8695,8 @@ class PlayerWindow(QMainWindow):
         use_mvc_decoder = (MVC_SUPPORT_AVAILABLE and self.current_file_path and
                            (self.video_3d_info.get('stereo_mode') == 'mvc' or
                             self.video_3d_info.get('has_mvc_track') or
-                            packed_input))
+                            packed_input or
+                            (getattr(self, '_synth3d_active', False) and self.mvc_mode_active)))
 
         if use_mvc_decoder:
             try:
@@ -7845,8 +8994,13 @@ class PlayerWindow(QMainWindow):
             self.mvc_decoder_thread.frameReady.connect(self._on_mvc_frame_ready)
             # CRITICAL: Force QueuedConnection for cross-thread signal delivery
             from PySide6.QtCore import Qt
-            self.mvc_decoder_thread.frameYUVReady.connect(self._on_mvc_frame_yuv_ready, Qt.QueuedConnection)
-            logger.info("[MVC INIT] frameYUVReady connected with Qt.QueuedConnection")
+            # Timed delivery carries the exact media PTS with the pixels. The
+            # legacy two-argument signal remains available to external callers,
+            # but using it here would force Synth3D to confuse GUI/compute time
+            # with video time.
+            self.mvc_decoder_thread.frameYUVTimedReady.connect(
+                self._on_mvc_frame_yuv_timed_ready, Qt.QueuedConnection)
+            logger.info("[MVC INIT] frameYUVTimedReady connected with Qt.QueuedConnection")
             self.mvc_decoder_thread.error.connect(self._on_mvc_error)
             self.mvc_decoder_thread.fps_update.connect(self._on_mvc_fps_update)
             self.mvc_decoder_thread.decodingFinished.connect(self._on_mvc_finished)
@@ -7987,6 +9141,11 @@ class PlayerWindow(QMainWindow):
 
     def _fallback_to_mpv_mvc(self):
         """Fallback to mpv native MVC handling"""
+        # F1a: this is a genuine loss of the native decode path (mpv takes over
+        # MVC presentation) -- synthesis cannot keep running, same as the
+        # _stop_*_decoder call sites' guard just below.
+        if hasattr(self, '_synth3d_on_native_path_lost'):
+            self._synth3d_on_native_path_lost()
         self._restore_mpv_video_output()
         try:
             if not self.player: return
@@ -8150,6 +9309,7 @@ class PlayerWindow(QMainWindow):
         # stale-enabled on a now-2D-only session.
         was_3d = bool(isinstance(self.video_3d_info, dict) and self.video_3d_info.get('is_3d'))
         self.mvc_mode_active = False
+        self._synth3d_on_native_path_lost()
         # DF-FINAL FIX 2: clear the dual-file BD3D session flags too, so a fallen-back
         # pipeline can't be mistaken for a live dual-file session by later code
         # (e.g. a queued decoder-seek or a subsequent load-state check).
@@ -8171,10 +9331,10 @@ class PlayerWindow(QMainWindow):
                     self.video_3d_info['is_3d'] = False
             except Exception:
                 pass
-            try:
-                self._update_3d_button_state()
-            except Exception:
-                pass
+        try:
+            self._update_3d_button_state()
+        except Exception:
+            pass
         # Degrading to 2D: the framepack 3D window must not linger on a frozen frame.
         fp = getattr(self, 'framepacking_window', None)
         if fp is not None:
@@ -8512,8 +9672,8 @@ class PlayerWindow(QMainWindow):
             self.hevc_thread = HevcDecodeThread()
             self.hevc_thread.configure(src, mode=mode, half=half, inverted=inverted)
             self.hevc_thread.clock_offset_provider = self._mpv_time_pos_ms
-            self.hevc_thread.frameYUVReady.connect(
-                self._on_mvc_frame_yuv_ready, Qt.QueuedConnection)
+            self.hevc_thread.frameYUVTimedReady.connect(
+                self._on_mvc_frame_yuv_timed_ready, Qt.QueuedConnection)
             self.hevc_thread.decodeFailed.connect(self._on_hevc_failed)
             self.hevc_thread.endOfStream.connect(self._on_mvc_finished)  # shared EOS handler
             # Timeline position from the decode thread itself (mirror of the MVC
@@ -8591,12 +9751,20 @@ class PlayerWindow(QMainWindow):
         self._present_via_mpv_native()
         QTimer.singleShot(700, self._confirm_mpv_fallback_video)
 
-    def _stop_hevc_decoder(self):
+    def _stop_hevc_decoder(self, restarting=False):
         """Symmetric teardown of the HEVC path (mirror of the MVC cleanup): disconnect the
         decode thread's signals (pattern of _stop_mvc_decoder), stop + join it, close the
         avformat/avcodec source, and reset the widgets' plane_scale to 1.0 (8-bit default)
         so a subsequent 8-bit MVC/H.264 file renders correctly. Idempotent / no-op when no
         HEVC session is active, so it is safe to call from every MVC teardown site.
+
+        `restarting`: forwarded to `_synth3d_handle_decoder_stop` (default False — a
+        genuine loss). `_stop_mvc_decoder` passes its own `_mvc_restarting` state through
+        here, since it calls this unconditionally on every teardown, including a
+        same-session restart (edge264 crash recovery, seek-queue restart) -- without
+        that, this method's own synth3d notification would fire the false "native
+        decoder lost" alarm mid-restart even after `_stop_mvc_decoder`'s tail check is
+        fixed to skip it.
 
         request_stop() only flips a flag checked between frames -- it cannot interrupt a
         blocking read_frame() (GIL released inside av_read_frame/avcodec_receive_frame).
@@ -8610,7 +9778,8 @@ class PlayerWindow(QMainWindow):
         thread_dead = True
         if th is not None:
             try:
-                for _sig in ('frameYUVReady', 'decodeFailed', 'endOfStream'):
+                for _sig in ('frameYUVReady', 'frameYUVTimedReady',
+                             'decodeFailed', 'endOfStream'):
                     try:
                         getattr(th, _sig).disconnect()
                     except Exception:
@@ -8666,6 +9835,8 @@ class PlayerWindow(QMainWindow):
                 _w.transfer_sel = 0
             except Exception:
                 pass
+        if hasattr(self, '_synth3d_handle_decoder_stop'):
+            self._synth3d_handle_decoder_stop(restarting)
 
     def _show_framepacking_output(self):
         """Show the detached 3D output without stealing the main UI's focus."""
@@ -8797,12 +9968,10 @@ class PlayerWindow(QMainWindow):
         throughout — unlike the native SBS/TAB branch we NEVER restore mpv video (it has
         none). Keeps the embedded widget visible+rendering for timing parity.
 
-        MV-4: for MV-HEVC (multiview) sources ONLY, an explicit SBS/TAB combo pick re-lays
-        the two decoded views in the MAIN window (mirror of configure_3d_output's MVC
-        sbs/tab branch), instead of the detached framepack window — this is the renderer
-        presentation switch the combo drives (no source re-split; change_stereo_mode already
-        skipped hevc_thread.set_mode). Packed/2D HEVC never reach this branch (multiview
-        False), so their framepack/2D behaviour is byte-identical to before."""
+        An explicit SBS/TAB choice lays the available pair out in the MAIN window
+        instead of the detached framepack window. Genuine packed/multiview sources
+        already provide L/R; Synth3D reaches the same presentation branch with its
+        generated pair while the original HEVC input remains strictly mono."""
         fp = getattr(self, 'framepacking_window', None)
         emb = getattr(self, 'mvc_embedded_widget', None)
         # Review fix #1a: resolve 'auto' to the actual HEVC session mode BEFORE branching.
@@ -8963,7 +10132,9 @@ class PlayerWindow(QMainWindow):
         # HEVC path teardown (symmetric, idempotent no-op when inactive): every MVC
         # teardown site (stop / load-new / close / edge264-fallback / EOS) routes through
         # here, so it also releases the HEVC decode thread + source when one is active.
-        self._stop_hevc_decoder()
+        # restarting=... forwarded so its own synth3d-lost check doesn't fire the false
+        # alarm mid same-session restart (see _stop_hevc_decoder's docstring).
+        self._stop_hevc_decoder(restarting=getattr(self, '_mvc_restarting', False))
 
         # THUMB: stop thumbnail I/O before any decoder/demuxer teardown
         if getattr(self, '_thumb_service', None):
@@ -9060,6 +10231,7 @@ class PlayerWindow(QMainWindow):
                 self.mvc_decoder_thread.frameReady.disconnect()
                 self.mvc_decoder_thread.frameDecoded.disconnect()
                 self.mvc_decoder_thread.frameYUVReady.disconnect()
+                self.mvc_decoder_thread.frameYUVTimedReady.disconnect()
                 self.mvc_decoder_thread.error.disconnect()
                 self.mvc_decoder_thread.fps_update.disconnect()
                 self.mvc_decoder_thread.decodingFinished.disconnect()
@@ -9226,6 +10398,9 @@ class PlayerWindow(QMainWindow):
             if hasattr(self, 'video_stack'):
                 self.video_stack.setCurrentWidget(self.video_widget)
 
+        if hasattr(self, '_synth3d_handle_decoder_stop'):
+            self._synth3d_handle_decoder_stop(getattr(self, '_mvc_restarting', False))
+
     @Slot()
     def _on_mvc_frame_ready(self):
         """
@@ -9332,6 +10507,13 @@ class PlayerWindow(QMainWindow):
 
     @Slot(object, object)
     def _on_mvc_frame_yuv_ready(self, left_planes, right_planes):
+        """Compatibility entry point for callers without a media timestamp."""
+        return PlayerWindow._on_mvc_frame_yuv_timed_ready(
+            self, left_planes, right_planes, -1.0)
+
+    @Slot(object, object, object)
+    def _on_mvc_frame_yuv_timed_ready(
+            self, left_planes, right_planes, video_time_ms):
         """Dispatch one decoded stereo frame to every visible presentation target.
 
         Both numpy tuples are passed by reference — no extra copy made here.
@@ -9414,6 +10596,11 @@ class PlayerWindow(QMainWindow):
                 # thread. An attribute keeps the call contract compatible with
                 # older/test widgets while the new renderer honours Present(0).
                 target.present_vsync = bool(use_vsync)
+                # Exact media PTS travels beside the planes without widening
+                # set_frame_yuv_views(), whose compatibility surface is used by
+                # test and fallback widgets. NativeFramepackWidget consumes it
+                # immediately before uploading this same frame.
+                target.video_time_ms = float(video_time_ms)
                 _first, _second = self._planes_for_target(
                     target, left_planes, right_planes)
                 delivered = target.set_frame_yuv_views(_first, _second)
@@ -9726,6 +10913,17 @@ class PlayerWindow(QMainWindow):
                 logger.info("[VISIBILITY] Framepacking window hidden during SBS/TAB "
                             "presentation — expected (main-window 3D); is_3d preserved")
                 return
+            # Fourth deliberate-hide reason (round 4, depth presets): changing the
+            # depth preset re-arms synthesis with toggle_synth3d(False) then (True),
+            # and the off leg's configure_3d_output(False) hides this window for the
+            # microseconds until the on leg re-shows it. Reading that as a user close
+            # would tear 3D down mid-re-arm and, worse, auto-stop the cast session
+            # below — which the re-arm is required to preserve. The flag is set only
+            # around that one toggle pair (see _synth3d_set_depth_preset).
+            if getattr(self, '_synth3d_rearming', False):
+                logger.info("[VISIBILITY] Framepack hidden during a depth-preset "
+                            "re-arm — 3D and any cast session preserved")
+                return
             # FSBS/edge264 MultiView blind spot (fix-fsbs-multiview): a
             # visibilityChanged(False) does NOT always mean the window was hidden. The
             # framepack window's exit_fake_fullscreen() (F key / double-click / Esc)
@@ -9752,6 +10950,22 @@ class PlayerWindow(QMainWindow):
             if self.mvc_decoder_thread:
                 self.mvc_decoder_thread.set_display_widget(self.mvc_embedded_widget)
             logger.info("[VISIBILITY] Framepacking window hidden: switched to embedded 2D mode")
+
+            # F1c: a genuine close must also tear down synth3d -- otherwise the
+            # embedded '2d' preview just switched to above shows the WARPED left
+            # eye (the shader-side effect of synth3d_enabled) and the depth model
+            # keeps running with nothing left to display its output. toggle_synth3d
+            # is idempotent-safe here: its own configure_3d_output(False) repeats
+            # the same 2D-switch already done just above (redundant but harmless,
+            # since mvc_mode_active is still True at this point -- same branch,
+            # same idempotent calls), and additionally does the widget/notify/menu
+            # teardown (_push_synth3d_to_widgets, renderer set_synth3d(False),
+            # show_3d_notification, _update_3d_button_state/_update_synth3d_menu_state)
+            # this handler doesn't otherwise perform. Placed BEFORE the 3D-button
+            # uncheck below so its "2D->3D AI off" notification doesn't race the
+            # button-state update.
+            if getattr(self, '_synth3d_active', False):
+                self.toggle_synth3d(False)
 
             # Auto-deactivate the 3D button so the UI matches reality when the
             # user closes the framepacking window (X / Alt-F4 / exit fullscreen).
@@ -9908,6 +11122,24 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise SystemExit(0)
+
+    # --- TensorRT engine-probe child (in-app acquisition, stage 3) ------------
+    # Every TensorRT engine build runs in its OWN process, because an incomplete
+    # or incompatible TensorRT assembly does not raise -- it takes the process
+    # down with a hard native abort (see trt_engines.py's header and
+    # tools_dev/setup_tensorrt.py's). In a frozen build there is no Python
+    # interpreter to spawn: sys.executable IS this exe, so trt_engines
+    # re-invokes it with this hidden flag, exactly as SYLC_EXPORT_SELFTEST above
+    # re-invokes it for the release build's export smoke test.
+    #
+    # Handled HERE, before faulthandler and before any Qt/GUI init, so the child
+    # never builds a window, never touches media and exits the moment it has a
+    # verdict. The literal is duplicated from trt_engines.PROBE_ARGV_FLAG rather
+    # than imported so a normal launch does not pay for the import;
+    # tests/models/test_trt_engines.py pins the two equal.
+    if '--sylc-trt-engine-probe' in sys.argv:
+        import trt_engines
+        raise SystemExit(trt_engines.probe_main(sys.argv[1:]))
 
     # Enable faulthandler to a file (never stderr) to capture real crashes.
     #

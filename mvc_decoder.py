@@ -851,6 +851,10 @@ class MVCDecoderThread(QThread):
     frameReady = Signal()
     frameDecoded = Signal(object)
     frameYUVReady = Signal(object, object)
+    # Timed companion used by Synth3D. Keep frameYUVReady unchanged for older
+    # consumers/tests, but never make the renderer reconstruct video time from
+    # GUI arrival or inference cadence.
+    frameYUVTimedReady = Signal(object, object, object)  # (left, right, pts_ms)
     error = Signal(str)
     fps_update = Signal(float)
     stats_update = Signal(int, int)
@@ -4335,6 +4339,10 @@ class MVCDecoderThread(QThread):
             if self.frame_count <= 10 or self.frame_count % 100 == 0:
                 logger.debug(f"[DIAG] EMIT frameYUVReady #{self.frame_count}")
             self.frameYUVReady.emit(left_planes, right_planes)
+            pts_ms = (
+                float(frame_data['timestamp']) * 1000.0
+                if 'timestamp' in frame_data else -1.0)
+            self.frameYUVTimedReady.emit(left_planes, right_planes, pts_ms)
 
             # Legacy signal for backward compatibility (not used in V7b)
             if not self._display_widget:

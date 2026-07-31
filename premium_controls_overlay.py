@@ -37,6 +37,13 @@ from PySide6.QtGui import (
 
 # (license/subscription system removed - freeware build)
 
+# Labels of the "Depth preset" submenu in the AI menu, in display order. They
+# double as the identifiers emitted on synth3d_depth_preset_selected and
+# persisted by the host, which owns the real table (model candidates + inference
+# grid per preset) and pins these names equal to it. Spelled out here because
+# this overlay must not import the player -- the player imports IT.
+SYNTH3D_DEPTH_PRESET_LABELS = ("Quality", "Balanced", "Performance")
+
 
 # =============================================================================
 # HELPERS & THUMBNAIL EXTRACTION
@@ -242,6 +249,10 @@ class PremiumIconButton(QPushButton):
         w, h = sizes.get(size, (40, 40))
         self.setFixedSize(w, h)
         self.is_primary = (size == 'primary')
+        # "Active" look for buttons that cannot be checkable (a QPushButton
+        # carrying a menu pops the menu on click and never toggles): same blue
+        # background as the checked state, driven programmatically by the host.
+        self._active_look = False
 
         # Animation timer
         self._anim_timer = QTimer(self)
@@ -251,6 +262,13 @@ class PremiumIconButton(QPushButton):
 
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet("background: transparent; border: none;")
+
+    def set_active_look(self, active):
+        """Show/clear the checked-style blue background without being checkable."""
+        active = bool(active)
+        if active != self._active_look:
+            self._active_look = active
+            self.update()
 
     def stop_animations(self):
         """Stop animation timer to reduce activity during cleanup."""
@@ -339,7 +357,7 @@ class PremiumIconButton(QPushButton):
                 painter.drawEllipse(QPointF(cx, cy), radius, radius)
             else:
                 # Secondary button: glass effect
-                if self.isChecked():
+                if self.isChecked() or self._active_look:
                     # Active (Checked) State - Cyan Tint
                     bg_color = QColor(0, 140, 220, 160)
                     border_color = QColor(100, 220, 255, 200)
@@ -512,6 +530,22 @@ class PremiumIconButton(QPushButton):
             painter.setPen(color)
             painter.drawText(QRectF(0, 0, self.width(), self.height()),
                              Qt.AlignmentFlag.AlignCenter, '3D')
+
+        elif self.icon_type == 'ai3d':
+            # "AI" monogram with a stereo ghost: the same glyph echoed with a
+            # small horizontal offset, like the parallax double the 2D->3D
+            # synthesis creates. Same typography as the '3d' glyph.
+            font = QFont('Segoe UI', int(s * 0.8), QFont.Weight.Bold)
+            painter.setFont(font)
+            rect = QRectF(0, 0, self.width(), self.height())
+            ghost = QColor(color)
+            ghost.setAlphaF(color.alphaF() * 0.35)
+            painter.setPen(ghost)
+            painter.drawText(rect.translated(-s * 0.12, 0),
+                             Qt.AlignmentFlag.AlignCenter, 'AI')
+            painter.setPen(color)
+            painter.drawText(rect.translated(s * 0.06, 0),
+                             Qt.AlignmentFlag.AlignCenter, 'AI')
 
         elif self.icon_type == 'disc':
             # Optical disc: outer ring + center hub (open a Blu-ray)
@@ -1524,6 +1558,19 @@ class PremiumControlsOverlay(QWidget):
     archive_requested = Signal()  # archive the current optical disc to an .iso image
     export_mvhevc_requested = Signal(str)  # export current 3D media to MV-HEVC .mov; arg = 'quality'|'fast'
     cast_requested = Signal(str)  # start/stop casting the live 3D session to the Quest; arg = 'wifi'|'usb'
+    synth3d_toggled = Signal(bool)  # enable/disable real-time 2D->3D AI conversion
+    synth3d_depth_view_toggled = Signal(bool)  # show the raw depth map instead of the warped stereo pair
+    synth3d_diagnostics_toggled = Signal(bool)  # live depth/disocclusion overlay
+    synth3d_preset_selected = Signal(str)  # comfort|cinema|immersion|custom
+    synth3d_depth_preset_selected = Signal(str)  # Quality|Balanced|Performance
+    synth3d_download_models_requested = Signal()
+    # Sliders are single-purpose (Task 8 review): *_preview fires on every
+    # valueChanged (live push to the renderer, never persisted to disk);
+    # *_changed fires only on sliderReleased (the value the host persists).
+    synth3d_strength_preview = Signal(int)      # tenths of a percent, 5..30
+    synth3d_strength_changed = Signal(int)      # tenths of a percent, 5..30
+    synth3d_convergence_preview = Signal(int)   # 0..100
+    synth3d_convergence_changed = Signal(int)   # 0..100
     stereo_mode_changed = Signal(str)
     mode_3d_toggled = Signal(bool)
     audio_track_changed = Signal(int)
@@ -1671,6 +1718,13 @@ class PremiumControlsOverlay(QWidget):
         # Separator
         sep2 = PremiumSeparator()
 
+        # 2D->3D (AI) conversion button + menu (dedicated 'ai3d' glyph: "AI"
+        # with a stereo-parallax ghost -- the button itself carries no state,
+        # only its menu's checkable actions do).
+        self.synth3d_button = PremiumIconButton('ai3d', 'medium')
+        self.synth3d_button.setToolTip("2D->3D AI conversion")
+        self._build_synth3d_menu()
+
         # 3D Mode button
         self.mode_3d_button = PremiumIconButton('3d', 'medium')
         self.mode_3d_button.setCheckable(True)
@@ -1726,6 +1780,7 @@ class PremiumControlsOverlay(QWidget):
         self.vu_meter = PremiumSpectrumMeter()
         right_group.addWidget(self.vu_meter, 1)
         right_group.addSpacing(8)
+        right_group.addWidget(self.synth3d_button)
         right_group.addWidget(self.mode_3d_button)
         right_group.addWidget(self.stereo_mode_combo)
         right_group.addWidget(sep2)
@@ -1883,6 +1938,14 @@ class PremiumControlsOverlay(QWidget):
             font-size: 9pt;
             background: transparent;
         }
+        QLabel#sylcMenuSection {
+            color: #7B8194;
+            font-family: "Segoe UI";
+            font-size: 8pt;
+            font-weight: 600;
+            letter-spacing: 1.2px;
+            background: transparent;
+        }
         QToolTip {
             color: #F4F6FA;
             background-color: #20242F;
@@ -1989,6 +2052,76 @@ class PremiumControlsOverlay(QWidget):
             painter.drawPolygon(QPolygonF([
                 QPointF(14.3, 5.4), QPointF(17.0, 8.2), QPointF(11.6, 8.2)
             ]))
+        elif kind == 'depth':
+            # Two offset triangles -- a minimal "relief"/parallax cue for
+            # synthesized (2D->3D AI) depth, same offset-pair idiom as 'spatial'.
+            def _tri(ox, oy):
+                path = QPainterPath()
+                path.moveTo(10.0 + ox, 3.0 + oy)
+                path.lineTo(16.5 + ox, 15.5 + oy)
+                path.lineTo(3.5 + ox, 15.5 + oy)
+                path.closeSubpath()
+                return path
+            painter.drawPath(_tri(-1.6, -1.0))
+            painter.drawPath(_tri(1.6, 1.0))
+        elif kind == 'models':
+            # Three offset sheets -- a library you acquire and hold on disk.
+            # Only the EXPOSED edges of the two behind are drawn: three whole
+            # outlines collapse into crossed lines at 20 px, where this still
+            # reads as a stack.
+            front = QRectF(1.8, 7.4, 11.4, 10.4)
+            painter.drawRoundedRect(front, 1.8, 1.8)
+            previous = front
+            for dx, dy in ((2.3, -2.3), (4.6, -4.6)):
+                sheet = front.translated(dx, dy)
+                edge = QPainterPath()
+                edge.moveTo(sheet.left(), previous.top())
+                edge.lineTo(sheet.left(), sheet.top())
+                edge.lineTo(sheet.right(), sheet.top())
+                edge.lineTo(sheet.right(), sheet.bottom())
+                edge.lineTo(previous.right(), sheet.bottom())
+                painter.drawPath(edge)
+                previous = sheet
+        elif kind == 'grid':
+            # A subdivided square. Literally true: a depth preset selects the
+            # inference grid (756 vs 518), which is the speed lever.
+            painter.drawRoundedRect(QRectF(2.6, 2.6, 14.8, 14.8), 2.4, 2.4)
+            for offset in (7.5, 12.5):
+                painter.drawLine(QPointF(offset, 2.6), QPointF(offset, 17.4))
+                painter.drawLine(QPointF(2.6, offset), QPointF(17.4, offset))
+            painter.setBrush(QBrush(accent))
+            painter.drawRect(QRectF(8.4, 8.4, 3.2, 3.2))
+        elif kind == 'parallax':
+            # A caliper: two end stops and the measured span between them.
+            # Stereo geometry IS a separation you set, which is exactly what the
+            # two sliders under that submenu do.
+            #
+            # Three strokes, and the proportions are load-bearing -- only
+            # rendering at 20 px shows why. Stops at x=5/15 over a full
+            # 4.5..15.5 height (the obvious construction) draw a near-square
+            # figure that reads as a capital H, arrowheads or not: a 10 px gap
+            # cannot hold two heads AND still look like a gap. Pushing the stops
+            # to the edges and cutting them to 7 px makes the figure wide and
+            # flat, which no letterform is.
+            #
+            # Arrowheads were drawn, rendered and DROPPED: at 20 px they merge
+            # into the stops as blur rather than reading as heads, and detaching
+            # them into the span just leaves two floating blobs. They only work
+            # at 40 px, which is not the only size this ships at.
+            painter.drawLine(QPointF(2.6, 6.4), QPointF(2.6, 13.6))
+            painter.drawLine(QPointF(17.4, 6.4), QPointF(17.4, 13.6))
+            painter.drawLine(QPointF(2.6, 10.0), QPointF(17.4, 10.0))
+        elif kind == 'pulse':
+            # A waveform -- live measurement, running while you watch.
+            wave = QPainterPath()
+            wave.moveTo(1.6, 10.0)
+            wave.lineTo(5.2, 10.0)
+            wave.lineTo(7.1, 4.3)
+            wave.lineTo(9.7, 15.5)
+            wave.lineTo(12.0, 7.4)
+            wave.lineTo(13.6, 10.0)
+            wave.lineTo(18.4, 10.0)
+            painter.drawPath(wave)
 
         painter.end()
         return QIcon(pixmap)
@@ -2026,6 +2159,34 @@ class PremiumControlsOverlay(QWidget):
         header_action.setEnabled(False)
         menu.addAction(header_action)
         return header_action
+
+    @staticmethod
+    def _add_export_menu_section(menu, title, minimum_width):
+        """A quiet, non-command section label, one step below the header.
+
+        Same construction as _add_export_menu_header so it reads as the same
+        family: the header names the panel, a section names the register the
+        rows beneath it belong to. It is STRUCTURE, not decoration -- add one
+        only where the register genuinely changes.
+        """
+        section_action = QWidgetAction(menu)
+        holder = QWidget(menu)
+        holder.setObjectName("sylcMenuHeader")
+        holder.setMinimumWidth(max(240, minimum_width - 18))
+        holder.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        layout = QVBoxLayout(holder)
+        layout.setContentsMargins(14, 5, 12, 1)
+        layout.setSpacing(0)
+
+        label = QLabel(title, holder)
+        label.setObjectName("sylcMenuSection")
+        label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        layout.addWidget(label)
+
+        section_action.setDefaultWidget(holder)
+        section_action.setEnabled(False)
+        menu.addAction(section_action)
+        return section_action
 
     def _build_export_menu(self):
         """EX-4: build the unified « Sauvegarde / Export » QMenu attached to the
@@ -2151,6 +2312,267 @@ class PremiumControlsOverlay(QWidget):
         self._cast_light_state = (None, False)   # (active_kind, connected)
         self.export_menu = menu
         self.archive_button.setMenu(menu)
+
+    # Base titles of the two preset submenus. The row itself reports the
+    # current choice ("Depth preset — Balanced"), so these are the stem the
+    # selection is appended to rather than the final text.
+    _SYNTH3D_DEPTH_PRESET_TITLE = "Depth preset"
+    _SYNTH3D_GEOMETRY_TITLE = "Stereo geometry"
+
+    def _build_synth3d_menu(self):
+        """Build the "2D->3D (AI)" QMenu attached to synth3d_button.
+
+        Ordered by DEPENDENCY, not by implementation history -- the four
+        registers a user actually moves through:
+
+          provision  "Depth models" is the gateway: nothing below it works until
+                     a pack is on disk. It therefore comes first, alone above
+                     the rule, ahead of the very control it unlocks. Convention
+                     puts the primary action at the top; here that action is
+                     greyed out until this row has been used, and a dead control
+                     sitting above its own remedy explains nothing. The row also
+                     reports its own state (set_synth3d_models_summary).
+          act/tune   SYNTHESIS -- the enable toggle, the two preset submenus
+                     (which model computes the depth, and how it reaches your
+                     eyes) and the two precise sliders.
+          inspect    INSPECT -- depth view, live diagnostics, engine status.
+
+        Colour is semantic and comes only from the existing PremiumColors
+        tokens: ACCENT_PRIMARY = synthesis itself, SUCCESS/WARNING = the
+        gateway's own provisioning state, WARNING = inspection, muted grey =
+        structure and inert text. Every row carries an icon that means something
+        on its own; no glyph is reused with a different tint standing in for a
+        difference in kind.
+
+        Task 8 review -- atomic build: every local widget/action is fully
+        constructed first; only then are the four attributes the host's
+        _update_synth3d_menu_state touches (synth3d_enable_action,
+        synth3d_depth_view_action, synth3d_strength_slider,
+        synth3d_convergence_slider) assigned, as one block, and only after
+        that are their signals wired to the outside. That host method guards
+        on synth3d_enable_action alone then touches all four, so a
+        partially-built menu (e.g. an exception midway) must never be
+        observable -- either none of the four exist, or all of them do.
+
+        Enablement/tooltips/slider values are owned by the host, refreshed on
+        the menu's aboutToShow (same idiom as _update_export_menu_state); this
+        overlay stays media/state-blind.
+        """
+        menu = QMenu(self.synth3d_button)
+        self._prepare_export_menu(menu, 340)
+        header = self._add_export_menu_header(
+            menu, "2D->3D (AI)",
+            "Depth Anything V3 - real-time synthesis", 340)
+
+        # --- provision -------------------------------------------------------
+        # Always present, always enabled: this is how a user inspects what is
+        # installed and re-fetches a corrupted file, not only how they escape an
+        # empty models/ directory. The overlay stays player-blind -- it emits,
+        # the host opens the dialog and feeds the row's summary back.
+        download_models_action = QAction("Depth models…", menu)
+        download_models_action.setIcon(
+            self._export_menu_icon('models', PremiumColors.SUCCESS))
+        download_models_action.triggered.connect(
+            lambda _checked=False: self.synth3d_download_models_requested.emit())
+        menu.addAction(download_models_action)
+
+        # --- synthesis -------------------------------------------------------
+        menu.addSeparator()
+        self._add_export_menu_section(menu, "SYNTHESIS", 340)
+
+        # The header already says AI; saying it again here would be the only
+        # word in the panel that carries no information.
+        enable_action = QAction("Enable 2D->3D", menu)
+        enable_action.setCheckable(True)
+        enable_action.setIcon(self._export_menu_icon('depth'))
+        menu.addAction(enable_action)
+
+        # Depth preset = which model runs, and on which inference grid; the
+        # stereo-geometry presets below are the geometry axis
+        # (strength/convergence) and are independent of it. The labels ARE the
+        # names the host persists (see SYNTH3D_DEPTH_PRESET_LABELS): this
+        # overlay stays player-blind, so the host pins them equal to its own
+        # preset table.
+        depth_preset_menu = QMenu(self._SYNTH3D_DEPTH_PRESET_TITLE, menu)
+        self._prepare_export_menu(depth_preset_menu, 300)
+        depth_preset_menu.setIcon(self._export_menu_icon('grid'))
+        depth_preset_header = self._add_export_menu_header(
+            depth_preset_menu, "DEPTH PRESET",
+            "Which model runs, and on which grid", 300)
+        depth_preset_group = QActionGroup(depth_preset_menu)
+        depth_preset_group.setExclusive(True)
+        depth_preset_actions = {}
+        for key in SYNTH3D_DEPTH_PRESET_LABELS:
+            action = QAction(key, depth_preset_menu)
+            action.setCheckable(True)
+            action.setData(key)
+            depth_preset_group.addAction(action)
+            depth_preset_menu.addAction(action)
+            action.triggered.connect(
+                lambda checked=False, name=key:
+                    self.synth3d_depth_preset_selected.emit(name) if checked else None)
+            depth_preset_actions[key] = action
+        menu.addMenu(depth_preset_menu)
+
+        # "Stereo geometry", not "Comfort preset": a preset menu named after one
+        # of its own children reads as a mistake, and this is exactly what the
+        # two sliders below it set. It pairs with "Depth preset" -- what the AI
+        # computes, versus how it reaches your eyes. The KEYS are untouched:
+        # the host persists them.
+        preset_menu = QMenu(self._SYNTH3D_GEOMETRY_TITLE, menu)
+        self._prepare_export_menu(preset_menu, 300)
+        preset_menu.setIcon(self._export_menu_icon('parallax'))
+        preset_header = self._add_export_menu_header(
+            preset_menu, "STEREO GEOMETRY",
+            "How pronounced the effect is", 300)
+        preset_group = QActionGroup(preset_menu)
+        preset_group.setExclusive(True)
+        preset_actions = {}
+        for key, label in (
+                ("comfort", "Comfort"),
+                ("cinema", "Cinema"),
+                ("immersion", "Immersion"),
+                ("custom", "Custom")):
+            action = QAction(label, preset_menu)
+            action.setCheckable(True)
+            action.setData(key)
+            preset_group.addAction(action)
+            preset_menu.addAction(action)
+            action.triggered.connect(
+                lambda checked=False, name=key:
+                    self.synth3d_preset_selected.emit(name) if checked else None)
+            preset_actions[key] = action
+        preset_actions["custom"].setChecked(True)
+        menu.addMenu(preset_menu)
+
+        # The sliders are the fine end of the same register as the presets
+        # above them, so no rule divides them: the section label already
+        # carries that structure.
+        strength_slider = self._add_menu_slider(
+            menu, "Depth strength", 5, 30, 15,
+            self.synth3d_strength_preview, self.synth3d_strength_changed)
+        convergence_slider = self._add_menu_slider(
+            menu, "Convergence", 0, 100, 50,
+            self.synth3d_convergence_preview, self.synth3d_convergence_changed)
+
+        # --- inspect ---------------------------------------------------------
+        menu.addSeparator()
+        self._add_export_menu_section(menu, "INSPECT", 340)
+
+        depth_view_action = QAction("Depth view", menu)
+        depth_view_action.setCheckable(True)
+        depth_view_action.setIcon(
+            self._export_menu_icon('eye', PremiumColors.WARNING))
+        diagnostics_action = QAction("Live diagnostics", menu)
+        diagnostics_action.setCheckable(True)
+        diagnostics_action.setIcon(
+            self._export_menu_icon('pulse', PremiumColors.WARNING))
+        menu.addAction(depth_view_action)
+        menu.addAction(diagnostics_action)
+
+        status_action = QAction("Engine: off", menu)
+        status_action.setEnabled(False)
+        menu.addAction(status_action)
+
+        # Assign all four together (atomic build -- see docstring) before
+        # wiring anything outward.
+        self.synth3d_enable_action = enable_action
+        self.synth3d_depth_view_action = depth_view_action
+        self.synth3d_strength_slider = strength_slider
+        self.synth3d_convergence_slider = convergence_slider
+        self.synth3d_diagnostics_action = diagnostics_action
+        self.synth3d_preset_menu = preset_menu
+        self.synth3d_preset_group = preset_group
+        self.synth3d_preset_actions = preset_actions
+        self.synth3d_depth_preset_menu = depth_preset_menu
+        self.synth3d_depth_preset_group = depth_preset_group
+        self.synth3d_depth_preset_actions = depth_preset_actions
+        self.synth3d_download_models_action = download_models_action
+        self.synth3d_status_action = status_action
+        self.synth3d_depth_preset_header = depth_preset_header
+        self.synth3d_preset_header = preset_header
+
+        enable_action.toggled.connect(self.synth3d_toggled)
+        depth_view_action.toggled.connect(self.synth3d_depth_view_toggled)
+        diagnostics_action.toggled.connect(self.synth3d_diagnostics_toggled)
+
+        self.synth3d_menu_header = header
+        self.synth3d_menu = menu
+        self.synth3d_button.setMenu(menu)
+
+    def set_synth3d_status(self, text):
+        """Set the single compact diagnostics line at the foot of the AI menu."""
+        if hasattr(self, 'synth3d_status_action'):
+            self.synth3d_status_action.setText(str(text))
+
+    def set_synth3d_models_summary(self, text, ready=True):
+        """Make the gateway row report its own state: "Depth models — Small
+        installed".
+
+        `ready` decides the tint. SUCCESS once a pack is on disk, WARNING while
+        the panel has nothing to run: a green light over "none installed" would
+        be the one dishonest colour in the menu, and this row is the only one
+        whose colour is a claim about the world rather than about its kind.
+
+        Same contract as set_synth3d_status -- the host is the authority on
+        what is installed and simply tells the overlay.
+        """
+        action = getattr(self, 'synth3d_download_models_action', None)
+        if action is None:
+            return
+        summary = str(text).strip()
+        action.setText("Depth models — %s" % summary if summary
+                       else "Depth models…")
+        action.setIcon(self._export_menu_icon(
+            'models',
+            PremiumColors.SUCCESS if ready else PremiumColors.WARNING))
+
+    def set_synth3d_selection_summary(self, depth_preset=None,
+                                      geometry_preset=None):
+        """Name the current choice on each submenu ROW, so a user reads their
+        configuration without opening anything.
+
+        The host passes its own persisted keys; the overlay resolves them
+        against the actions it built itself and never has to know what a preset
+        means. Either argument may be None to leave that row alone.
+        """
+        for menu, stem, actions, key in (
+                (getattr(self, 'synth3d_depth_preset_menu', None),
+                 self._SYNTH3D_DEPTH_PRESET_TITLE,
+                 getattr(self, 'synth3d_depth_preset_actions', None),
+                 depth_preset),
+                (getattr(self, 'synth3d_preset_menu', None),
+                 self._SYNTH3D_GEOMETRY_TITLE,
+                 getattr(self, 'synth3d_preset_actions', None),
+                 geometry_preset)):
+            if menu is None or key is None:
+                continue
+            action = (actions or {}).get(str(key))
+            label = action.text() if action is not None else str(key)
+            menu.setTitle("%s — %s" % (stem, label) if label else stem)
+
+    def _add_menu_slider(self, menu, label, lo, hi, val, preview_signal, changed_signal):
+        """A labeled QSlider hosted in the menu via QWidgetAction. `preview_signal`
+        fires on every valueChanged (live, e.g. while dragging); `changed_signal`
+        fires only on sliderReleased, with the slider's settled value -- the
+        single point where the host persists the setting."""
+        holder = QWidget()
+        lay = QVBoxLayout(holder)
+        lay.setContentsMargins(14, 4, 14, 6)
+        lay.setSpacing(2)
+        lab = QLabel(label)
+        lab.setObjectName("sylcMenuSubtitle")
+        lay.addWidget(lab)
+        s = QSlider(Qt.Orientation.Horizontal)
+        s.setRange(lo, hi)
+        s.setValue(val)
+        s.valueChanged.connect(preview_signal)
+        s.sliderReleased.connect(lambda: changed_signal.emit(s.value()))
+        lay.addWidget(s)
+        act = QWidgetAction(menu)
+        act.setDefaultWidget(holder)
+        menu.addAction(act)
+        return s
 
     @classmethod
     def _export_menu_icon_with_status(cls, kind, color, state):
