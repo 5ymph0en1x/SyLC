@@ -48,6 +48,12 @@ class HevcDecodeThread(QThread):
     frameYUVTimedReady = Signal(object, object, object)  # (left, right, pts_ms)
     endOfStream = Signal()
     decodeFailed = Signal(str)
+    # PGS streaming — MEME contrat de signaux que MVCDecoderThread, pour que le
+    # player branche l'aval (SubtitleManager.on_pgs_data, combo pistes) a
+    # l'identique. Les blocs sont collectes par la source au fil du demux (donc
+    # legerement en avance sur l'horloge) — aucune extraction de fichier.
+    pgsDataReady = Signal(bytes, float)          # (segments bruts, pts en s)
+    subtitleTracksDetected = Signal(list)        # [{trackNumber, codecId, isPGS, ...}]
     # Position of the frame just emitted, in SECONDS, throttled to ~4 Hz.
     # This is the UI timeline's only live position source for files where the
     # mpv shell has nothing to play (no audio track): frameYUVReady carries no
@@ -63,12 +69,30 @@ class HevcDecodeThread(QThread):
         self._paused = False
         self._seek_req = None        # ms | None
         self.clock_offset_provider = None   # callable -> ms de l'horloge maitre
+        # The standalone thread keeps its historical free-running defaults.  The
+        # player opts into the stricter audio-master contract in configure().
+        self._require_master_clock = False
+        self._bounded_delivery = False
+        self._presentation_pending = False
+        self._av_sync_offset_ms = 0.0
+        self._sync_drop_count = 0
+        self._backpressure_drop_count = 0
 
-    def configure(self, source, mode, half, inverted, swap_eyes=False):
+    def configure(self, source, mode, half, inverted, swap_eyes=False,
+                  start_paused=False, require_master_clock=False,
+                  bounded_delivery=False, av_sync_offset_s=0.0):
         # `half` n'affecte pas le split (les moities sont ce qu'elles sont);
         # l'upscale half-res = magnification du sampler du renderer.
         self._src, self._mode = source, mode
         self._inverted = bool(inverted) ^ bool(swap_eyes)
+        self._paused = bool(start_paused)
+        self._require_master_clock = bool(require_master_clock)
+        self._bounded_delivery = bool(bounded_delivery)
+        self._presentation_pending = False
+        self._av_sync_offset_ms = max(-1000.0, min(
+            2000.0, float(av_sync_offset_s) * 1000.0))
+        self._sync_drop_count = 0
+        self._backpressure_drop_count = 0
 
     def set_mode(self, mode):
         """Live stereo-mode switch from the UI combo ('sbs' | 'tab' | None). A plain
@@ -95,8 +119,75 @@ class HevcDecodeThread(QThread):
     def set_paused(self, paused):
         self._paused = bool(paused)
 
+    def set_master_clock_required(self, required):
+        """Switch between audio-master and PTS/wall-clock pacing.
+
+        This is used when mpv discovers that a nominally audio-backed session is
+        actually video-only.  It is intentionally a single atomic attribute
+        store: the decode loop samples it once per iteration.
+        """
+        self._require_master_clock = bool(required)
+
+    def adjust_av_offset(self, delta_s):
+        """Adjust the HEVC video trim (positive means delay video)."""
+        self._av_sync_offset_ms = max(-1000.0, min(
+            2000.0, self._av_sync_offset_ms + float(delta_s) * 1000.0))
+        return self._av_sync_offset_ms / 1000.0
+
+    def presentation_consumed(self):
+        """Acknowledge the sole queued GUI presentation.
+
+        With bounded delivery enabled the decoder never queues a second UHD
+        frame while the GUI still owns the first one.  It continues decoding on
+        the media timeline and simply discards obsolete presentations.
+        """
+        self._presentation_pending = False
+
+    def sync_stats(self):
+        return {
+            'sync_drops': int(self._sync_drop_count),
+            'backpressure_drops': int(self._backpressure_drop_count),
+            'presentation_pending': bool(self._presentation_pending),
+        }
+
+    def _master_clock_ms(self):
+        provider = self.clock_offset_provider
+        if provider is None:
+            return None
+        try:
+            value = provider()
+            if value is None:
+                return None
+            value = float(value)
+            if value < 0.0 or value != value:  # negative / NaN
+                return None
+            return value
+        except Exception:
+            return None
+
     def request_stop(self):
         self._stop = True
+
+    def set_subtitle_track(self, track_number):
+        """Route la selection de piste PGS vers la source (0/None desactive).
+        Store d'attribut cote source, GIL-atomique — meme patron que set_mode."""
+        src = self._src
+        if src is not None and hasattr(src, 'set_subtitle_track'):
+            src.set_subtitle_track(track_number)
+
+    def _poll_subtitles(self):
+        """Draine la file PGS de la source et emet pgsDataReady par bloc.
+        Appele depuis la boucle de decode, apres chaque lecture (les blocs sont
+        collectes au READ, contrat identique a mvc_decoder._poll_subtitles)."""
+        src = self._src
+        if src is None or not hasattr(src, 'has_subtitle_data'):
+            return
+        while src.has_subtitle_data():
+            ok, block = src.read_subtitle_block()
+            if not ok or block is None:
+                break
+            self.pgsDataReady.emit(bytes(block['data']),
+                                   float(block['timestampMs']) / 1000.0)
 
     def _read_next_pair(self):
         """Lit la prochaine paire (left, right, pts_ms) selon le mode courant, ou None
@@ -132,6 +223,16 @@ class HevcDecodeThread(QThread):
         return left, right, pts_ms
 
     def run(self):
+        # Pistes PGS connues des l'open de la source : publiees au demarrage du
+        # thread (miroir de la detection MVC), le player remplit le combo.
+        try:
+            src = self._src
+            if src is not None and hasattr(src, 'get_subtitle_tracks'):
+                tracks = src.get_subtitle_tracks()
+                if tracks:
+                    self.subtitleTracksDetected.emit(tracks)
+        except Exception as e:
+            logger.warning(f"[HEVC] detection pistes sous-titres echouee: {e}")
         anchor_wall = None           # perf_counter a l'ancre
         anchor_pts = 0.0             # pts (ms) a l'ancre
         last_interval_s = 1.0 / 24.0     # repli quand une frame n'a pas de pts
@@ -173,6 +274,14 @@ class HevcDecodeThread(QThread):
                     anchor_wall = None
                     time.sleep(0.01)
                     continue
+                # Audio-backed HEVC must not consume even one frame before mpv
+                # has published a usable master clock.  This is the startup
+                # barrier that prevents video from running ahead while TrueHD
+                # initializes.  Video-only files leave this requirement off.
+                if self._require_master_clock and self._master_clock_ms() is None:
+                    anchor_wall = None
+                    time.sleep(0.005)
+                    continue
                 out = self._read_next_pair()
                 if out is None:
                     if getattr(self._src, 'failed', False):
@@ -181,6 +290,14 @@ class HevcDecodeThread(QThread):
                         self.endOfStream.emit()
                     return
                 left, right, pts_ms = out
+                # Sous-titres PGS : drain apres CHAQUE lecture, hors du try de
+                # la video ? Non — dans le try global, mais isole : un pepin de
+                # sous-titre ne doit jamais casser la lecture video (meme regle
+                # que mvc_decoder ligne ~2975).
+                try:
+                    self._poll_subtitles()
+                except Exception as exc:
+                    logger.warning(f"[HEVC] poll sous-titres en echec: {exc}")
                 if pts_ms >= 0:
                     now = time.perf_counter()
                     if anchor_wall is None:
@@ -202,23 +319,34 @@ class HevcDecodeThread(QThread):
                                     _m_master_hi = master
                         except Exception:
                             pass
-                    # FREE-RUN pacing: the video is paced PURELY by its own pts cadence, the
-                    # correct 23.976 fps real-time clock. The mpv audio time-pos exposed via
-                    # clock_offset_provider is a cache drained by a GIL-starved Python callback
-                    # and was MEASURED advancing at only ~0.4x real time while ALWAYS trailing
-                    # ([HEVC-METER] master rate ~410 ms/s; drift always positive). The former
-                    # design hard-snapped the anchor to that cache whenever drift > 100 ms,
-                    # which fired ~4x/s and yanked the video clock ~150 ms BACKWARD each time —
-                    # THAT was the "lecture horriblement saccadee". Any drift-based re-anchor to
-                    # this cache is unsafe: the ~0.4x trailing makes drift grow without bound,
-                    # so every threshold eventually triggers a large backward jump. mpv's real
-                    # audio device runs at 1x on its own C threads (GIL-independent) and the
-                    # video pts is also 1x, so a pure free-run stays in A/V sync WITHOUT chasing
-                    # the broken cache. Explicit user seeks still re-anchor via the _seek_req
-                    # path above (both mpv and this thread are driven by the same seek).
-                    due = anchor_wall + (float(pts_ms) - anchor_pts) / 1000.0
-                    delay = min(due - now, 0.5)     # borne anti-blocage (pts aberrant)
-                    if _diag and (due - now) < 0.0:
+                    # Prefer the reconstructed mpv AUDIO clock.  Unlike the old raw
+                    # observer cache this clock is extrapolated at 1x between callbacks,
+                    # so we never hard-snap backwards to a GIL-starved sample.  A frame
+                    # ahead waits; a frame over one frame late is discarded until the
+                    # video content catches up with audio.
+                    master_ms = self._master_clock_ms()
+                    if master_ms is not None:
+                        anchor_wall = None
+                        target_ms = float(pts_ms) + self._av_sync_offset_ms
+                        error_ms = target_ms - master_ms
+                        frame_ms = max(1.0, last_interval_s * 1000.0)
+                        late_drop_ms = max(45.0, min(100.0, frame_ms * 1.25))
+                        if error_ms < -late_drop_ms:
+                            self._sync_drop_count += 1
+                            if _diag:
+                                _m_late += 1
+                            continue
+                        delay = min(max(0.0, error_ms / 1000.0), 0.5)
+                    else:
+                        # Video-only / unavailable master: preserve the proven PTS
+                        # wall-clock pacing used by the standalone HEVC tests.
+                        if anchor_wall is None:
+                            anchor_wall, anchor_pts = now, float(pts_ms)
+                        due = anchor_wall + (float(pts_ms) - anchor_pts) / 1000.0
+                        delay = min(due - now, 0.5)  # borne anti-blocage (pts aberrant)
+                    if _diag and master_ms is None and (due - now) < 0.0:
+                        # `due` exists only in wall-clock mode.  Audio-master
+                        # lateness is counted at the drop decision above.
                         _m_late += 1
                 else:
                     # Pas de pts: cadence de repli (dernier intervalle valide)
@@ -228,13 +356,14 @@ class HevcDecodeThread(QThread):
                         logger.warning(f"[HEVC] frame sans pts (#{nopts_count}): "
                                        f"cadence de repli {last_interval_s * 1000:.0f} ms")
                     delay = last_interval_s
-                while delay > 0 and not self._stop and self._seek_req is None:
+                while (delay > 0 and not self._stop and self._seek_req is None
+                       and not self._paused):
                     step = min(delay, 0.01)
                     time.sleep(step)
                     delay -= step
                 # Recheck peremption AVANT emission, quel que soit le pts:
                 # une frame decodee avant un seek ne part jamais.
-                if self._seek_req is not None or self._stop:
+                if self._seek_req is not None or self._stop or self._paused:
                     continue
                 if _diag:
                     _te = time.perf_counter()
@@ -260,8 +389,13 @@ class HevcDecodeThread(QThread):
                         _m_master_changes = 0
                         _m_master_lo = None
                         _m_master_hi = None
-                self.frameYUVReady.emit(left, right)
-                self.frameYUVTimedReady.emit(left, right, float(pts_ms))
+                if self._bounded_delivery and self._presentation_pending:
+                    self._backpressure_drop_count += 1
+                else:
+                    if self._bounded_delivery:
+                        self._presentation_pending = True
+                    self.frameYUVReady.emit(left, right)
+                    self.frameYUVTimedReady.emit(left, right, float(pts_ms))
                 # Timeline feed: throttled (250 ms of pts progress, or any
                 # backward jump = seek) so the GUI never sees a per-frame storm.
                 if pts_ms >= 0 and (last_pos_emit_ms is None

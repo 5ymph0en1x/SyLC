@@ -1236,6 +1236,176 @@ def _detect_packing(path, meta):
     return 'tab' if (h and w / h < 1.4) else 'sbs'
 
 
+class Synth3DAdapter(_BaseAdapter):
+    """2D->3D AI synthesis (spec round-5c, author directive 2026-08-03):
+    the OFFLINE deployment of the realtime synth3d pipeline, reachable ONLY
+    through the export menu while the viewer has the AI active on a 2D file.
+
+    ffmpeg decodes the 2D source to i420 on a pipe; a detached offscreen
+    NativeRenderer (hidden Win32 window, same harness family as the synth3d
+    GPU golden tests) runs the EXACT production warp with the viewer's live
+    tuning (strength/convergence/auto-conv/temporal fill, carried in the
+    descriptor). Offline pacing IS the quality unlock: the encode loop is far
+    slower than the depth worker's cycle, so — unlike realtime's latest-only
+    mailbox — every single frame gets its own inference. The second present()
+    before readback consumes the map inferred FROM this frame (reprojection
+    included), not the previous one."""
+
+    supports_tonemap = True
+
+    _WARMUP_S = 12.0       # ORT/TRT session build + first map (verified cache)
+    _INFER_WAIT_S = 0.05   # one worker cycle (33-41ms measured) + margin
+
+    def __init__(self, desc, opts):
+        super().__init__(desc, opts)
+        self._renderer = None
+        self._hwnd = None
+
+    def metadata(self):
+        if self._meta:
+            return self._meta
+        m = self._probe_metadata()
+        per_w, per_h = m['width'], m['height']
+        self._apply_hdr_policy(m)
+        m = self._finalise_meta(m, per_w, per_h, 1)   # FSBS canvas, L then R
+        self._meta = m
+        return self._meta
+
+    def open(self):
+        s3d = self.desc.get('synth3d') or {}
+        if not s3d.get('model_path'):
+            raise RuntimeError(
+                '2D->3D depth model not installed — enable the AI once in the '
+                'player (which downloads it) before exporting.')
+        import ctypes
+        import mvc_demuxer_cpp
+        m = self.metadata()
+        user32 = ctypes.windll.user32
+        self._hwnd = user32.CreateWindowExW(
+            0, 'STATIC', 'sylc-synth3d-export', 0, 0, 0, 4, 4,
+            None, None, None, None)
+        if not self._hwnd:
+            raise RuntimeError('could not create the offscreen export window')
+        r = mvc_demuxer_cpp.NativeRenderer()
+        if not r.initialize(int(self._hwnd), int(m['width']), int(m['height']),
+                            False):
+            raise RuntimeError(f'offscreen renderer init failed: {r.last_error()}')
+        kwargs = dict(
+            strength_pct=float(s3d.get('strength_pct', 1.5)),
+            convergence=float(s3d.get('convergence', 0.5)),
+            depth_view=False,
+            model_path=s3d.get('model_path', ''),
+            ort_dir=s3d.get('ort_dir', ''),
+            auto_convergence=bool(s3d.get('auto_convergence', False)),
+            temporal_fill=bool(s3d.get('temporal_fill', False)),
+        )
+        if int(s3d.get('side') or 0) > 0:
+            kwargs['side'] = int(s3d['side'])
+        if not r.set_synth3d(True, **kwargs):
+            r.shutdown()
+            raise RuntimeError('set_synth3d refused (model/runtime unavailable?)')
+        self._renderer = r
+
+    def _synthesize(self, y, u, v, wait_s):
+        r = self._renderer
+        r.set_yuv_frame(y, u, v)
+        r.present(0)
+        if wait_s > 0:
+            time.sleep(wait_s)
+        r.present(0)   # consume THIS frame's map (per-frame inference)
+
+    def frames(self):
+        import numpy as np
+        m = self.metadata()
+        w, h = m['width'], m['height']
+        y_sz, c_sz = w * h, (w // 2) * (h // 2)
+        fb_in = y_sz + 2 * c_sz
+        max_frames = self.opts.get('max_frames')
+        cmd = [_ffmpeg_path(), '-v', 'error', '-nostdin', '-i', self.path,
+               '-map', '0:v:0']
+        if max_frames:
+            cmd += ['-frames:v', str(int(max_frames))]
+        if m.get('tonemap'):
+            cmd += ['-vf', _TONEMAP_FILTER]
+        cmd += ['-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-']
+        logger.info('[EXPORT] synth3d decode: %s', ' '.join(cmd))
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, bufsize=0,
+                                creationflags=_NO_WINDOW)
+        self._procs.append(proc)
+        err_tail = collections.deque(maxlen=32)
+        drain = threading.Thread(target=_drain_stream, args=(proc.stderr, err_tail),
+                                 daemon=True)
+        drain.start()
+        reached_eof = False
+        torn_bytes = 0
+        first = True
+        try:
+            while not self._cancel.is_set():
+                data = _read_exact(proc.stdout, fb_in)
+                if len(data) < fb_in:
+                    reached_eof = True
+                    torn_bytes = len(data)
+                    break
+                buf = np.frombuffer(data, np.uint8)
+                y = buf[:y_sz].reshape(h, w)
+                u = buf[y_sz:y_sz + c_sz].reshape(h // 2, w // 2)
+                v = buf[y_sz + c_sz:].reshape(h // 2, w // 2)
+                if first:
+                    # Session warm-up: keep feeding frame 0 until the depth
+                    # service has built its ORT/TRT session and published the
+                    # first map — exporting before that would warp on nothing.
+                    first = False
+                    deadline = time.monotonic() + self._WARMUP_S
+                    while (time.monotonic() < deadline
+                           and not self._cancel.is_set()):
+                        self._synthesize(y, u, v, self._INFER_WAIT_S)
+                        time.sleep(0.05)
+                if self._cancel.is_set():
+                    break
+                self._synthesize(y, u, v, self._INFER_WAIT_S)
+                r = self._renderer
+                yl, ul, vl = (r.synth3d_read_plane(0), r.synth3d_read_plane(1),
+                              r.synth3d_read_plane(2))
+                yr, ur, vr = (r.synth3d_read_plane(3), r.synth3d_read_plane(4),
+                              r.synth3d_read_plane(5))
+                yield _pack_i420(yl, ul, vl, yr, ur, vr,
+                                 swap=self._swap_views)
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            if reached_eof and not self._cancel.is_set():
+                rc = _wait_quiet(proc, 20)
+                drain.join(timeout=2)
+                tail = b''.join(err_tail).decode('utf-8', 'replace').strip()[-400:]
+                if rc not in (0, None):
+                    self.error = (f'ffmpeg decode of the source failed (rc={rc})'
+                                  + (f': {tail}' if tail else ''))
+                elif torn_bytes:
+                    self.error = (f'source decode ended mid-frame ({torn_bytes} of '
+                                  f'{fb_in} bytes) — truncated or corrupt'
+                                  + (f': {tail}' if tail else ''))
+            _kill(proc)
+
+    def close(self):
+        super().close()
+        if self._renderer is not None:
+            try:
+                self._renderer.shutdown()
+            except Exception:
+                pass
+            self._renderer = None
+        if self._hwnd:
+            try:
+                import ctypes
+                ctypes.windll.user32.DestroyWindow(self._hwnd)
+            except Exception:
+                pass
+            self._hwnd = None
+
+
 def build_adapter(desc, opts):
     kind = desc.get('kind')
     if kind == 'packed':
@@ -1244,6 +1414,8 @@ def build_adapter(desc, opts):
         return MVHEVCAdapter(desc, opts)
     if kind == 'mvc':
         return MVCAdapter(desc, opts)
+    if kind == 'synth3d':
+        return Synth3DAdapter(desc, opts)
     raise ValueError(f'unknown source kind: {kind!r}')
 
 

@@ -256,11 +256,29 @@ class _BorderlessOutputWindow(QMainWindow):
 class Framepacking3DWindow(_BorderlessOutputWindow):
     """D3D11-native 3D framepacking window with HDR support."""
 
+    # Full side-by-side for video glasses: two 1920x1080 eyes in one frame. The
+    # glasses split whatever they receive at its midpoint, so the halves must be
+    # a full 1920 wide or the picture arrives horizontally squeezed.
+    FSBS_WIDTH = 3840
+    FSBS_HEIGHT = 1080
+
+    # Fix round 3: the player's Glasses aspect clamp needs to know the ACTUAL
+    # current client size, and that goes stale the instant fake-fullscreen is
+    # toggled (Win32 SetWindowPos, Qt's own fullscreen state never sees it).
+    # Emitted from resizeEvent below, which fires for both an ordinary Qt
+    # resize AND the raw Win32 resize enter/exit_fake_fullscreen perform --
+    # same underlying WM_SIZE, same Qt delivery path -- so this is the one
+    # signal that covers every way this window's size can actually change.
+    geometryChanged = Signal(int, int)
+
     def __init__(self, parent=None, use_yuv_shader=True, display_widget=None):
         super().__init__(parent)
         self.setWindowTitle("3D Frame-Packed Output (D3D11 HDR)")
-        self.resize(960, 1102)
+        self._last_geometry_mode = 'framepack'
+        self.apply_output_geometry('framepack')
         self.setStyleSheet("background-color: black;")
+        # Fix round 3, Minor: see _reapply_geometry_on_hide below.
+        self.visibilityChanged.connect(self._reapply_geometry_on_hide)
 
         if display_widget:
             self.display_widget = display_widget
@@ -272,6 +290,76 @@ class Framepacking3DWindow(_BorderlessOutputWindow):
         self.setCentralWidget(self.display_widget)
         self.use_yuv_shader = use_yuv_shader
         logger.info("[D3D11-WINDOW] Framepacking3DWindow created (D3D11 HDR mode)")
+
+    def apply_output_geometry(self, mode):
+        """Size the client area for `mode` and return the (w, h) applied.
+
+        Frame-packed output is 1920x2205 -- two 1080 frames plus 45 lines of
+        blanking -- and its window opens at half that so it fits an ordinary
+        desktop. F-SBS has no such headroom: 3840x1080 IS the signal, and a
+        smaller window would hand the glasses a squeezed picture to split.
+
+        A 3840-wide window can exceed the desktop; Windows may clamp it, and
+        that is acceptable -- the user drags it onto the glasses and goes
+        fullscreen there, where the display is 3840x1080 and the match is exact.
+        """
+        # Remembered so exit_fake_fullscreen can re-apply the SAME mode after
+        # restoring windowed geometry (fix round 3, see that override below).
+        self._last_geometry_mode = str(mode)
+        if str(mode).lower() == 'glasses':
+            size = (self.FSBS_WIDTH, self.FSBS_HEIGHT)
+        else:
+            size = (960, 1102)
+        # Called on every reconfigure now, not just __init__. A live fullscreen
+        # output must not be resized out from under itself: enter_fake_fullscreen
+        # is pure Win32 (Qt has no idea the window is fullscreen), so a resize()
+        # here would shrink a fullscreen 3D output down to a small borderless
+        # rectangle while _is_fake_fullscreen stays True. Skip while fullscreen,
+        # and skip when already at the target size (avoids a redundant resize).
+        # The size is still returned either way, so callers/tests reading the
+        # return value see the geometry that applies, whether or not this call
+        # was the one to apply it.
+        if not getattr(self, '_is_fake_fullscreen', False) and (self.width(), self.height()) != size:
+            self.resize(*size)
+        return size
+
+    def _reapply_geometry_on_hide(self, visible):
+        """Re-apply this window's own last requested layout whenever it goes
+        invisible (fix round 3, Minor).
+
+        Deliberately a signal-connected method, not an `exit_fake_fullscreen`
+        override -- `test_framepack_window_inherits_the_shared_fullscreen_
+        base` pins that fullscreen machinery lives ONLY on
+        `_BorderlessOutputWindow`, never redefined per-subclass, and that
+        invariant is worth keeping: it is what stops this window's fullscreen
+        behaviour from silently diverging from the Dual Projector eye
+        windows', which share the same base.
+
+        The bug this closes: the base `exit_fake_fullscreen` only knows how
+        to restore `_saved_rect`, captured at ENTER time -- but a mode switch
+        made WHILE fullscreen (MultiView windowed -> F -> pick Glasses -> F to
+        exit) never touches that saved rect, because `apply_output_geometry`
+        is correctly SKIPPED for the whole time this window is fullscreen
+        (the guard in that method). Nothing else ever moves the window onto
+        the size the now-active mode actually wants, so exiting lands back on
+        the stale pre-fullscreen size holding the new mode's layout -- e.g. a
+        960x1102 window showing F-SBS, each eye 480px wide.
+
+        Safe to run on every hide, not just a fullscreen exit: `exit_fake_
+        fullscreen` emits `visibilityChanged(False)` AFTER restoring
+        `_saved_rect` and clearing `_is_fake_fullscreen`, so by the time this
+        fires after a genuine fullscreen exit, `apply_output_geometry` is no
+        longer guarded off and lands on the CURRENT mode's size. On a plain
+        `hide()` (no fullscreen involved), `_last_geometry_mode` already
+        matches the window's current size, so this is a harmless no-op (the
+        same size-comparison guard in `apply_output_geometry` skips the
+        redundant resize)."""
+        if not visible:
+            self.apply_output_geometry(getattr(self, '_last_geometry_mode', 'framepack'))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.geometryChanged.emit(self.width(), self.height())
 
     def display_frame(self, qimage):
         """Display a QImage frame (compatibility method)."""

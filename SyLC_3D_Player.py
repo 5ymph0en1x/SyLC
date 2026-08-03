@@ -242,6 +242,10 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(threadName)s %(name)s: %(message)s',
     handlers=_log_handlers or None)
 logger = logging.getLogger(__name__)
+
+# The five OUTPUT presentation keys the stereo combo can emit ('auto' is the
+# absence of a pick, not a presentation). Shared by the per-file memory hooks.
+PRESENTATION_KEYS = ('mvc', 'sbs', 'tab', 'dual', 'glasses')
 if _log_level != logging.INFO:
     logger.info("[STARTUP] log level = %s (SYLC_LOG_LEVEL)",
                 logging.getLevelName(_log_level))
@@ -506,6 +510,7 @@ def _find_asset(name):
 import mpv
 import numpy as np
 from premium_controls_overlay import PremiumControlsOverlay as ControlsOverlay
+from stereo_hud import StereoHudController
 
 print("[STARTUP] PySide6/mpv/numpy imports succeeded")
 
@@ -686,6 +691,39 @@ SYNTH3D_ADAPTIVE_MODEL_GRIDS = (
     ("da3_small_518x238.onnx", 518, 238),
     ("da3_small_518x210.onnx", 518, 210),
 )
+
+# A seek used to bounce EVERY adaptive selection back through the square graph
+# so the new position could re-earn its eight-observation verdict. Measured
+# 2026-08-03 on a native 1920x808 master: that detour costs ~1-3 s of
+# non-nominal depth per seek -- flat 2D, then depth computed on the SQUARE
+# 756x756 grid over 2.376:1 content, then flat again, then the 300 ms ramp --
+# and re-primes EMA/plate/tone/history TWICE instead of once.
+# It only ever guarded against a matte that changes mid-title (a Scope/IMAX
+# reel switch). A selection earned from the CODED frame dimensions cannot be
+# invalidated by a seek: those dimensions belong to the file, not to the
+# position. So only matte-derived overrides still take the detour.
+# SYLC_SYNTH3D_SEEK_KEEP_ASPECT=0 restores the unconditional detour.
+SYNTH3D_SEEK_KEEP_ASPECT = os.environ.get(
+    'SYLC_SYNTH3D_SEEK_KEEP_ASPECT', '1').strip().lower() not in {
+        '0', 'false', 'off', 'disabled', 'no'}
+
+
+def _synth3d_seek_keeps_aspect(override):
+    """True when a seek must NOT bounce this aspect override through the square.
+
+    The probe is deliberately getattr-based (house idiom): a foreign, fake or
+    legacy selection object answers None, never 0, and therefore keeps the
+    historical clear-everything behaviour. Only a real AspectSelection whose
+    matte is empty on BOTH edges -- i.e. one derived from the coded dimensions
+    -- is retained across the seek.
+    """
+    if not SYNTH3D_SEEK_KEEP_ASPECT:
+        return False
+    selection = (override[2]
+                 if isinstance(override, tuple) and len(override) >= 3
+                 else None)
+    return (getattr(selection, 'crop_top', None) == 0
+            and getattr(selection, 'crop_bottom', None) == 0)
 
 # The preset choice is a per-user preference that must survive a restart, so it
 # lives in QSettings rather than in the JSON app-settings file (which holds the
@@ -1494,6 +1532,7 @@ class Video3DAnalyzer:
             'fps': None,
             'codec_name': None,    # H.264 ('h264') eligible for edge264 path
             'container_ext': None, # File extension (.mkv, .mp4, .ssif, ...)
+            'has_audio': None,     # None = probe unavailable, bool after ffprobe
         }
         # Capture extension early — analyzer uses it for codec routing decisions.
         try:
@@ -1561,6 +1600,9 @@ class Video3DAnalyzer:
                 return result
 
             data = json.loads(completed.stdout or "{}")
+            streams = data.get('streams', [])
+            result['has_audio'] = any(
+                stream.get('codec_type') == 'audio' for stream in streams)
 
             format_info = data.get('format', {})
             duration_str = format_info.get('duration')
@@ -1570,7 +1612,7 @@ class Video3DAnalyzer:
                 except ValueError:
                     pass
 
-            for stream_index, stream in enumerate(data.get('streams', [])):
+            for stream_index, stream in enumerate(streams):
                 if stream.get('codec_type') == 'video':
                     result['width'] = stream.get('width', 0)
                     result['height'] = stream.get('height', 0)
@@ -1829,11 +1871,18 @@ def _decide_thumbs_mode(file_path, mounted_iso_letters, optical_letters, codec_n
     d = os.path.splitdrive(os.path.abspath(file_path))[0]
     letter = d[0].upper() if d else None
     if letter and letter in optical_letters:
-        # Optical-class = OFF unconditionally (physical disc AND player-mounted
-        # ISO). A concurrent in-process demuxer/edge264 reader on the mounted UDF
-        # volume breaks playback's demuxer reads (proven: Avatar init break;
-        # GITS dual-file BD3D 0xe24c4a02 crash on timeline hover). is_optical
-        # stays True so callers still treat it as optical-class.
+        if letter in (mounted_iso_letters or set()):
+            # Player-mounted ISO: a virtual volume has no optical head to
+            # thrash. The in-process service reads it with its OWN demuxer,
+            # DISARMED around init/seeks and throttled by the optical pacing
+            # (OPTICAL_MIN_INTERVAL_S) — the guardrails built after the
+            # 2026-07-14/22 concurrent-read breaks. Author decision
+            # 2026-08-02: only a PHYSICAL disc skips thumbnails; ISOs must
+            # produce them. is_optical=True keeps those guardrails engaged.
+            return ('edge264', True) if is_h264 else ('avcodec', True)
+        # Physical optical drive: the single head is already shared by mpv
+        # (audio) and the video demuxer — a third reader causes measured
+        # 45-120 s head thrash. The ONE case with no thumbnails.
         return 'off', True
     return ('edge264', False) if is_h264 else ('avcodec', False)
 
@@ -1964,6 +2013,12 @@ class TimeSlider(QSlider):
             print(f"[ERROR] {e}")
 
     def _show_preview_at(self, mouse_x):
+        # FIX VIGNETTE : Lecture persistante de la propriété définie par le HUD
+        if self.property('hud_mode'):
+            self._preview_widget.hide()
+            self.update()
+            return
+
         global_pos = self.mapToGlobal(QPoint(int(mouse_x), 0))
         tooltip_x = global_pos.x() - self._preview_widget.width() // 2
         tooltip_y = global_pos.y() - self._preview_widget.height() - 10
@@ -2792,6 +2847,10 @@ class PlayerWindow(QMainWindow):
         self.controls_overlay = ControlsOverlay(self)
         # Note: We do NOT add it to the layout anymore. It will be positioned manually in resizeEvent.
         self.controls_overlay.raise_()
+        # In 3D output modes the same canonical Qt controls are captured into an
+        # eye-local RGBA HUD and composed by the native shader. The controller
+        # also remaps clicks from either eye back to these widgets.
+        self.stereo_hud = StereoHudController(self, self.controls_overlay)
 
         print("[STARTUP] Controls overlay created")
         self.info_overlay = InfoOverlay("Click here or drop a file", self)
@@ -2866,6 +2925,11 @@ class PlayerWindow(QMainWindow):
         self._last_drift_adjust_time = 0.0
         self._cumulative_drift = 0.0
         self._sync_bias = 0.0  # Low-pass bias to cancel constant offset
+        # Non-blocking mpv audio clock.  The observer provides sparse media-time
+        # samples; _mpv_time_pos_ms extrapolates them at 1x using monotonic time.
+        self._mpv_time_pos_cache = None
+        self._mpv_time_pos_cache_mono = None
+        self._mpv_pause_cache = True
 
         # V60: persisted per-install settings (currently: the A/V sync trim set
         # with [ and ] — re-applied to every new decoder thread).
@@ -2881,6 +2945,10 @@ class PlayerWindow(QMainWindow):
                 float(self._app_settings.get('synth3d_convergence', 0.5))))
         except Exception:
             self._synth3d_strength, self._synth3d_convergence = 1.5, 0.5
+        self._synth3d_auto_convergence = bool(
+            self._app_settings.get('synth3d_auto_convergence', False))
+        self._synth3d_temporal_fill = bool(
+            self._app_settings.get('synth3d_temporal_fill', False))
         self._synth3d_depth_view = False
         self._synth3d_diagnostics = False
         # (absolute square-model path, square side, AspectSelection). Kept for
@@ -2897,6 +2965,14 @@ class PlayerWindow(QMainWindow):
         if self._synth3d_preset not in {
                 'comfort', 'cinema', 'immersion', 'custom'}:
             self._synth3d_preset = 'custom'
+        # MatAnyone 2 is an optional, isolated CUDA worker. "auto" is the
+        # production default: it starts only when the complete offline runtime
+        # is installed, and otherwise leaves the depth-only renderer untouched.
+        _matting_mode = os.environ.get('SYLC_MATANYONE2', 'auto').strip().lower()
+        self._synth3d_matting_requested = _matting_mode not in {
+            '0', 'false', 'off', 'disabled', 'no'}
+        self._synth3d_matte_service = None
+        self._synth3d_matte_unavailable_logged = False
 
         # --- SEEK / SCRUBBING STATE ---
         # Standard "Seek on Release" logic to prevent decoder saturation
@@ -3051,7 +3127,7 @@ class PlayerWindow(QMainWindow):
         # mouseMoveEvent doesn't fire). Behaviour: any movement inside the window shows
         # the bar; no movement for 3 s (playing) / 5 s (paused) hides it.
         self._nav_last_cursor = QCursor.pos()
-        self._nav_last_activity = 0.0
+        self._nav_last_activity = time.monotonic()
         self._nav_had_media = False
         self._nav_poll = QTimer(self)
         self._nav_poll.setInterval(120)
@@ -3333,6 +3409,13 @@ class PlayerWindow(QMainWindow):
         self.controls_overlay.stereo_mode_changed.connect(self.change_stereo_mode)
         self.controls_overlay.audio_track_changed.connect(self.change_audio_track)
         self.controls_overlay.subtitle_track_changed.connect(self.change_subtitle_track)
+        # Per-file memory: an explicit eye-order pick is per-title by design
+        # (the load path resets it) — remember it for this title's replays.
+        try:
+            self.controls_overlay.export_eye_order_group.triggered.connect(
+                self._on_eye_order_picked)
+        except Exception:
+            pass
         # 2D->3D (AI) conversion (Task 8): sliders are single-purpose -- the
         # *_preview signals (live, valueChanged) push without persisting;
         # the *_changed signals (sliderReleased) are what persists to disk.
@@ -3352,6 +3435,10 @@ class PlayerWindow(QMainWindow):
         self.controls_overlay.synth3d_convergence_preview.connect(
             lambda v: self.set_synth3d_convergence(v, persist=False))
         self.controls_overlay.synth3d_convergence_changed.connect(self.set_synth3d_convergence)
+        self.controls_overlay.synth3d_auto_convergence_toggled.connect(
+            self.set_synth3d_auto_convergence)
+        self.controls_overlay.synth3d_temporal_fill_toggled.connect(
+            self.set_synth3d_temporal_fill)
         self.controls_overlay.synth3d_menu.aboutToShow.connect(self._update_synth3d_menu_state)
         self.info_overlay.file_clicked.connect(self.open_file_dialog)
         self.controls_overlay.installEventFilter(self)
@@ -3387,9 +3474,11 @@ class PlayerWindow(QMainWindow):
         if not self.is_playing:
             return
 
-        # If mouse is not over controls overlay and not outside window, start timer
-        if not self.controls_overlay.underMouse() and not self._mouse_outside_window:
-            self._mouse_inactivity_timer.start()
+        # Closing a popup is itself user activity. The global nav poll is the
+        # sole hide authority; refresh its deadline instead of arming a second
+        # timer which can later fire while another popup/drag is active.
+        if not self._mouse_outside_window:
+            self._mark_activity()
 
     def _ensure_controls_timer_initialized(self):
         """Initialize controls hide timer in GUI thread when first needed"""
@@ -3402,6 +3491,7 @@ class PlayerWindow(QMainWindow):
     def _on_slider_pressed(self):
         """User started dragging the slider. Pause playback."""
         self._is_scrubbing = True
+        self._mark_activity()
         if self.player:
             self._was_playing_before_scrub = not self.player.pause
             if self._was_playing_before_scrub:
@@ -3551,7 +3641,7 @@ class PlayerWindow(QMainWindow):
                     # same unit the on_time_update observer stores; _mpv_time_pos_ms
                     # multiplies by 1000) BEFORE seeking, so the decode thread re-anchors
                     # to the target rather than the stale pre-seek position.
-                    self._mpv_time_pos_cache = time_pos
+                    self._prime_mpv_time_pos(time_pos)
                     self.hevc_thread.seek_to(time_pos * 1000.0)
                 except Exception:
                     pass
@@ -3716,7 +3806,7 @@ class PlayerWindow(QMainWindow):
                 # unit the on_time_update observer stores; _mpv_time_pos_ms multiplies by
                 # 1000) BEFORE seeking, so the decode thread re-anchors to the target
                 # rather than the stale pre-seek position.
-                self._mpv_time_pos_cache = target_time
+                self._prime_mpv_time_pos(target_time)
                 self.hevc_thread.seek_to(target_time * 1000.0)
             except Exception:
                 pass
@@ -3775,7 +3865,7 @@ class PlayerWindow(QMainWindow):
                   f"(mvc_mode_active=False, pipeline fell back to 2D)")
 
     def update_ui_state(self):
-        self.controls_overlay.show()
+        self.show_controls()
         self.info_overlay.setVisible(not self.has_media)
         if self.has_media:
             # Metrics overlay disabled to remove top-left artifact
@@ -3790,22 +3880,85 @@ class PlayerWindow(QMainWindow):
 
     def _controls_shown(self):
         """True if the nav bar is actually visible (accounts for the fullscreen opacity trick)."""
+        hud = getattr(self, 'stereo_hud', None)
+        if hud is not None and hud.active:
+            return bool(hud.desired_visible)
         if not self.controls_overlay.isVisible():
             return False
         eff = self.controls_overlay.graphicsEffect()
         if eff and eff.opacity() < 0.1:
             return False
+        if self.controls_overlay.windowOpacity() < 0.1:
+            return False
         return True
 
     def _controls_busy(self):
         """True if the user is interacting with the bar (hovering it or an open dropdown) — never auto-hide then."""
+        if getattr(self, '_is_scrubbing', False):
+            return True
+
         try:
-            if self.controls_overlay.underMouse():
+            slider = self.controls_overlay.time_slider
+            if slider.isSliderDown():
                 return True
+            volume = getattr(self.controls_overlay, 'volume_slider', None)
+            if volume is not None and getattr(volume, '_dragging', False):
+                return True
+        except Exception:
+            pass
+
+        hud = getattr(self, 'stereo_hud', None)
+        hud_active = bool(hud is not None and hud.active)
+        
+        # --- DÉTECTION DES FENÊTRES EXTÉRIEURES ---
+        has_external = False
+        fp = getattr(self, 'framepacking_window', None)
+        if fp and getattr(fp, 'isVisible', lambda: False)():
+            has_external = True
+        eyes = getattr(self, 'eye_windows', None)
+        if eyes and any(e and getattr(e, 'isVisible', lambda: False)() for e in eyes):
+            has_external = True
+        
+        hide_native = hud_active and not has_external
+
+        if hud_active:
+            if (getattr(hud, '_popup', None) is not None
+                    or getattr(hud, '_pressed_widget', None) is not None):
+                return True
+            # La soupape anti-drapeau-collé doit lire l'horloge d'interaction
+            # DU HUD : _nav_poll_tick rafraîchit _nav_last_activity à chaque
+            # tick occupé (120 ms), donc une fenêtre de 10 s mesurée sur
+            # _nav_last_activity ne peut jamais expirer — un `interacting`
+            # resté vrai épinglait les barres pour toujours.
+            if (getattr(hud, 'interacting', False)
+                    and time.monotonic() - getattr(hud, 'last_interaction', 0.0) < 10.0):
+                return True
+            # En mode HUD pur (vidéo 3D directement dans la fenêtre principale), on s'arrête ici
+            if hide_native:
+                return False
+
+        try:
+            # Le hover Qt n'est fiable que SANS HUD stéréo : en mode HUD (mono
+            # comme pilote/FramePack), la barre capturée/remappée garde un
+            # WA_UnderMouse périmé à True, et chaque tick occupé rafraîchit
+            # l'échéance — les deux barres par œil ne disparaissaient JAMAIS.
+            # Un survol réel continue d'épingler la barre : ses événements
+            # Enter/MouseMove passent par l'eventFilter → _mark_activity().
+            if not hud_active and self.controls_overlay.underMouse():
+                return True
+                
             for combo in (self.controls_overlay.audio_track_combo,
                           self.controls_overlay.subtitle_track_combo,
                           self.controls_overlay.stereo_mode_combo):
                 if combo.view().isVisible():
+                    return True
+                    
+            for name in ('export_menu', 'export_mvhevc_menu',
+                         'export_eye_order_menu', 'cast_menu',
+                         'synth3d_menu', 'synth3d_preset_menu',
+                         'synth3d_depth_preset_menu'):
+                menu = getattr(self.controls_overlay, name, None)
+                if menu is not None and menu.isVisible():
                     return True
         except Exception:
             pass
@@ -3816,6 +3969,15 @@ class PlayerWindow(QMainWindow):
         self._nav_last_activity = time.monotonic()
         if not self._controls_shown():
             self.show_controls()
+
+    def _nav_is_fullscreen(self):
+        """Return the effective fullscreen state used by nav rendering.
+
+        The player deliberately implements HDR-safe fullscreen with Win32
+        styles, so Qt's isFullScreen() remains False for the normal fullscreen
+        path. Navigation opacity/heartbeat decisions must include that state.
+        """
+        return bool(self.isFullScreen() or getattr(self, '_is_fake_fullscreen', False))
 
     def _cursor_on_our_window(self):
         """True only if the top-level window actually UNDER the cursor belongs
@@ -3848,6 +4010,23 @@ class PlayerWindow(QMainWindow):
         except Exception:
             return True     # non-Windows / API failure: keep legacy behavior
 
+    def _is_cursor_over_framepack(self, pos):
+        """True if the cursor is over the framepacking 3D window (or any eye window)."""
+        fp = getattr(self, 'framepacking_window', None)
+        if fp is not None and fp.isVisible():
+            try:
+                if fp.frameGeometry().contains(pos):
+                    return True
+            except Exception:
+                pass
+        for ew in getattr(self, 'eye_windows', None) or ():
+            try:
+                if ew is not None and ew.isVisible() and ew.frameGeometry().contains(pos):
+                    return True
+            except Exception:
+                pass
+        return False
+
     def _nav_poll_tick(self):
         """SINGLE source of truth for the nav bar: show on movement inside the window,
         hide after 3 s (playing) / 5 s (paused) of no movement inside the window."""
@@ -3865,7 +4044,8 @@ class PlayerWindow(QMainWindow):
             moved = (pos - self._nav_last_cursor).manhattanLength() > 1
             self._nav_last_cursor = pos
             inside = (self.isVisible() and not self.isMinimized()
-                      and self.frameGeometry().contains(pos)
+                      and (self.frameGeometry().contains(pos)
+                           or self._is_cursor_over_framepack(pos))
                       and self._cursor_on_our_window())
             if moved and inside:
                 self._mark_activity()
@@ -3874,14 +4054,28 @@ class PlayerWindow(QMainWindow):
                 if self._controls_busy():
                     self._nav_last_activity = time.monotonic()  # defer while interacting
                     return
-                timeout = 3.0 if self.is_playing else 5.0
+                hud = getattr(self, 'stereo_hud', None)
+                # The stereoscopic HUD uses the requested five-second dwell:
+                # long enough to aim at duplicated controls, deterministic in
+                # both play/pause states. The 2D policy stays 3 s playing / 5 s
+                # paused.
+                timeout = (5.0 if hud is not None and hud.active
+                           else (3.0 if self.is_playing else 5.0))
                 if (time.monotonic() - self._nav_last_activity) >= timeout:
                     self.hide_controls()
         except Exception:
             pass
 
     def show_controls(self):
-        # V15: Stop old timer if it exists (for compatibility)
+        # Showing the bar is an activity edge even when it comes from pause,
+        # fullscreen, media load, or a delayed 3D transition rather than a
+        # mouse move. Without this refresh the poller can hide it again on its
+        # very next 120 ms tick using a stale deadline.
+        self._nav_last_activity = time.monotonic()
+
+        # Stop both retired timer paths. _nav_poll_tick is the single hide
+        # authority and re-checks active drags/popups before every transition.
+        self._mouse_inactivity_timer.stop()
         self._ensure_controls_timer_initialized()
         self.controls_hide_timer.stop()
 
@@ -3889,42 +4083,75 @@ class PlayerWindow(QMainWindow):
         opacity_effect = self.controls_overlay.graphicsEffect()
         if opacity_effect:
             opacity_effect.setOpacity(1.0)
-        self.controls_overlay.show()
-        self.controls_overlay.raise_()  # Ensure it floats on top
+            
+        hud = getattr(self, 'stereo_hud', None)
+        if hud is not None:
+            hud.set_desired_visible(True)
+            
+        if hud is None or not hud.active:
+            if not self.controls_overlay.isVisible():
+                self.controls_overlay.show()
+            self.controls_overlay.setWindowOpacity(1.0)
+            self.controls_overlay.raise_()
+        else:
+            # HUD active: trigger a fresh capture so the bar appears on
+            # all 3D display surfaces immediately (bypasses stale caches).
+            if hud is not None:
+                hud.sync(force=True)
+            self.controls_overlay.setWindowOpacity(1.0)
+            
         self.setCursor(Qt.CursorShape.ArrowCursor)
 
         # V14b RENDER HEARTBEAT: Stop heartbeat when controls are visible (UI activity is sufficient)
         if self._render_heartbeat_timer.isActive():
             self._render_heartbeat_timer.stop()
 
-        # V15: Inactivity timer is started by mouseMoveEvent, not here
-        # This ensures controls only hide after mouse stops moving for 3s
-
     def hide_controls(self):
-        # V3: auto-hide works during playback AND when paused — the timing (3 s playing /
-        # 5 s paused) is enforced by _nav_poll_tick, so no play-state gate here.
+        self._mouse_inactivity_timer.stop()
+        self._ensure_controls_timer_initialized()
+        self.controls_hide_timer.stop()
 
-        # V14b FULLSCREEN SMOOTHNESS FIX: In fullscreen, keep controls "technically visible"
-        # but fully transparent. This maintains DWM compositor activity which prevents stuttering.
-        # When controls are completely hidden, Windows DWM changes composition behavior.
-        if self.isFullScreen():
-            # Use QGraphicsOpacityEffect for child widgets
-            from PySide6.QtWidgets import QGraphicsOpacityEffect
-            opacity_effect = self.controls_overlay.graphicsEffect()
-            if not opacity_effect:
-                opacity_effect = QGraphicsOpacityEffect(self.controls_overlay)
-                self.controls_overlay.setGraphicsEffect(opacity_effect)
-            opacity_effect.setOpacity(0.0)  # Invisible but still composited
+        # --- DÉTECTION DES FENÊTRES EXTÉRIEURES (Mode Pilote) ---
+        has_external = False
+        fp = getattr(self, 'framepacking_window', None)
+        if fp and getattr(fp, 'isVisible', lambda: False)():
+            has_external = True
+        eyes = getattr(self, 'eye_windows', None)
+        if eyes and any(e and getattr(e, 'isVisible', lambda: False)() for e in eyes):
+            has_external = True
+
+        hud = getattr(self, 'stereo_hud', None)
+        if hud is not None:
+            # L'ordre de masquage est envoyé au HUD (effacera la barre sur le projecteur)
+            hud.set_desired_visible(False)
+            
+        if hud is None or not hud.active:
+            if self._nav_is_fullscreen():
+                from PySide6.QtWidgets import QGraphicsOpacityEffect
+                opacity_effect = self.controls_overlay.graphicsEffect()
+                if not opacity_effect:
+                    opacity_effect = QGraphicsOpacityEffect(self.controls_overlay)
+                    self.controls_overlay.setGraphicsEffect(opacity_effect)
+                opacity_effect.setOpacity(0.0)
+            else:
+                self.controls_overlay.setWindowOpacity(0.0)
         else:
-            self.controls_overlay.hide()
+            # HUD actif : On efface la texture 3D du projecteur (et des autres écrans)
+            for w in self._display_widgets():
+                try:
+                    if hasattr(w, 'clear_hud'):
+                        w.clear_hud()
+                except Exception:
+                    pass
+            QApplication.processEvents()
+            
+            # FIX : On applique la disparition à la barre native APRÈS 5 SECONDES, même en mode pilote !
+            self.controls_overlay.setWindowOpacity(0.0)
 
-        # Only hide cursor if we are over the video area (simplified: just hide it)
+        # La souris disparaît de l'écran principal
         self.setCursor(Qt.CursorShape.BlankCursor)
 
-        # V14b RENDER HEARTBEAT: Start heartbeat when controls hide in fullscreen
-        # This maintains Qt event loop activity for smooth MPV rendering
-        # V7b++ STUTTER FIX: Don't start in MVC mode - D3D11 handles its own timing
-        if (self.isFullScreen() and not self._render_heartbeat_timer.isActive()
+        if (self._nav_is_fullscreen() and not self._render_heartbeat_timer.isActive()
                 and not self.mvc_mode_active and not getattr(self, '_hevc_mode_active', False)):
             self._render_heartbeat_timer.start()
 
@@ -3983,6 +4210,38 @@ class PlayerWindow(QMainWindow):
             except Exception as e:
                 logger.warning(f"[MVC] set_media_duration propagation failed: {e}")
 
+    def _prime_mpv_time_pos(self, value):
+        """Install an exact media-time anchor without reading an mpv property."""
+        if value is None:
+            self._mpv_time_pos_cache = None
+            self._mpv_time_pos_cache_mono = None
+            return
+        self._mpv_time_pos_cache = float(value)
+        self._mpv_time_pos_cache_mono = time.monotonic()
+
+    def _cache_mpv_time_pos(self, value):
+        """Merge one pushed mpv sample into a smooth, monotonic audio clock.
+
+        python-mpv callbacks can be delayed while the GUI owns the GIL.  Treating
+        every late callback as a fresh wall-clock anchor made the apparent audio
+        clock run at ~0.4x on 4K TrueHD.  Between explicit seeks the real audio
+        device and media timeline are 1x, so never pull an established estimate
+        backwards; a newer sample may still advance it immediately.
+        """
+        if value is None:
+            return
+        sample = float(value)
+        now = time.monotonic()
+        previous = getattr(self, '_mpv_time_pos_cache', None)
+        previous_mono = getattr(self, '_mpv_time_pos_cache_mono', None)
+        if (previous is not None and previous_mono is not None
+                and not getattr(self, '_mpv_pause_cache', True)
+                and not getattr(self, '_is_seeking', False)):
+            predicted = float(previous) + max(0.0, now - float(previous_mono))
+            sample = max(sample, predicted)
+        self._mpv_time_pos_cache = sample
+        self._mpv_time_pos_cache_mono = now
+
     def on_time_update(self, _, value):
         """MPV time position changed - called from MPV event thread!"""
         try:
@@ -3991,7 +4250,17 @@ class PlayerWindow(QMainWindow):
             # store of a value mpv HANDED us — NOT a blocking mpv read (the 0xe24c4a02
             # hot-path pattern). Kept above the guards so the cache never goes stale.
             if value is not None:
-                self._mpv_time_pos_cache = value
+                self._cache_mpv_time_pos(value)
+                # Startup handshake: do not depend on the separate pause observer
+                # to wake HEVC.  The first advancing audio timestamp proves mpv is
+                # running; release the paused decoder directly from this callback
+                # (only atomic Python state changes, no GUI/mpv calls).
+                request = getattr(self, '_hevc_start_request', None)
+                if request is not None:
+                    target_s = request[0]
+                    if (not getattr(self, '_mpv_pause_cache', True)
+                            or float(value) > float(target_s) + 0.001):
+                        self._release_hevc_audio_start(float(value))
             # V14b: Ignore during transition
             if getattr(self, '_mpv_transition_in_progress', False):
                 return
@@ -4011,7 +4280,15 @@ class PlayerWindow(QMainWindow):
             if new_time is None: return
             new_time = float(new_time)
 
-            if force or self._is_scrubbing or getattr(self, '_is_seeking', False):
+            # While the user owns the timeline gesture, the slider already
+            # displays the requested position. Late mpv/decoder clock callbacks
+            # must not overwrite its time label (the slider value itself is
+            # protected by isSliderDown(), the label was not). The release/seek
+            # path installs the final target immediately afterwards.
+            if getattr(self, '_is_scrubbing', False) and not force:
+                return
+
+            if force or getattr(self, '_is_seeking', False):
                 self._last_ui_time = new_time
             else:
                 # Prevent backward jitter (strict monotonic)
@@ -4063,8 +4340,49 @@ class PlayerWindow(QMainWindow):
             # logger.warning(f"[UI] Time update error: {e}")
             pass
 
+    def _pump_lookahead_advisory(self):
+        """Two-filter look-ahead pump (spec 2026-08-03): arm the decoder-side
+        scout while synth3d runs, read its future events against the PRESENTED
+        position and forward the delays to every display widget's renderer.
+        Self-arming and self-disarming; every step best-effort."""
+        th = getattr(self, 'mvc_decoder_thread', None)
+        if th is None or not hasattr(th, 'set_lookahead_enabled'):
+            return
+        try:
+            active = bool(getattr(self, '_synth3d_active', False))
+            th.set_lookahead_enabled(active)
+            if not active:
+                return
+            scout = th.lookahead_scout()
+            if scout is None:
+                return
+            adv = scout.next_events(
+                float(getattr(self, '_current_precise_time', 0.0) or 0.0) * 1000.0)
+            for w in self._display_widgets():
+                fn = getattr(w, 'set_lookahead_advisory', None)
+                if fn is not None:
+                    fn(adv['cut_in_ms'], adv['storm_in_ms'])
+        except Exception:
+            pass
+
     def _update_playback_position(self):
         """Periodic update of the playback position (for reliability in MVC mode)."""
+        # Per-file memory: keep the resume position fresh (throttled to 15s
+        # inside; a crash or kill then costs at most 15s of resume accuracy).
+        _rp = getattr(self, '_remember_position', None)
+        if _rp is not None:
+            _rp()
+        # Look-ahead advisory pump (no-op unless a synth3d session runs).
+        _pump = getattr(self, '_pump_lookahead_advisory', None)
+        if _pump is not None:
+            _pump()
+        if getattr(self, '_hevc_mode_active', False):
+            # Mise à jour du temps du sous-titre via la dernière position connue
+            if self._subtitle_manager is not None and self._last_mvc_timestamp > 0:
+                self._subtitle_manager.update_time(self._last_mvc_timestamp)
+            self._last_timeline_update_time = time.monotonic()
+            return
+
         # CRITICAL FIX: Do not access player if media is not loaded or loading
         if not self.has_media or getattr(self, '_is_loading_file', False):
             return
@@ -4194,7 +4512,21 @@ class PlayerWindow(QMainWindow):
         # Observer-side pause cache: lets GUI-thread code (VU meter poll) know
         # the pause state WITHOUT a blocking mpv property read (0xe24c4a02).
         # Updated even during transitions — it's a plain bool assign.
-        self._mpv_pause_cache = bool(is_paused)
+        new_paused = (is_paused is True or is_paused == 'yes'
+                      or is_paused == 'true')
+        old_paused = bool(getattr(self, '_mpv_pause_cache', True))
+        now = time.monotonic()
+        # Freeze the extrapolated clock at the pause edge; restart its monotonic
+        # anchor at resume.  No synchronous mpv access occurs on this event thread.
+        if new_paused and not old_paused:
+            estimate_ms = self._mpv_time_pos_ms()
+            if estimate_ms is not None:
+                self._mpv_time_pos_cache = estimate_ms / 1000.0
+                self._mpv_time_pos_cache_mono = now
+        elif not new_paused and old_paused:
+            if getattr(self, '_mpv_time_pos_cache', None) is not None:
+                self._mpv_time_pos_cache_mono = now
+        self._mpv_pause_cache = new_paused
         # V14b: Ignore during transition
         if getattr(self, '_mpv_transition_in_progress', False):
             return
@@ -4254,8 +4586,10 @@ class PlayerWindow(QMainWindow):
                 if self.mvc_decoder_thread:
                     self.mvc_decoder_thread.pause()
             else:
-                # V15: Start inactivity timer when playback resumes
-                self._mouse_inactivity_timer.start()
+                # Resume is a user-visible navigation transition. Refresh the
+                # single poller's deadline instead of starting the retired
+                # inactivity timer (whose callback is intentionally a no-op).
+                self._mark_activity()
                 self._playback_timer.start()  # Start the timeline update
                 # Notify decoder
                 if self.mvc_decoder_thread:
@@ -4356,6 +4690,12 @@ class PlayerWindow(QMainWindow):
         if getattr(self, '_playback_ended', False):
             logger.info("[PLAYER] stop_playback skipped — _on_mvc_finished already handling teardown")
             return
+
+        # Per-file memory: an explicit Stop is the classic "I'll finish later"
+        # — record where they were so the next load offers to resume there.
+        _rp = getattr(self, '_remember_position', None)
+        if _rp is not None:
+            _rp(final=True)
 
         print("[PLAYER] Stopping playback...")
         
@@ -4580,13 +4920,30 @@ class PlayerWindow(QMainWindow):
                 except Exception as e:
                     logger.warning(f"[HDR] Could not set d3d11-flip: {e}")
 
-            # Sync framepacking window
+            # Sync framepacking window -- but leave a Glasses layout alone (fix
+            # round 1, Critical 2b): same reasoning as the visibility-changed
+            # handler this mirrors, F-fullscreen on the main window must not
+            # force the detached window back to 'framepack' mid-Glasses-session.
             if self.framepacking_window and self.mvc_mode_active and self.framepacking_window.isVisible():
-                self.framepacking_window.display_widget.set_stereo_mode('framepack')
+                if getattr(self, 'current_stereo_mode', None) != 'glasses':
+                    self.framepacking_window.display_widget.set_stereo_mode('framepack')
                 self.framepacking_window.enter_fake_fullscreen()
                 self.framepacking_window.raise_()
 
             logger.info(f"[FULLSCREEN-WIN32] Entered fake fullscreen {mon_w}x{mon_h} (HDR preserved)")
+
+        # Win32 style fullscreen does not guarantee a Qt WindowStateChange;
+        # explicitly reposition/show the Tool-window navigation bar after the
+        # native resize has reached Qt's layout system.
+        QTimer.singleShot(50, self._refresh_nav_after_window_transition)
+
+    def _refresh_nav_after_window_transition(self):
+        """Re-anchor and reveal navigation after an HDR-safe Win32 resize."""
+        if self.isHidden() or self.isMinimized():
+            return
+        self._update_overlays_geometry()
+        if self.has_media:
+            self._mark_activity()
 
     def _apply_fullscreen_video_settings(self):
         """Apply optimal MPV settings for fullscreen HDR playback."""
@@ -4844,6 +5201,11 @@ class PlayerWindow(QMainWindow):
             self.show_3d_notification("2D video — 3D mode unavailable", success=False)
             return
         self.is_3d_enabled = enabled
+        # Per-file memory: 3D auto-enables for 3D content, so the meaningful
+        # preference to carry across replays is the viewer's explicit choice.
+        _rem = getattr(self, '_remember_for_file', None)
+        if _rem is not None and self.has_media:
+            _rem(three_d_enabled=bool(enabled))
         if self.has_media:
             self.configure_3d_output(enabled, self.current_stereo_mode)
             if self.video_3d_info and self.video_3d_info['is_3d']:
@@ -4887,26 +5249,198 @@ class PlayerWindow(QMainWindow):
             seen.add(id(widget))
             yield widget
 
+    def _hevc_source_aspect_baseline(self):
+        """The ordinary (non-Glasses) `source_aspect` for the current source:
+        the same value `_try_start_hevc` seeds every display widget with and
+        `change_stereo_mode`'s half-source recompute restores -- `mi.width /
+        mi.height` for a half-packed source (the packed frame's own coded size
+        IS the original, un-squeezed per-eye aspect), 0.0 (renderer derives
+        from the decoded planes) otherwise. Also the correct answer for
+        non-HEVC MVC/BD3D content, which never sets `hevc_media_info`/
+        `_hevc_half` at all -- those getattr defaults land here at 0.0, i.e.
+        "derive", which is right: MVC views are already full per-eye
+        resolution, nothing to un-squeeze."""
+        mi = getattr(self, 'hevc_media_info', None)
+        if mi is not None and getattr(self, '_hevc_half', False):
+            try:
+                return float(mi.width) / float(mi.height)
+            except (TypeError, ZeroDivisionError):
+                pass
+        return 0.0
+
+    def _glasses_eye_aspect(self):
+        """The per-eye display aspect Glasses doubles for its source_aspect
+        override.
+
+        Half-packed sources keep `_hevc_source_aspect_baseline` (mi.width /
+        mi.height): the packed frame's own coded size IS the un-squeezed
+        per-eye aspect, and the decoded eye PLANE for a half source is
+        genuinely squeezed (e.g. 960x1080), so deriving from the plane would
+        be wrong here -- same reason the existing half-source override reads
+        MediaInfo instead of the planes at `:4924`/`:9546`.
+
+        Everything else -- full-packed, MV-HEVC, native MVC/BD3D, synthesized
+        -- derives from the LAST DECODED eye plane's own dimensions
+        (`_glasses_eye_plane_dims`, kept current by
+        `_on_mvc_frame_yuv_timed_ready`): for these classes the eye plane IS
+        the display frame, so its own w/h ARE the eye's display aspect. Round
+        1's 16:9 assumption was wrong for exactly this reason -- a scope
+        master delivering e.g. 1920x800 per eye gives 2.4 (4.8 doubled), and
+        assuming 16:9 (3.556 doubled) would have letterboxed it incorrectly.
+        16:9 remains only the LAST-RESORT interim value before any frame of
+        the current source has arrived to seed the cache; the first frame
+        corrects it."""
+        if getattr(self, '_hevc_half', False):
+            return self._hevc_source_aspect_baseline()
+        dims = getattr(self, '_glasses_eye_plane_dims', None)
+        if dims:
+            w, h = dims
+            if h:
+                return float(w) / float(h)
+        return 16.0 / 9.0
+
+    def _glasses_target_aspect(self, fp):
+        """The `source_aspect` target for Glasses: `2 * eye_aspect`, clamped
+        down to the surface's own aspect when the surface is too NARROW (in
+        absolute pixels) to show the pair at full per-eye width.
+
+        Fix round 3. The renderer pillarboxes/letterboxes to whichever side
+        of `source_aspect` vs. the actual output surface is "wrong"
+        (`native_renderer.cpp:688-704`), so the plain doubled value from
+        round 2 is only correct when the surface is wide enough for it. On a
+        surface narrower than the pair needs -- e.g. windowed, or fullscreen
+        on a 1920x1080 display -- a 3.556 target against a 1.778 surface
+        takes the LETTERBOX branch: each half becomes 960x540 with black
+        bands above and below, throwing away half the rows for nothing.
+        Filling is the right answer there instead: the glasses split
+        whatever they receive at ITS OWN midpoint and stretch each half back
+        out on their own panel, so on a surface too narrow for full
+        per-eye width, the picture reaches the eye the same shape either way
+        -- degraded resolution, but geometrically correct, exactly like
+        plain SBS/framepack already is on an undersized surface.
+
+        THE COMPARISON IS WIDTH, NOT THE FULL DOUBLED ASPECT RATIO -- a
+        deliberate departure from the conceptual `min(2*eye_aspect,
+        surface_aspect)`. A pure aspect-ratio clamp conflates two different
+        situations that produce the SAME inequality direction: a surface
+        genuinely too narrow (not enough pixels -- filling is right, per
+        above), and a surface merely TALLER than 2*eye_aspect needs AT THE
+        CORRECT WIDTH. The second one is not an edge case here: a scope eye
+        (2.4, doubled 4.8) on the STANDARD 3840x1080 Glasses window has
+        surface aspect 3.556 -- narrower than 4.8 -- so the literal
+        aspect-ratio clamp would fire on the window's own INTENDED,
+        correctly-sized target, filling and vertically stretching the eye's
+        true 1920x800 picture up to 1920x1080. The glasses' horizontal
+        split-and-restretch does nothing to correct a VERTICAL distortion,
+        so that would silently undo round 2's scope fix on the ordinary
+        window, not just a genuinely undersized one -- regressing a case
+        this user's community actually watches, not a hypothetical.
+        Comparing WIDTH against `Framepacking3DWindow.FSBS_WIDTH` (3840, the
+        pair's own fixed full-resolution requirement, independent of
+        content) tells the two situations apart: narrower than 3840 clamps
+        (fill, regardless of aspect); at or above 3840 never clamps, so
+        scope still letterboxes correctly at the window's own intended
+        size, and filling only ever kicks in when the surface itself cannot
+        deliver full per-eye width no matter what the content is.
+
+        The surface size is read from `fp` itself (the live
+        Framepacking3DWindow), not cached -- see `_on_framepacking_geometry_
+        changed` for why a value captured once would go stale the instant
+        the user toggles fullscreen."""
+        from framepacking_window_d3d11 import Framepacking3DWindow
+        doubled = 2.0 * self._glasses_eye_aspect()
+        try:
+            w, h = fp.width(), fp.height()
+        except Exception:
+            w = h = 0
+        if w and h and w < Framepacking3DWindow.FSBS_WIDTH:
+            return float(w) / float(h)
+        return doubled
+
+    def _apply_framepack_source_aspect(self, fp, stereo_mode):
+        """Set the framepack widget's `source_aspect` for the presentation
+        about to show in it.
+
+        CRITICAL (fix round 1): the renderer's viewport targets `source_aspect`
+        for stereo_mode 2 (SBS/Glasses) same as any other layout --
+        `native_renderer.cpp:677-682` -- and that target is a SINGLE eye's
+        aspect (~1.778 for 16:9), not the pair's. On the Glasses window's
+        3840x1080 surface that pillarboxes: a 3.556 surface against a 1.778
+        target crops to a centred 1920x1080 viewport, so EACH eye lands in a
+        960-wide slice with black either side. Glasses needs the COMBINED
+        (both-eyes) aspect instead, i.e. double the per-eye value (see
+        `_glasses_eye_aspect`, fix round 2, for how that value is derived) --
+        but CLAMPED to the actual surface aspect (see `_glasses_target_aspect`,
+        fix round 3) so a surface narrower than the pair fills instead of
+        letterboxing. 3.556 for 16:9 on a 3840-wide surface fills exactly;
+        4.8 for a 2.39:1-ish scope source letterboxes -- bars top/bottom
+        INSIDE each half, which is correct F-SBS behaviour, not a defect --
+        but only when the surface is wide enough to earn that target; a
+        1920x1080 surface clamps to 1.778 and fills instead.
+
+        Only `fp.display_widget` is touched here -- never loop this over
+        `_display_widgets()`, which also yields the embedded 2D preview; that
+        widget reads the same field for its own (single-eye, undoubled)
+        display and would be poisoned by the doubled value.
+
+        Every other presentation gets the ordinary baseline -- this runs on
+        every 'mvc'/'dual'/'glasses' reconfigure (mirroring
+        `apply_output_geometry`/`set_stereo_mode` right beside it), so leaving
+        Glasses always overwrites the doubled value rather than requiring a
+        separate revert step."""
+        widget = getattr(fp, 'display_widget', None)
+        if widget is None:
+            return
+        try:
+            if stereo_mode == 'glasses':
+                widget.source_aspect = self._glasses_target_aspect(fp)
+            else:
+                widget.source_aspect = self._hevc_source_aspect_baseline()
+        except Exception:
+            pass
+
+    def _note_decoded_eye_plane(self, left_planes):
+        """Feed one decoded frame's left-eye plane dims into the Glasses
+        aspect cache (`_glasses_eye_plane_dims`, read by `_glasses_eye_aspect`).
+
+        Called from `_on_mvc_frame_yuv_timed_ready` on every valid frame. A
+        no-op for half-packed HEVC -- that class derives from MediaInfo, never
+        the plane, because the plane itself is squeezed (see
+        `_glasses_eye_aspect`) -- and whenever the dims haven't changed, so the
+        comparatively expensive push into the renderer only runs on an actual
+        change, not every frame at 24fps. Torn down (reset to None) at every
+        session end in `_stop_hevc_decoder`, so a new file's first frame is
+        never compared against a leftover value from the one before it."""
+        if getattr(self, '_hevc_half', False):
+            return
+        try:
+            eye_h, eye_w = left_planes[0].shape[:2]
+        except Exception:
+            return
+        if not (eye_w and eye_h):
+            return
+        dims = (eye_w, eye_h)
+        if dims == getattr(self, '_glasses_eye_plane_dims', None):
+            return
+        self._glasses_eye_plane_dims = dims
+        if getattr(self, 'current_stereo_mode', None) == 'glasses':
+            fp = getattr(self, 'framepacking_window', None)
+            if fp is not None:
+                self._apply_framepack_source_aspect(fp, 'glasses')
+
     def change_stereo_mode(self, mode):
         self.current_stereo_mode = mode
+        # Per-file memory: the presentation pick is a per-title preference.
+        # (getattr idiom: fake hosts drive this method in tests.)
+        _rem = getattr(self, '_remember_for_file', None)
+        if (_rem is not None and self.has_media
+                and mode in PRESENTATION_KEYS):
+            _rem(stereo_mode=mode)
         # Dual Projector owns the detached output while selected; any other
         # presentation gives it back to the framepack/main-window paths.
-        # The `has_media and is_3d_enabled` conjunction mirrors the guard the
-        # sibling enforcement site in configure_3d_output applies: picking this
-        # presentation while 3D is OFF used to open two windows that no frame
-        # would ever reach (the combo stays enabled for any 3D content,
-        # independently of the 3D toggle) -- two black rectangles on the
-        # projectors. `mode == 'dual'` is evaluated first, so for every other
-        # presentation the call is False exactly as before.
         self._set_dual_projector_enabled(
             mode == 'dual' and self.has_media and self.is_3d_enabled)
-        # I3: live stereo-mode switch for the HEVC path — the decode thread splits packed
-        # frames per its _mode, so push the new mode and it takes effect on the NEXT frame
-        # (no decoder restart). configure_3d_output below drives the MVC/native paths.
-        # MV-4: MV-HEVC (multiview) is EXCLUDED — the two views ARE the stereo pair, there
-        # is no packed frame to re-split, so the SBS/TAB combo switches the RENDERER
-        # presentation only (via configure_3d_output below), NOT the source. The thread's
-        # set_mode refuses mvhevc anyway (with a log); the player must not even call it.
+        
         _mvhevc = bool(getattr(getattr(self, 'hevc_media_info', None), 'multiview', False))
         if (getattr(self, '_hevc_mode_active', False)
                 and getattr(self, 'hevc_thread', None)
@@ -4915,10 +5449,6 @@ class PlayerWindow(QMainWindow):
                 and not getattr(self, '_synth3d_active', False)):
             try:
                 self.hevc_thread.set_mode(mode)
-                # Keep the display aspect consistent when the source is half-packed: for
-                # half-SBS/half-TAB the packed frame carries the ORIGINAL 2D dims, so the
-                # per-eye display aspect is frame W/H. Recompute from the stored MediaInfo;
-                # if it wasn't a half source, leave source_aspect as-is (full = derive).
                 mi = getattr(self, 'hevc_media_info', None)
                 if mi is not None and getattr(self, '_hevc_half', False):
                     aspect = float(mi.width) / float(mi.height)
@@ -4930,14 +5460,11 @@ class PlayerWindow(QMainWindow):
             except Exception:
                 pass
         elif getattr(self, '_synth3d_active', False):
-            # During 2D->3D conversion SBS/TAB/MultiView are OUTPUT layouts.
-            # They must never be forwarded to the HEVC decoder as INPUT layouts:
-            # doing so slices the genuine 2D source in half, and selecting
-            # MultiView later cannot undo it because that branch only accepted
-            # 'sbs'/'tab'. Reassert the mono-source invariant on every switch.
             self._synth3d_restore_mono_source()
+            
         if self.has_media and self.is_3d_enabled:
             self.configure_3d_output(True, mode)
+            # SUPPRESSION de _force_frame_refresh ici. C'était la cause du crash en pause.
 
     def _content_is_3d(self):
         """True iff the loaded media is genuinely stereoscopic (MVC / SBS / TAB),
@@ -5179,6 +5706,11 @@ class PlayerWindow(QMainWindow):
             self._update_synth3d_menu_state()
             return
         self._synth3d_active = bool(enabled)
+        # Per-file memory: 2D->3D synthesis is a per-title decision (a title
+        # the viewer converts once is a title they want converted on replay).
+        _rem = getattr(self, '_remember_for_file', None)
+        if _rem is not None and getattr(self, 'has_media', False):
+            _rem(synth3d_enabled=bool(enabled))
         # A synth3d session only ever runs on 2D content (_synth3d_eligible requires
         # `not self._content_is_3d()`), so this can never clobber a real-3D session.
         # Without it, change_stereo_mode/_set_dual_projector_enabled's `is_3d_enabled`
@@ -5187,14 +5719,17 @@ class PlayerWindow(QMainWindow):
         self._push_synth3d_to_widgets()
         if enabled:
             self._synth3d_restore_mono_source()
+            start_matting = getattr(self, '_synth3d_start_human_matting', None)
+            if start_matting is not None:
+                start_matting()
             self.show_3d_notification("2D->3D AI active - depth model warming up")
             logger.info("[2D3D] enabled strength=%.1f%% convergence=%.2f",
                         self._synth3d_strength, self._synth3d_convergence)
             # Keep the selector and the actual presentation in lockstep. 'auto'
             # visually means MultiView (combo index 0); persisting a previous
-            # SBS/TAB/Dual choice is also legitimate and should be honoured.
+            # SBS/TAB/Dual/Glasses choice is also legitimate and should be honoured.
             presentation = getattr(self, 'current_stereo_mode', 'auto')
-            if presentation not in ('mvc', 'sbs', 'tab', 'dual'):
+            if presentation not in ('mvc', 'sbs', 'tab', 'dual', 'glasses'):
                 presentation = 'mvc'
                 self.current_stereo_mode = presentation
             self.configure_3d_output(True, presentation)
@@ -5202,11 +5737,94 @@ class PlayerWindow(QMainWindow):
             # single early log said nothing about a failure hours into playback.
             self._synth3d_start_poll()
         else:
+            # Attribute propagation alone reaches NativeRenderer only with the
+            # next decoded frame. A paused/stopped source may never deliver it,
+            # so detach every live surface synchronously (the native registry
+            # hands teardown to its reaper and returns without joining ORT).
+            self._synth3d_disable_renderers_now()
+            if getattr(self, '_synth3d_rearming', False):
+                service = getattr(self, '_synth3d_matte_service', None)
+                if service is not None:
+                    service.reset("depth preset re-arm")
+                clear_matte = getattr(self, '_synth3d_clear_human_matte', None)
+                if clear_matte is not None:
+                    clear_matte()
+            else:
+                stop_matting = getattr(self, '_synth3d_stop_human_matting', None)
+                if stop_matting is not None:
+                    stop_matting()
             self.show_3d_notification("2D->3D AI off")
             self.configure_3d_output(False)
             self._synth3d_stop_poll()
         self._update_3d_button_state()
         self._update_synth3d_menu_state()
+
+    def _synth3d_start_human_matting(self):
+        """Start the optional MatAnyone 2 process without blocking playback."""
+        if not getattr(self, '_synth3d_matting_requested', True):
+            return False
+        service = getattr(self, '_synth3d_matte_service', None)
+        if service is not None and service.running:
+            service.reset("2D->3D enabled")
+            return True
+        try:
+            from synth3d_matting_service import MatAnyone2Runtime, MatAnyone2Service
+            runtime = MatAnyone2Runtime.discover(_SOURCE_ROOT)
+            if runtime is None:
+                if not getattr(self, '_synth3d_matte_unavailable_logged', False):
+                    logger.info("[MATANYONE2] offline runtime not installed; "
+                                "continuing with depth-only contour protection")
+                    self._synth3d_matte_unavailable_logged = True
+                return False
+            target_fps = float(os.environ.get('SYLC_MATANYONE2_FPS', '5'))
+            short_side = int(os.environ.get('SYLC_MATANYONE2_SHORT_SIDE', '720'))
+            service = MatAnyone2Service(runtime, target_fps=target_fps,
+                                        short_side=short_side)
+            self._synth3d_matte_service = service
+            if not service.start():
+                logger.warning("[MATANYONE2] worker unavailable: %s",
+                               service.status().get('error', 'start failure'))
+                self._synth3d_matte_service = None
+                return False
+            logger.info("[MATANYONE2] async worker starting at %.1f fps, short-side=%d",
+                        target_fps, short_side)
+            return True
+        except Exception:
+            logger.exception("[MATANYONE2] optional worker initialization failed")
+            self._synth3d_matte_service = None
+            return False
+
+    def _synth3d_clear_human_matte(self):
+        for widget in self._display_widgets():
+            try:
+                widget.set_synth3d_human_matte(None)
+            except (AttributeError, TypeError):
+                pass
+
+    def _synth3d_stop_human_matting(self, timeout=0.0):
+        self._synth3d_clear_human_matte()
+        service = getattr(self, '_synth3d_matte_service', None)
+        self._synth3d_matte_service = None
+        if service is not None:
+            try:
+                service.stop(timeout=timeout)
+            except Exception:
+                logger.exception("[MATANYONE2] worker shutdown failed")
+
+    def _synth3d_human_matte_for_frame(self, left_planes, video_time_ms):
+        if not getattr(self, '_synth3d_active', False):
+            return None
+        service = getattr(self, '_synth3d_matte_service', None)
+        if service is None or not service.running:
+            return None
+        try:
+            service.submit_yuv(left_planes, float(video_time_ms))
+            return service.latest_for_pts(float(video_time_ms))
+        except Exception:
+            # Matting is guidance, never a dependency of depth synthesis.
+            logger.exception("[MATANYONE2] frame bridge failed; disabling matte guidance")
+            self._synth3d_stop_human_matting()
+            return None
 
     def _synth3d_restore_mono_source(self):
         """Keep a synthesized session's input as the original unsplit 2D frame.
@@ -5255,6 +5873,10 @@ class PlayerWindow(QMainWindow):
             w.synth3d_enabled = self._synth3d_active
             w.synth3d_strength = self._synth3d_strength
             w.synth3d_convergence = self._synth3d_convergence
+            w.synth3d_auto_convergence = getattr(
+                self, '_synth3d_auto_convergence', False)
+            w.synth3d_temporal_fill = getattr(
+                self, '_synth3d_temporal_fill', False)
             w.synth3d_depth_view = self._synth3d_depth_view
             w.synth3d_diagnostics = self._synth3d_diagnostics
             w.synth3d_model_path = model_path
@@ -5268,6 +5890,24 @@ class PlayerWindow(QMainWindow):
             w.synth3d_crop_top = crop_top
             w.synth3d_crop_bottom = crop_bottom
 
+    def _synth3d_disable_renderers_now(self):
+        """Detach live native surfaces without waiting for another video frame."""
+        for w in self._display_widgets():
+            # Invalidate the widget cache even when the native call succeeds.
+            # A rapid off->on before another frame must re-push True rather than
+            # mistake the pre-disable True tuple for the live renderer state.
+            try:
+                w._synth3d_pushed = None
+            except Exception:
+                pass
+            r = getattr(w, '_r', None)
+            if r is None:
+                continue
+            try:
+                r.set_synth3d(False)
+            except (AttributeError, TypeError, RuntimeError):
+                pass
+
     @staticmethod
     def _synth3d_status_fields(status):
         fields = {}
@@ -5278,16 +5918,18 @@ class PlayerWindow(QMainWindow):
         return fields
 
     def _maybe_apply_synth3d_aspect(self, status):
-        """Promote stable wide content to an installed rectangular graph.
+        """Select (and reselect) a rectangular graph from live full-frame evidence.
 
         Encoded mattes require eight agreeing depth observations.  A crop-free
         source may promote immediately because its coded dimensions are stable;
         a minimum native ratio prevents ordinary 16:9 video from doing so.
-        Once promoted, retain the choice for this medium.
+        The renderer keeps reporting an uncropped luma probe even while the
+        model input is cropped, so a certified Scope/IMAX transition can return
+        to square or move to another installed rectangular graph.
         """
-        if (not getattr(self, '_synth3d_active', False)
-                or getattr(self, '_synth3d_aspect_override', None) is not None):
+        if not getattr(self, '_synth3d_active', False):
             return False
+        override = getattr(self, '_synth3d_aspect_override', None)
         fields = self._synth3d_status_fields(status)
         if fields.get('state') != 'running':
             return False
@@ -5300,17 +5942,51 @@ class PlayerWindow(QMainWindow):
         if (source_width <= 0 or source_height <= 0
                 or top < 0 or bottom < 0):
             return False
+        crop_ready = fields.get('crop_ready') == '1'
+
+        def clear_override(reason):
+            if override is None:
+                return False
+            logger.info("[2D3D] %s; returning to the square graph", reason)
+            self._synth3d_aspect_override = None
+            self._synth3d_aspect_unavailable_key = None
+            self._push_synth3d_to_widgets()
+            return True
+
         has_matte = top > 0 or bottom > 0
         if has_matte:
             if confidence < 0.999 or top <= 0 or bottom <= 0:
                 return False
         elif source_width / float(source_height) < MIN_NATIVE_WIDE_RATIO:
+            # Missing crop_ready means an older native module: preserve its
+            # established override because that build cannot certify a return
+            # to no-matte content. New builds clear only after eight agreeing
+            # full-frame observations, never on one dark/flash frame.
+            if override is not None and crop_ready:
+                return clear_override(
+                    "full-frame evidence now certifies %dx%d without a matte" %
+                    (source_width, source_height))
             return False
 
         square_model, side = self._synth3d_model_path()
+        base_key = os.path.normcase(os.path.abspath(square_model))
+        if override is not None:
+            override_model, override_side, _current_selection = override
+            if override_model != base_key or override_side != side:
+                return clear_override("the active depth preset changed")
         selection = select_installed_aspect_model(
             square_model, side, source_width, source_height, top, bottom)
         if selection is None:
+            if override is not None:
+                # While a newly attached rectangular service is accumulating
+                # its first eight observations, crop=0 is intentionally not a
+                # verdict. Retain the known-good selection until crop_ready=1.
+                if not crop_ready:
+                    return False
+                return clear_override(
+                    "the certified %.3f:1 content has no compatible rectangle" %
+                    (source_width / float(
+                        max(1, source_height - top - bottom))))
             miss_key = (os.path.normcase(os.path.abspath(square_model)), side,
                         source_width, source_height, top, bottom)
             if miss_key != getattr(self, '_synth3d_aspect_unavailable_key', None):
@@ -5327,6 +6003,21 @@ class PlayerWindow(QMainWindow):
                         source_width / float(source_height), side)
                 self._synth3d_aspect_unavailable_key = miss_key
             return False
+
+        if override is not None:
+            current = override[2]
+            current_key = (
+                os.path.normcase(os.path.abspath(current.model_path)),
+                current.grid_width, current.grid_height,
+                current.crop_top, current.crop_bottom,
+                current.source_width, current.source_height)
+            selection_key = (
+                os.path.normcase(os.path.abspath(selection.model_path)),
+                selection.grid_width, selection.grid_height,
+                selection.crop_top, selection.crop_bottom,
+                selection.source_width, selection.source_height)
+            if selection_key == current_key:
+                return False
 
         # TensorRT engines are per graph. A square service that is already on
         # TensorRT must not silently fall back to DirectML just because the
@@ -5345,9 +6036,11 @@ class PlayerWindow(QMainWindow):
                     "keeping the square TensorRT graph",
                     os.path.basename(selection.model_path))
                 self._synth3d_aspect_unavailable_key = miss_key
+            if override is not None:
+                return clear_override(
+                    "the newly matching rectangle is not TensorRT-attested")
             return False
 
-        base_key = os.path.normcase(os.path.abspath(square_model))
         self._synth3d_aspect_override = (base_key, side, selection)
         self._synth3d_aspect_unavailable_key = None
         if has_matte:
@@ -5358,10 +6051,11 @@ class PlayerWindow(QMainWindow):
                 source_width, source_height,
                 source_width / float(source_height))
         logger.info(
-            "[2D3D] %s -> %s grid=%dx%d (%d%% fewer depth pixels)",
+            "[2D3D] %s -> %s grid=%dx%d (%d%% fewer depth pixels)%s",
             source_desc, os.path.basename(selection.model_path),
             selection.grid_width, selection.grid_height,
-            round(100 * (1.0 - selection.grid_height / float(side))))
+            round(100 * (1.0 - selection.grid_height / float(side))),
+            " [ratio transition]" if override is not None else "")
         self._push_synth3d_to_widgets()
         return True
 
@@ -5399,18 +6093,21 @@ class PlayerWindow(QMainWindow):
         """Status comes from the first _display_widgets() entry with a live renderer --
         NOT hard-coded to mvc_embedded_widget (house rule, see _display_widgets), since
         the active 3D presentation may be the framepack or an eye-window widget."""
-        st = None
+        statuses = []
         for w in self._display_widgets():
             r = getattr(w, '_r', None)
             if r is None:
                 continue
             try:
-                st = r.synth3d_status()
+                statuses.append(r.synth3d_status())
             except (AttributeError, TypeError, RuntimeError):
-                st = None
-            break
-        if st is None:
+                continue
+        if not statuses:
             return
+        # A device-local renderer failure may affect only one output surface.
+        # It must outrank a healthy shared-service line from another surface.
+        st = next((item for item in statuses if "state=error" in item),
+                  statuses[0])
         maybe_apply_aspect = getattr(self, '_maybe_apply_synth3d_aspect', None)
         if maybe_apply_aspect is not None:
             maybe_apply_aspect(st)
@@ -5419,6 +6116,9 @@ class PlayerWindow(QMainWindow):
         last = getattr(self, '_synth3d_poll_last_log', 0.0)
         if now - last >= 10.0:
             logger.info("[2D3D] %s", st)
+            matte_service = getattr(self, '_synth3d_matte_service', None)
+            if matte_service is not None:
+                logger.info("[MATANYONE2] %s", matte_service.status())
             self._synth3d_poll_last_log = now
         if "state=error" in st:
             err_tail = st.split("err=", 1)[-1] if "err=" in st else st
@@ -5477,6 +6177,11 @@ class PlayerWindow(QMainWindow):
         if persist:
             self._app_settings['synth3d_strength_pct'] = self._synth3d_strength
             self._save_app_settings()
+            # Depth strength is content-dependent tuning: also remember it for
+            # THIS title (persist=False = programmatic restore, not re-saved).
+            _rem = getattr(self, '_remember_for_file', None)
+            if _rem is not None and getattr(self, 'has_media', False):
+                _rem(synth3d_strength=self._synth3d_strength)
         self._push_synth3d_to_widgets()
 
     def set_synth3d_convergence(self, percent, persist=True):
@@ -5484,6 +6189,31 @@ class PlayerWindow(QMainWindow):
         self._mark_synth3d_custom()
         if persist:
             self._app_settings['synth3d_convergence'] = self._synth3d_convergence
+            self._save_app_settings()
+            _rem = getattr(self, '_remember_for_file', None)
+            if _rem is not None and getattr(self, 'has_media', False):
+                _rem(synth3d_convergence=self._synth3d_convergence)
+        self._push_synth3d_to_widgets()
+
+    def set_synth3d_auto_convergence(self, enabled, persist=True):
+        """Per-shot zero-parallax plane from the stabilizer's tone machinery.
+        The manual Convergence slider remains the fallback (and the value used
+        the instant a session starts, before the first depth map lands)."""
+        self._synth3d_auto_convergence = bool(enabled)
+        if persist:
+            self._app_settings['synth3d_auto_convergence'] = \
+                self._synth3d_auto_convergence
+            self._save_app_settings()
+        self._push_synth3d_to_widgets()
+
+    def set_synth3d_temporal_fill(self, enabled, persist=True):
+        """Round 5a: disocclusion holes prefer flow-transported, previously
+        SEEN background over the stretch fallback. Experimental (author's
+        visual gate pending); off is byte-identical to the historical warp."""
+        self._synth3d_temporal_fill = bool(enabled)
+        if persist:
+            self._app_settings['synth3d_temporal_fill'] = \
+                self._synth3d_temporal_fill
             self._save_app_settings()
         self._push_synth3d_to_widgets()
 
@@ -5500,17 +6230,12 @@ class PlayerWindow(QMainWindow):
             self.is_3d_enabled = False
             self._synth3d_stop_poll()
             self._push_synth3d_to_widgets()
-            # Push the disable to the renderer promptly (not on a next frame that
-            # may never come) so the ORT session/GPU memory is released now.
-            for w in self._display_widgets():
-                try:
-                    r = getattr(w, '_r', None)
-                    if r is not None:
-                        r.set_synth3d(False)
-                except (AttributeError, TypeError):
-                    pass
+            self._synth3d_disable_renderers_now()
             self.show_3d_notification("2D->3D AI off (native decoder lost)",
                                       success=False)
+        stop_matting = getattr(self, '_synth3d_stop_human_matting', None)
+        if stop_matting is not None:
+            stop_matting()
         self._update_synth3d_menu_state()
         # The AI button's grey/white/blue cycle lives in _update_3d_button_state;
         # refresh it on every path that kills the synthesis (guarded: some
@@ -5542,14 +6267,23 @@ class PlayerWindow(QMainWindow):
         """Deterministic depth-EMA reset on seek (spec: same mechanic as a cut snap)."""
         if not getattr(self, '_synth3d_active', False):
             return
-        # A seek may jump across an aspect-ratio transition (Scope/IMAX cuts are
-        # common enough to make retaining the old crop unsafe). Return briefly
-        # to the warm square service and let the new position earn its own
-        # eight-observation verdict.
-        if getattr(self, '_synth3d_aspect_override', None) is not None:
+        # A seek may jump across an aspect-ratio transition (Scope/IMAX reel
+        # switches are common enough to make retaining an encoded MATTE unsafe).
+        # Return briefly to the warm square service and let the new position
+        # earn its own eight-observation verdict -- but only for a selection a
+        # seek can actually invalidate: see SYNTH3D_SEEK_KEEP_ASPECT for why a
+        # coded-dimension selection is kept and what the detour costs.
+        override = getattr(self, '_synth3d_aspect_override', None)
+        if override is not None and not _synth3d_seek_keeps_aspect(override):
             self._synth3d_aspect_override = None
             self._synth3d_aspect_unavailable_key = None
             self._push_synth3d_to_widgets()
+        matte_service = getattr(self, '_synth3d_matte_service', None)
+        if matte_service is not None:
+            matte_service.reset("media seek")
+        clear_matte = getattr(self, '_synth3d_clear_human_matte', None)
+        if clear_matte is not None:
+            clear_matte()
         for w in self._display_widgets():
             r = getattr(w, '_r', None)
             try:
@@ -5640,6 +6374,17 @@ class PlayerWindow(QMainWindow):
             bool(self._synth3d_diagnostics))
         ov.synth3d_diagnostics_action.setEnabled(bool(self._synth3d_active))
         ov.synth3d_diagnostics_action.blockSignals(False)
+        auto_conv = getattr(ov, 'synth3d_auto_convergence_action', None)
+        if auto_conv is not None:
+            auto_conv.blockSignals(True)
+            auto_conv.setChecked(bool(self._synth3d_auto_convergence))
+            auto_conv.blockSignals(False)
+        temporal = getattr(ov, 'synth3d_temporal_fill_action', None)
+        if temporal is not None:
+            temporal.blockSignals(True)
+            temporal.setChecked(
+                bool(getattr(self, '_synth3d_temporal_fill', False)))
+            temporal.blockSignals(False)
         # Programmatic synchronisation must not look like a user's manual edit:
         # otherwise merely opening the menu would turn a preset into "Custom".
         for slider, value in (
@@ -5744,6 +6489,17 @@ class PlayerWindow(QMainWindow):
             text = "Engine error · returned to 2D"
         else:
             text = "Engine: off"
+        matte_service = getattr(self, '_synth3d_matte_service', None)
+        if matte_service is not None:
+            matte = matte_service.status()
+            matte_state = matte.get('state', 'off')
+            if matte_state in ('loading', 'ready'):
+                text += " · matte warming up"
+            elif matte_state == 'running':
+                text += (f" · matte {matte.get('fps', 0.0):.1f} fps/"
+                         f"{matte.get('inference_ms', 0.0):.0f} ms")
+            elif matte_state in ('degraded', 'error'):
+                text += " · matte bypassed"
         ov.set_synth3d_status(text)
 
     def _update_3d_button_state(self):
@@ -5853,6 +6609,9 @@ class PlayerWindow(QMainWindow):
             # mpv.command() serializes via the MPV queue instead of a direct set_property,
             # which avoids the collision with the decoder thread (SEH 0xe24c4a02).
             self.player.command('set', 'aid', str(track_id))
+            _rem = getattr(self, '_remember_for_file', None)
+            if _rem is not None:
+                _rem(audio_track=int(track_id))
             print(f"Audio track changed: ID {track_id}")
         except (OSError, RuntimeError, Exception) as e:
             print(f"Error changing audio track: {e}")
@@ -5901,13 +6660,43 @@ class PlayerWindow(QMainWindow):
                                           or getattr(self, '_hevc_mode_active', False)):
                 logger.info("[TRANSPORT] no audio track: mpv shell marked inert "
                             "(native pipeline drives the transport)")
+                if getattr(self, '_hevc_mode_active', False):
+                    th = getattr(self, 'hevc_thread', None)
+                    if th is not None:
+                        th.set_master_clock_required(False)
+                        if getattr(self, 'is_playing', False):
+                            th.set_paused(False)
             self.controls_overlay.update_audio_tracks(audio_tracks)
+            # Per-file memory: re-apply the remembered audio pick (combo is
+            # synced silently; mpv is driven through the normal handler).
+            _art = getattr(self, '_apply_remembered_track', None)
+            aid = _art(self.controls_overlay.audio_track_combo,
+                       'audio_track') if _art else None
+            if aid is not None:
+                self.change_audio_track(aid)
         except Exception as e:
             print(f"Error fetching audio tracks: {e}")
 
     def change_subtitle_track(self, track_id):
         logger.info(f"[SUBTITLE] change_subtitle_track called with track_id={track_id}")
-        logger.info(f"[SUBTITLE] has_media={self.has_media}, mvc_mode_active={self.mvc_mode_active}")
+        # Per-file memory: the pick is stable per title (same enumeration on
+        # every load of the same media). 0 = subtitles off, also remembered.
+        # The id space differs between the streaming combo (1-based index) and
+        # the plain mpv combo (sid), so the kind is stored with the id and each
+        # restore site only applies its own kind.
+        _rem = getattr(self, '_remember_for_file', None)
+        if _rem is not None and self.has_media:
+            try:
+                _rem(subtitle_track=int(track_id),
+                     subtitle_track_kind=('streaming'
+                                          if getattr(self, '_streaming_subtitle_tracks', None)
+                                          else 'mpv'))
+            except (TypeError, ValueError):
+                pass
+        hevc_mode_active = bool(getattr(self, '_hevc_mode_active', False))
+        native_overlay_mode = bool(self.mvc_mode_active or hevc_mode_active)
+        logger.info(f"[SUBTITLE] has_media={self.has_media}, mvc_mode_active={self.mvc_mode_active}, "
+                    f"hevc_mode_active={hevc_mode_active}")
         logger.info(f"[SUBTITLE] PGS_AVAILABLE={PGS_SUBTITLE_AVAILABLE}, manager={self._subtitle_manager is not None}")
         logger.info(f"[SUBTITLE] PGS tracks detected: {len(self._pgs_subtitle_tracks)}")
         logger.info(f"[SUBTITLE] Streaming tracks detected: {len(self._streaming_subtitle_tracks)}")
@@ -5915,8 +6704,13 @@ class PlayerWindow(QMainWindow):
         if self.has_media and self.player:
             try:
                 # ========== STREAMING SUBTITLE PATH (No extraction delay!) ==========
-                # Check if this is a streaming subtitle track from the MVC demuxer
-                if self.mvc_mode_active and self._streaming_subtitle_tracks and self.mvc_decoder_thread:
+                # Streaming tracks come from the MVC demuxer (MKV/M2TS) OR from the
+                # lavf HEVC source (same signal contract) — one branch serves both.
+                native_thread = (self.mvc_decoder_thread
+                                 if (self.mvc_mode_active and self.mvc_decoder_thread)
+                                 else (getattr(self, 'hevc_thread', None)
+                                       if hevc_mode_active else None))
+                if native_thread is not None and self._streaming_subtitle_tracks:
                     # UI sends 1-based index, find the corresponding streaming track
                     # track_id 1 = first streaming track, track_id 2 = second, etc.
                     streaming_track = None
@@ -5926,18 +6720,18 @@ class PlayerWindow(QMainWindow):
 
                     if streaming_track and streaming_track.get('isPGS', False):
                         actual_track_number = streaming_track.get('trackNumber')
-                        logger.info(f"[STREAMING-SUBS] Enabling streaming for MKV track {actual_track_number}: {streaming_track.get('name')}")
+                        logger.info(f"[STREAMING-SUBS] Enabling streaming for track {actual_track_number}: {streaming_track.get('name')}")
 
-                        # Enable streaming in the decoder thread (use actual MKV track number)
-                        self.mvc_decoder_thread.set_subtitle_track(actual_track_number)
+                        # Enable streaming in the native decode thread (MVC or HEVC)
+                        native_thread.set_subtitle_track(actual_track_number)
                         self._active_streaming_track = actual_track_number
 
                         # Configure SubtitleManager for streaming
                         if self._subtitle_manager:
                             # V7b++ STUTTER FIX: Connect PGS streaming signal NOW (deferred from MVC init)
                             if not getattr(self, '_pgs_streaming_connected', False):
-                                if hasattr(self.mvc_decoder_thread, 'pgsDataReady'):
-                                    self.mvc_decoder_thread.pgsDataReady.connect(self._subtitle_manager.on_pgs_data)
+                                if hasattr(native_thread, 'pgsDataReady'):
+                                    native_thread.pgsDataReady.connect(self._subtitle_manager.on_pgs_data)
                                     self._pgs_streaming_connected = True
                                     logger.info("[STREAMING-SUBS] Connected pgsDataReady signal (deferred)")
 
@@ -5968,11 +6762,11 @@ class PlayerWindow(QMainWindow):
                         # the overlay. No-ops outside BD3D (map empty).
                         try:
                             seq = (getattr(self, '_bd3d_pg_offset_map', None) or {}).get(actual_track_number)
-                            if seq is not None and hasattr(self.mvc_decoder_thread, 'set_pg_offset_sequence'):
-                                self.mvc_decoder_thread.set_pg_offset_sequence(seq)
+                            if seq is not None and hasattr(native_thread, 'set_pg_offset_sequence'):
+                                native_thread.set_pg_offset_sequence(seq)
                             if (not getattr(self, '_pg_depth_connected', False)
-                                    and hasattr(self.mvc_decoder_thread, 'pgDepthChanged')):
-                                self.mvc_decoder_thread.pgDepthChanged.connect(self._on_pg_depth_changed)
+                                    and hasattr(native_thread, 'pgDepthChanged')):
+                                native_thread.pgDepthChanged.connect(self._on_pg_depth_changed)
                                 self._pg_depth_connected = True
                         except Exception as _e:
                             logger.warning(f"[BD3D-DEPTH] wiring skipped: {_e}")
@@ -5997,7 +6791,7 @@ class PlayerWindow(QMainWindow):
                     elif track_id == 0:
                         # Disable streaming
                         logger.info("[STREAMING-SUBS] Disabling subtitle streaming")
-                        self.mvc_decoder_thread.set_subtitle_track(0)
+                        native_thread.set_subtitle_track(0)
                         self._active_streaming_track = None
                         if self._subtitle_manager:
                             self._subtitle_manager.set_enabled(False)
@@ -6006,10 +6800,13 @@ class PlayerWindow(QMainWindow):
                         return
                 # ====================================================================
 
-                # Check if this is a PGS track in MVC mode (LEGACY: extraction path)
-                # Only use extraction if streaming didn't handle it
+                # Check if this is a PGS track on either native-video path. mpv is
+                # audio-only in both MVC/edge264 and avcodec HEVC modes, so selecting
+                # its sid cannot draw bitmap subtitles; extract and feed the existing
+                # high-quality native overlay instead.
+                # Only use extraction if MVC streaming didn't handle it.
                 logger.info(f"[SUBTITLE] Streaming path did not handle track_id={track_id}, trying legacy extraction...")
-                if self.mvc_mode_active and self._subtitle_manager and PGS_SUBTITLE_AVAILABLE:
+                if native_overlay_mode and self._subtitle_manager and PGS_SUBTITLE_AVAILABLE:
                     # If PGS detection hasn't completed yet, do it synchronously now
                     if len(self._pgs_subtitle_tracks) == 0 and self._subtitle_extractor and self.current_file_path:
                         logger.info("[PGS] No PGS tracks cached, detecting synchronously...")
@@ -6079,7 +6876,7 @@ class PlayerWindow(QMainWindow):
                     if self._subtitle_manager:
                         self._subtitle_manager.set_enabled(False)
                         self._active_pgs_track_index = None
-                    if self.mvc_mode_active and self._text_subtitle_renderer is not None:
+                    if native_overlay_mode and self._text_subtitle_renderer is not None:
                         # edge264/native-renderer playback without a streaming track
                         # list (e.g. MP4 via lavf demuxer): mpv is audio-only and
                         # cannot draw its subs — mirror them onto the native overlay.
@@ -6216,12 +7013,19 @@ class PlayerWindow(QMainWindow):
             if getattr(self, '_subtitle_connected_widgets', None) == widgets:
                 return
 
-            # Drop any previous connections, then connect every gathered widget
-            try:
-                self._subtitle_manager.subtitle_changed.disconnect()
-                self._subtitle_manager.subtitle_cleared.disconnect()
-            except (TypeError, RuntimeError):
-                pass
+            # Drop any previous connections, then connect every gathered widget.
+            # PySide6 signale un disconnect() sans connexion par un RuntimeWarning
+            # (pas une exception) : ce cas est ATTENDU ici — premier branchement,
+            # ou reconnexion après le reset de _subtitle_connected_widgets qui
+            # laisse volontairement les connexions en place pour cette purge.
+            import warnings as _warnings
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("ignore", RuntimeWarning)
+                try:
+                    self._subtitle_manager.subtitle_changed.disconnect()
+                    self._subtitle_manager.subtitle_cleared.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
 
             def make_setter(target_widget):
                 def setter(rgba, x, y, width, height, vw, vh, disparity=0.0):
@@ -6436,8 +7240,18 @@ class PlayerWindow(QMainWindow):
                     logger.info(f"[SUBTITLE]   Found subtitle: id={track_id}, label={label}")
             logger.info(f"[SUBTITLE] Subtitle tracks found: {len(subtitle_tracks)}")
             self.controls_overlay.update_subtitle_tracks(subtitle_tracks)
+            # Per-file memory: mpv-sid picks are restored here; streaming picks
+            # belong to the streaming population site (different id space).
+            _art = getattr(self, '_apply_remembered_track', None)
+            if _art and (getattr(self, '_file_memory', None) or {}).get(
+                    'subtitle_track_kind') == 'mpv':
+                sid = _art(self.controls_overlay.subtitle_track_combo,
+                           'subtitle_track')
+                if sid:
+                    self.change_subtitle_track(sid)
 
-            # Also detect PGS tracks for MVC mode overlay (async to avoid blocking)
+            # Also detect PGS tracks for the native MVC/HEVC overlay
+            # (async to avoid blocking the UI).
             if PGS_SUBTITLE_AVAILABLE and self._subtitle_extractor and self.current_file_path:
                 import threading
                 filepath = self.current_file_path
@@ -6499,6 +7313,15 @@ class PlayerWindow(QMainWindow):
         # Update subtitle track menu in controls overlay
         if hasattr(self, 'controls_overlay') and hasattr(self.controls_overlay, 'update_subtitle_tracks_streaming'):
             self.controls_overlay.update_subtitle_tracks_streaming(tracks)
+            # Per-file memory: re-apply the remembered subtitle pick for this
+            # title (streaming enumeration is stable per media).
+            _art = getattr(self, '_apply_remembered_track', None)
+            if _art and (getattr(self, '_file_memory', None) or {}).get(
+                    'subtitle_track_kind') == 'streaming':
+                sid = _art(self.controls_overlay.subtitle_track_combo,
+                           'subtitle_track')
+                if sid:
+                    self.change_subtitle_track(sid)
 
         # Show notification
         if pgs_tracks:
@@ -6781,6 +7604,34 @@ class PlayerWindow(QMainWindow):
           mvc     -> {'path','kind':'mvc','eye_order'
                       [, 'mvc_container':'dual','dep_path']}
         """
+        # 2D->3D AI (spec round-5c §0bis): the offline synthesis export is
+        # available exactly WHEN the viewer has the AI active on a 2D file —
+        # never systematically. The descriptor carries every synth3d parameter
+        # so the exporter's detached renderer reproduces the live tuning at
+        # offline (per-frame inference) quality.
+        if (getattr(self, '_synth3d_active', False)
+                and not self._content_is_3d()
+                and getattr(self, 'current_file_path', None)):
+            try:
+                model, side = self._synth3d_model_path()
+            except Exception:
+                model, side = None, 0
+            return {
+                'path': self.current_file_path,
+                'kind': 'synth3d',
+                'eye_order': LEFT_FIRST,      # synthesized: base view IS left
+                'eye_order_source': '2D->3D AI synthesis',
+                'duration_s': (getattr(self, 'video_3d_info', None) or {}).get('duration'),
+                'synth3d': {
+                    'strength_pct': float(getattr(self, '_synth3d_strength', 1.5)),
+                    'convergence': float(getattr(self, '_synth3d_convergence', 0.5)),
+                    'auto_convergence': bool(getattr(self, '_synth3d_auto_convergence', False)),
+                    'temporal_fill': bool(getattr(self, '_synth3d_temporal_fill', False)),
+                    'model_path': str(model or ''),
+                    'ort_dir': str(self._synth3d_ort_dir(model) or '') if model else '',
+                    'side': int(side or 0),
+                },
+            }
         if not self._content_is_3d():
             return None
         path = getattr(self, 'current_file_path', None)
@@ -6890,7 +7741,8 @@ class PlayerWindow(QMainWindow):
                            "(v1 supports Full-SBS/Full-TAB only).")
                 else:
                     tip = ("No exportable 3D source — load an MVC, MV-HEVC, "
-                           "Full-SBS or Full-TAB file.")
+                           "Full-SBS or Full-TAB file, or enable 2D→3D AI on "
+                           "a 2D video to export an AI conversion.")
             elif missing:
                 enabled = False
                 tip = ("Missing export tool: " + ", ".join(missing)
@@ -6904,6 +7756,8 @@ class PlayerWindow(QMainWindow):
                 if (desc.get('kind') == 'mvhevc'
                         and normalise_eye_order(desc.get('eye_order')) != RIGHT_FIRST):
                     title = "Export to MV-HEVC (no re-encoding)"
+                elif desc.get('kind') == 'synth3d':
+                    title = "Export to MV-HEVC (2D→3D AI)"
             sub.setTitle(title)
             sub.setEnabled(enabled)
             eye_menu = getattr(ov, 'export_eye_order_menu', None)
@@ -7550,8 +8404,11 @@ class PlayerWindow(QMainWindow):
         margin_bottom = 20
         margin_side = 10
 
-        # Center the controls horizontally with margins
+        # Compute bar width: at least 600px or window width minus margins,
+        # but NEVER wider than the window itself (prevents overflow off-screen
+        # when the window is narrower than 600px).
         ctrl_w = max(600, w - (margin_side * 2))
+        ctrl_w = min(ctrl_w, w)
         ctrl_x = global_pos.x() + (w - ctrl_w) // 2
         ctrl_y = global_pos.y() + h - ctrl_h - margin_bottom
 
@@ -7567,6 +8424,12 @@ class PlayerWindow(QMainWindow):
         self.controls_overlay.setMaximumWidth(ctrl_w)
         self.controls_overlay.move(ctrl_x, ctrl_y)
         self.controls_overlay.resize(ctrl_w, ctrl_h)
+
+        hud = getattr(self, 'stereo_hud', None)
+        if hud is not None:
+            # A resize changes both the capture resolution and the texture's
+            # aspect-correct eye-space rectangle.
+            hud.sync(force=True)
 
         # Monitoring Overlay (Top Right)
         self._update_monitoring_overlay_geometry()
@@ -7587,29 +8450,30 @@ class PlayerWindow(QMainWindow):
     def changeEvent(self, event):
         if event.type() == QEvent.Type.WindowStateChange:
             if self.isMinimized():
-                self.controls_overlay.hide()
                 self.info_overlay.hide()
                 self.monitoring_overlay.hide()
             elif not self.isHidden():
-                # Restore visibility based on state
+                # Reposition overlays after unminimize / fullscreen toggle:
+                # the video_container may have shifted relative to the frame
+                # without a dedicated resize/move event on Windows.
+                self._update_overlays_geometry()
                 if self.has_media:
                     self.show_controls()
-                    # V15: Start inactivity timer if playing
-                    if self.is_playing:
-                        self._mouse_inactivity_timer.start()
                 else:
                     self.info_overlay.show()
                 self._refresh_monitoring_overlay()
         super().changeEvent(event)
 
     def enterEvent(self, event):
-        """V15: Mouse entered the main window - cancel hide timer."""
+        """Mouse entering the player is navigation activity."""
         self._mouse_outside_window = False
         self._mouse_inactivity_timer.stop()
+        if self.has_media:
+            self._mark_activity()
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        """V15: Mouse left the main window - start 3s timer to hide controls."""
+        """Start the poller's idle interval when the pointer leaves the player."""
         self._mouse_outside_window = True
         if self.is_playing and self.controls_overlay.isVisible():
             # Check if mouse is over a popup (ComboBox dropdown)
@@ -7622,9 +8486,215 @@ class PlayerWindow(QMainWindow):
                     # Mouse is in a popup - don't start hide timer
                     return
 
-            # Start 3s timer to hide controls
-            self._mouse_inactivity_timer.start()
+            self._nav_last_activity = time.monotonic()
         super().leaveEvent(event)
+
+    # --- Per-FILE playback memory (2026-08-03, user request) ------------
+    # Replaying a title restores the viewer's own tuning for it: stereo
+    # presentation, 3D on/off, eye order, track picks, resume position,
+    # per-title synth3d tuning. Distinct from _app_settings (global knobs):
+    # these fields are exactly the ones the load path resets per file.
+
+    def _playback_memory_store(self):
+        store = getattr(self, '_playback_memory', None)
+        if store is None:
+            from playback_memory import PlaybackMemory
+            # SYLC_PLAYBACK_MEMORY: test isolation — pytest points this at a
+            # temp file so tests can never rewrite the user's real memory.
+            store = PlaybackMemory(
+                os.environ.get('SYLC_PLAYBACK_MEMORY')
+                or os.path.join(os.path.expanduser('~'),
+                                '.sylc3d_playback_memory.json'))
+            self._playback_memory = store
+        return store
+
+    def _memory_key_path(self):
+        """The stable identity of the current media: for a file living on a
+        mounted ISO, the ISO itself — mount letters change between sessions
+        (D: today, E: tomorrow) and must not fragment the memory."""
+        path = getattr(self, 'current_file_path', None)
+        if not path:
+            return None
+        try:
+            drive = os.path.splitdrive(os.path.abspath(path))[0][:1].upper()
+            for m in (getattr(self, '_active_iso_mount', None),
+                      getattr(self, '_pending_iso_mount', None)):
+                if not m:
+                    continue
+                letter = str(m[1] or '').rstrip('\\').rstrip(':')[:1].upper()
+                if letter and drive == letter:
+                    return m[0]
+        except Exception:
+            pass
+        return path
+
+    def _recall_for_file(self):
+        """Load the current file's remembered fields; called once per load at
+        the canonical per-file reset point."""
+        self._file_memory = {}
+        self._file_memory_applied = set()
+        self._file_memory_last_pos_save = 0.0
+        try:
+            path = self._memory_key_path()
+            if path:
+                self._file_memory = self._playback_memory_store().recall(path)
+                if self._file_memory:
+                    logger.info(f"[FILE-MEMORY] recalled {sorted(self._file_memory)} "
+                                f"for {os.path.basename(path)}")
+        except Exception:
+            logger.exception("[FILE-MEMORY] recall failed (ignored)")
+
+    def _remember_for_file(self, **fields):
+        """Persist per-file fields for the current media. Never raises."""
+        try:
+            path = self._memory_key_path()
+            if not path:
+                return
+            self._playback_memory_store().remember(path, **fields)
+            mem = getattr(self, '_file_memory', None)
+            if isinstance(mem, dict):
+                for name, value in fields.items():
+                    if value is None:
+                        mem.pop(name, None)
+                    else:
+                        mem[name] = value
+        except Exception:
+            logger.exception("[FILE-MEMORY] remember failed (ignored)")
+
+    def _choose_initial_stereo_mode(self, detected_mode):
+        """The presentation the combo should start on: the viewer's remembered
+        pick for THIS file when valid, else the detected content mode."""
+        remembered = (getattr(self, '_file_memory', None) or {}).get('stereo_mode')
+        if remembered in PRESENTATION_KEYS:
+            return remembered
+        return detected_mode
+
+    def _remember_position(self, final=False):
+        """Record the resume position (throttled unless `final`). Positions in
+        the first 30s or the last 7% mean 'no resume' — restarting there is
+        better than resuming. Periodic ticks only ever UPGRADE the position
+        and only after the deferred restore ran: the early ticks of a fresh
+        session sit near 0s and would otherwise erase the very resume point
+        the restore is about to apply (measured race, 2026-08-03 smoke)."""
+        try:
+            if not (self.has_media and getattr(self, 'current_file_path', None)):
+                return
+            now = time.monotonic()
+            if not final:
+                if 'deferred' not in getattr(self, '_file_memory_applied', set()):
+                    return
+                if now - getattr(self, '_file_memory_last_pos_save', 0.0) < 15.0:
+                    return
+            self._file_memory_last_pos_save = now
+            pos = float(getattr(self, '_current_precise_time', 0.0) or 0.0)
+            try:
+                dur = float(self.controls_overlay.time_slider.maximum() or 0) / 1000.0
+            except Exception:
+                dur = 0.0
+            in_resume_range = pos >= 30.0 and (dur <= 0 or pos <= 0.93 * dur)
+            if in_resume_range:
+                self._remember_for_file(resume_pos=round(pos, 3),
+                                        duration=round(dur, 3) if dur > 0 else None)
+            elif final:
+                self._remember_for_file(resume_pos=None)
+        except Exception:
+            pass
+
+    def _apply_deferred_file_memory(self):
+        """Apply the remembered fields that need a RUNNING pipeline: resume
+        position, 3D-off, per-title synth3d tuning. Scheduled once shortly
+        after playback starts; every step is individually best-effort."""
+        mem = getattr(self, '_file_memory', None) or {}
+        applied = getattr(self, '_file_memory_applied', set())
+        if not mem or 'deferred' in applied or not self.has_media:
+            return
+        applied.add('deferred')
+
+        # Per-title synth3d tuning first (values only touch an active synthesis).
+        try:
+            if 'synth3d_strength' in mem:
+                self.set_synth3d_strength(float(mem['synth3d_strength']) * 10.0,
+                                          persist=False)
+            if 'synth3d_convergence' in mem:
+                self.set_synth3d_convergence(float(mem['synth3d_convergence']) * 100.0,
+                                             persist=False)
+        except Exception:
+            logger.exception("[FILE-MEMORY] synth3d tuning restore failed")
+        try:
+            if (mem.get('synth3d_enabled') and not getattr(self, '_synth3d_active', False)
+                    and self._synth3d_supported() and self._synth3d_eligible()):
+                logger.info("[FILE-MEMORY] re-enabling 2D->3D AI (remembered)")
+                self.toggle_synth3d(True)
+                self._update_synth3d_menu_state()
+        except Exception:
+            logger.exception("[FILE-MEMORY] synth3d re-enable failed")
+
+        # The viewer had turned 3D OFF for this title (ON is the content default).
+        try:
+            if mem.get('three_d_enabled') is False and self.is_3d_enabled:
+                logger.info("[FILE-MEMORY] disabling 3D output (remembered)")
+                try:
+                    btn = self.controls_overlay.mode_3d_button
+                    btn.blockSignals(True)
+                    btn.setChecked(False)
+                    btn.blockSignals(False)
+                except Exception:
+                    pass
+                self.toggle_3d_mode(False)
+        except Exception:
+            logger.exception("[FILE-MEMORY] 3D-off restore failed")
+
+        # Resume position last (through the production seek path).
+        try:
+            pos = float(mem.get('resume_pos') or 0.0)
+            try:
+                dur = float(self.controls_overlay.time_slider.maximum() or 0) / 1000.0
+            except Exception:
+                dur = 0.0
+            if pos > 30.0 and (dur <= 0 or pos < 0.93 * dur):
+                logger.info(f"[FILE-MEMORY] resuming at {pos:.1f}s")
+                self._handle_seek_request(pos)
+                self.show_3d_notification(
+                    f"Resumed at {self.controls_overlay._format_time(pos)}",
+                    success=True)
+        except Exception:
+            logger.exception("[FILE-MEMORY] resume failed")
+
+    def _apply_remembered_track(self, combo, field):
+        """Select the remembered track in `combo` (by itemData) and return the
+        track id to apply, or None. Marks the field applied exactly once."""
+        mem = getattr(self, '_file_memory', None) or {}
+        applied = getattr(self, '_file_memory_applied', set())
+        if field in applied or field not in mem:
+            return None
+        applied.add(field)
+        track_id = mem[field]
+        try:
+            idx = combo.findData(track_id)
+            if idx < 0:
+                return None
+            combo.blockSignals(True)
+            combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+            logger.info(f"[FILE-MEMORY] restoring {field}={track_id}")
+            return track_id
+        except Exception:
+            logger.exception(f"[FILE-MEMORY] {field} restore failed")
+            return None
+
+    def _on_eye_order_picked(self, action):
+        """Persist the export eye-order pick for this title."""
+        if not self.has_media:
+            return
+        try:
+            ov = self.controls_overlay
+            order = ('left' if action is ov.export_eye_left_action
+                     else 'right' if action is ov.export_eye_right_action
+                     else 'auto')
+            # 'auto' is the default: remembering it just deletes the override.
+            self._remember_for_file(eye_order=None if order == 'auto' else order)
+        except Exception:
+            pass
 
     # --- V60: tiny per-install settings store (JSON in the user profile) ---
 
@@ -7665,9 +8735,17 @@ class PlayerWindow(QMainWindow):
 
         # [ / ] -> adjust A/V sync offset live (delay video to match the heard audio)
         if key in (Qt.Key.Key_BracketRight, Qt.Key.Key_BracketLeft):
-            if self.mvc_decoder_thread and self.mvc_mode_active and hasattr(self.mvc_decoder_thread, 'adjust_av_offset'):
-                delta = 0.05 if key == Qt.Key.Key_BracketRight else -0.05
-                off = self.mvc_decoder_thread.adjust_av_offset(delta)
+            delta = 0.05 if key == Qt.Key.Key_BracketRight else -0.05
+            sync_decoder = None
+            if (getattr(self, '_hevc_mode_active', False)
+                    and getattr(self, 'hevc_thread', None) is not None
+                    and hasattr(self.hevc_thread, 'adjust_av_offset')):
+                sync_decoder = self.hevc_thread
+            elif (self.mvc_decoder_thread and self.mvc_mode_active
+                    and hasattr(self.mvc_decoder_thread, 'adjust_av_offset')):
+                sync_decoder = self.mvc_decoder_thread
+            if sync_decoder is not None:
+                off = sync_decoder.adjust_av_offset(delta)
                 # V60: persist the trim so every future decoder thread starts with it
                 self._app_settings['av_sync_offset_s'] = off
                 self._save_app_settings()
@@ -7681,6 +8759,14 @@ class PlayerWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def closeEvent(self, event):
+        # Per-file memory: closing the app mid-film must still remember where
+        # the viewer was (same contract as an explicit Stop).
+        _rp = getattr(self, '_remember_position', None)
+        if _rp is not None:
+            _rp(final=True)
+        stop_matting = getattr(self, '_synth3d_stop_human_matting', None)
+        if stop_matting is not None:
+            stop_matting(timeout=1.0)
         if getattr(self, '_thumb_service', None):
             try:
                 self._thumb_service.shutdown()
@@ -7711,6 +8797,9 @@ class PlayerWindow(QMainWindow):
             self._pending_iso_mount = None
         except Exception:
             pass
+        hud = getattr(self, 'stereo_hud', None)
+        if hud is not None:
+            hud.shutdown()
         self.controls_overlay.close()
         self.info_overlay.close()
         self.loading_overlay.close()
@@ -7752,11 +8841,13 @@ class PlayerWindow(QMainWindow):
 
         if watched is self.controls_overlay:
             if event.type() in (QEvent.Type.Enter, QEvent.Type.MouseMove):
-                # V15: Mouse is on controls - stop inactivity timer
+                # Direct event handling gives immediate feedback; the global
+                # cursor poll remains the sole authority for hiding.
                 self._mouse_inactivity_timer.stop()
-                # Also stop old timer for compatibility
                 self._ensure_controls_timer_initialized()
                 self.controls_hide_timer.stop()
+                if self.has_media:
+                    self._mark_activity()
             elif event.type() == QEvent.Type.Leave and self.is_playing:
                 # V15: Mouse left controls overlay
                 # Check if it went to a popup (ComboBox dropdown)
@@ -7769,9 +8860,10 @@ class PlayerWindow(QMainWindow):
                         # Mouse is in a popup - don't start hide timer
                         return super().eventFilter(watched, event)
 
-                # Mouse left to main window area - start inactivity timer
+                # Mouse left to main window area: begin a fresh poller-owned
+                # idle interval, without arming a competing QTimer.
                 if not self._mouse_outside_window:
-                    self._mouse_inactivity_timer.start()
+                    self._nav_last_activity = time.monotonic()
         return super().eventFilter(watched, event)
 
     def _update_metrics_overlay_geometry(self):
@@ -8117,6 +9209,12 @@ class PlayerWindow(QMainWindow):
     def _continue_play_file(self, file_path):
         """Continue loading file after cleanup delay."""
         self.current_file_path = file_path
+        # Per-FILE memory: recall this title's remembered tuning right at the
+        # canonical per-file reset point, so every reset below can prefer the
+        # viewer's own choice over the blanket default.
+        _recall = getattr(self, '_recall_for_file', None)
+        if _recall is not None:
+            _recall()
         # Encoded mattes are per-medium. A rectangular choice from the previous
         # title must never crop a new source before its own detector has spoken.
         self._synth3d_aspect_override = None
@@ -8133,9 +9231,14 @@ class PlayerWindow(QMainWindow):
         # emits next.
         self._set_dual_projector_enabled(False)
         # Eye-order overrides are per source.  A right-first choice for one MVC
-        # must never silently carry into the next movie.
+        # must never silently carry into the next movie — unless it was made
+        # for THIS movie: the per-file memory restores it.
         try:
-            self.controls_overlay.export_eye_auto_action.setChecked(True)
+            _eye = (getattr(self, '_file_memory', None) or {}).get('eye_order')
+            ov = self.controls_overlay
+            (ov.export_eye_left_action if _eye == 'left'
+             else ov.export_eye_right_action if _eye == 'right'
+             else ov.export_eye_auto_action).setChecked(True)
         except Exception:
             pass
         self._edge264_consecutive_crashes = 0  # fresh source: reset edge264 crash streak
@@ -8166,7 +9269,7 @@ class PlayerWindow(QMainWindow):
         self._prev_mvc_ts = 0.0
         self._last_mvc_timestamp = 0.0
         self._current_precise_time = 0.0
-        self._mpv_time_pos_cache = None
+        self._prime_mpv_time_pos(None)
 
         # STEP 1: Quick analysis to detect if MVC (DON'T start decoder yet!)
         self.loading_overlay.set_status("Analyzing 3D structure...")
@@ -8313,6 +9416,10 @@ class PlayerWindow(QMainWindow):
             _mpv_src = self._mpv_source_for(file_path)
             self.player.play(_mpv_src)
             self.player.pause = True
+            # The async pause observer can legitimately arrive late (notably
+            # while TrueHD initializes).  Latch the command-side truth now so
+            # the HEVC audio clock cannot extrapolate during the load barrier.
+            self._mpv_pause_cache = True
             # V7b FIX: FORCE the timer to stay active even when paused for MVC mode
             # This lets the slider progress immediately
             if self.mvc_mode_active or getattr(self, "_mvc_file_detected", False):
@@ -8382,10 +9489,15 @@ class PlayerWindow(QMainWindow):
                                     else:
                                         self.player.command_async('set', 'time-pos', '0')
                                         self.player.command_async('set', 'pause', 'no')
+                                        self._arm_hevc_audio_start(0.0)
                                 except:
                                     pass
 
                         QTimer.singleShot(50, _safe_start)
+                        # Per-file memory: apply the deferred fields (resume
+                        # position, 3D-off, synth3d re-enable) once the
+                        # pipeline is actually running.
+                        QTimer.singleShot(1800, self._apply_deferred_file_memory)
                         logger.info("[TIMELINE] Playback started with correct scale")
                         return
 
@@ -8425,10 +9537,14 @@ class PlayerWindow(QMainWindow):
                                 try:
                                     self.player.command_async('set', 'time-pos', '0')
                                     self.player.command_async('set', 'pause', 'no')
+                                    self._arm_hevc_audio_start(0.0)
                                 except:
                                     pass
 
                         QTimer.singleShot(50, _safe_fallback_start)
+                        # Per-file memory: same deferred application as the
+                        # mpv-duration branch (no-audio files land here).
+                        QTimer.singleShot(1800, self._apply_deferred_file_memory)
 
                 except Exception as e:
                     logger.debug(f"[TIMELINE] Could not update from MPV: {e}")
@@ -8440,6 +9556,7 @@ class PlayerWindow(QMainWindow):
                                 try:
                                     self.player.command_async('set', 'time-pos', '0')
                                     self.player.command_async('set', 'pause', 'no')
+                                    self._arm_hevc_audio_start(0.0)
                                 except:
                                     pass
                         QTimer.singleShot(50, _safe_last_resort)
@@ -8526,9 +9643,22 @@ class PlayerWindow(QMainWindow):
 
         if self.video_3d_info['is_3d'] and self.video_3d_info['stereo_mode'] != 'none':
             stereo_mode = self.video_3d_info['stereo_mode']
-            # Index mapping: 0=MVC, 1=Side-by-Side, 2=Top-Bottom
-            mode_index = {'mvc': 0, 'sbs': 1, 'tab': 2, 'dual': 3}.get(stereo_mode, 0)
+            # Index mapping: 0=MVC, 1=Side-by-Side, 2=Top-Bottom, 3=Dual Projector, 4=Glasses
+            # The COMBO starts on the viewer's remembered presentation for this
+            # file when one exists (per-file memory); the decoder configuration
+            # below keeps following the detected CONTENT mode regardless.
+            _choose = getattr(self, '_choose_initial_stereo_mode', None)
+            ui_mode = _choose(stereo_mode) if _choose else stereo_mode
+            mode_index = {'mvc': 0, 'sbs': 1, 'tab': 2, 'dual': 3,
+                          'glasses': 4}.get(ui_mode, 0)
             self.controls_overlay.stereo_mode_combo.setCurrentIndex(mode_index)
+            # A REMEMBERED pick must be latched even when the combo was already
+            # showing it (setCurrentIndex emits nothing then — measured: the
+            # replay booted with the right combo but current_stereo_mode stuck
+            # at 'auto'). Detection-only loads keep the historical behavior.
+            if ((getattr(self, '_file_memory', None) or {}).get('stereo_mode') == ui_mode
+                    and self.current_stereo_mode != ui_mode):
+                self.change_stereo_mode(ui_mode)
             mode_names = {'mvc': 'MultiView', 'sbs': 'Side-by-Side', 'tab': 'Top-Bottom'}
             self.show_3d_notification(f"3D File: {mode_names.get(stereo_mode, stereo_mode.upper())}", success=True,
                                       permanent=True)
@@ -8683,6 +9813,9 @@ class PlayerWindow(QMainWindow):
                     self.show_3d_notification("2D Mode (Left View)", success=True)
                 except Exception as e:
                     print(f"Error switching to 2D: {e}")
+                
+                # Restore 2D navigation bar UI - AFTER stack switch and OS compositor updates
+                QTimer.singleShot(250, lambda: (self._update_overlays_geometry(), self.show_controls()))
                 return
 
             self._stop_mvc_decoder()
@@ -8692,6 +9825,9 @@ class PlayerWindow(QMainWindow):
                 self.video_stack.setCurrentWidget(self.video_widget)
             except:
                 pass
+                
+            # Restore 2D navigation bar UI - AFTER stack switch and OS compositor updates
+            QTimer.singleShot(250, lambda: (self._update_overlays_geometry(), self.show_controls()))
             return
 
         # Resolve 'auto' to the actually detected mode BEFORE any branching.
@@ -8725,7 +9861,7 @@ class PlayerWindow(QMainWindow):
                            (self.video_3d_info.get('stereo_mode') == 'mvc' or
                             self.video_3d_info.get('has_mvc_track') or
                             packed_input or
-                            (getattr(self, '_synth3d_active', False) and self.mvc_mode_active)))
+                            getattr(self, '_synth3d_active', False)))
 
         if use_mvc_decoder:
             try:
@@ -8745,13 +9881,19 @@ class PlayerWindow(QMainWindow):
                 # already handled separately by eye_windows (which _select_stereo_
                 # presentation_targets prioritises over the framepack window) plus the
                 # _show_framepacking_output guard, so no duplicate branch is needed here.
-                if stereo_mode in ('mvc', 'dual'):
+                if stereo_mode in ('mvc', 'dual', 'glasses'):
                     # --- Detached 3D FramePack Mode ---
+                    # 'glasses' joins 'mvc'/'dual' here (not the SBS/TAB branch below) for
+                    # the same reason as the HEVC path's equivalent branch: it needs the
+                    # DETACHED window, sized to F-SBS, not the main window at desktop size.
                     if hasattr(self, 'mvc_embedded_widget') and self.framepacking_window:
                         # V7b SYNC: Embedded stays in 2D (left eye), Framepack window in framepack mode
                         # Both receive same frames for timing sync, but render differently
                         self.mvc_embedded_widget.set_stereo_mode('2d')
-                        self.framepacking_window.display_widget.set_stereo_mode('framepack')
+                        self.framepacking_window.apply_output_geometry(stereo_mode)
+                        self._apply_framepack_source_aspect(self.framepacking_window, stereo_mode)
+                        self.framepacking_window.display_widget.set_stereo_mode(
+                            'glasses' if stereo_mode == 'glasses' else 'framepack')
 
                         # V7b CRITICAL SYNC FIX: Keep embedded widget VISIBLE so it continues rendering!
                         # If we hide it, Qt won't render it and it will freeze on last frame = desync
@@ -8769,6 +9911,8 @@ class PlayerWindow(QMainWindow):
                             self._connect_text_subtitle_to_widget()
 
                         self._show_framepacking_output()
+                        if stereo_mode == 'glasses':
+                            self.show_3d_notification("3D Mode: Glasses F-SBS", success=True)
 
                 elif stereo_mode in ('sbs', 'tab'):
                     # --- SBS/TAB Mode in MAIN WINDOW ---
@@ -8810,6 +9954,15 @@ class PlayerWindow(QMainWindow):
                     self.framepacking_window.hide()
                 mode_name = "Side-by-Side" if is_sbs else "Top-Bottom"
                 self.show_3d_notification(f"3D Mode: {mode_name} (Native)", success=True)
+            elif stereo_mode == 'glasses':
+                # Glasses needs the native decoder's detached F-SBS window, same as
+                # Dual Projector needs it for the eye pair below -- mpv has no
+                # equivalent output and cannot be steered into producing one.
+                # (fix round 1, Minor 5: this used to fall through silently.)
+                self.show_3d_notification(
+                    "Glasses needs the native decoder — not available for this "
+                    "source", success=False)
+                self._fallback_to_mpv_mvc()
             else:
                 # Dual Projector is fed exclusively by the native decoder's frame
                 # dispatch (_on_mvc_frame_yuv_ready). mpv renders into its own
@@ -8943,6 +10096,7 @@ class PlayerWindow(QMainWindow):
                     display_widget=_dw
                 )
                 self.framepacking_window.visibilityChanged.connect(self._on_framepacking_visibility_changed)
+                self.framepacking_window.geometryChanged.connect(self._on_framepacking_geometry_changed)
 
             # 3. Initial State: prepare the native widget, but keep MPV visible
             # until edge264 has produced a validated first frame. This makes the
@@ -9407,10 +10561,62 @@ class PlayerWindow(QMainWindow):
         """Master clock for the HEVC decode thread: mpv's audio time-pos in ms, read
         FROM A CACHED value only (populated by the existing on_time_update observer). A
         blocking mpv property read on this hot cross-thread path is exactly the
-        0xe24c4a02 FSBS-crash pattern (project memory) — never do it here. Returns None
-        until mpv reports a position (the decode thread then free-runs on its pts clock)."""
+        0xe24c4a02 FSBS-crash pattern (project memory) — never do it here. Samples are
+        extrapolated at 1x while playing; None keeps an audio-backed decoder behind its
+        startup barrier, while a proven video-only session uses PTS/wall-clock pacing."""
         pos = getattr(self, '_mpv_time_pos_cache', None)
-        return None if pos is None else float(pos) * 1000.0
+        if pos is None:
+            return None
+        stamp = getattr(self, '_mpv_time_pos_cache_mono', None)
+        if stamp is not None and not getattr(self, '_mpv_pause_cache', True):
+            pos = float(pos) + max(0.0, time.monotonic() - float(stamp))
+        return float(pos) * 1000.0
+
+    def _arm_hevc_audio_start(self, target_s=0.0):
+        """Request a clocked HEVC start without trusting one mpv observer.
+
+        Normally the first advancing time-pos releases the decoder.  If Python
+        never receives that callback, a GUI-thread timer reconstructs where the
+        1x audio clock should be and releases it anyway.  The captured thread
+        identity prevents an old timer from waking a later media session.
+        """
+        th = getattr(self, 'hevc_thread', None)
+        if (th is None or not getattr(self, '_hevc_mode_active', False)
+                or not getattr(self, '_hevc_clocked', False)):
+            return
+        request = (float(target_s), time.monotonic(), th)
+        self._hevc_start_request = request
+        QTimer.singleShot(
+            350,
+            lambda owner=th: self._release_hevc_audio_start(
+                observed_s=None, expected_thread=owner))
+
+    def _release_hevc_audio_start(self, observed_s=None, expected_thread=None):
+        """Idempotently release the startup barrier from audio evidence/fallback."""
+        request = getattr(self, '_hevc_start_request', None)
+        if request is None:
+            return False
+        target_s, requested_at, owner = request
+        current = getattr(self, 'hevc_thread', None)
+        if (current is not owner
+                or (expected_thread is not None and owner is not expected_thread)):
+            return False
+        now = time.monotonic()
+        if observed_s is None:
+            # No callback: audio was commanded to start at requested_at, so its
+            # best non-blocking estimate is target + elapsed wall time.
+            clock_s = target_s + max(0.0, now - requested_at)
+            source = 'timeout'
+        else:
+            clock_s = float(observed_s)
+            source = 'time-pos'
+        self._prime_mpv_time_pos(clock_s)
+        self._mpv_pause_cache = False
+        self._hevc_start_request = None
+        owner.set_paused(False)
+        logger.info("[HEVC-SYNC] startup barrier released by %s at %.3fs",
+                    source, clock_s)
+        return True
 
     def _try_start_hevc(self, file_path):
         """Probe + start the HEVC path. Returns True when it took the file (the caller
@@ -9515,6 +10721,8 @@ class PlayerWindow(QMainWindow):
                     parent=None, use_yuv_shader=USE_GPU_YUV_CONVERSION, display_widget=_dw)
                 self.framepacking_window.visibilityChanged.connect(
                     self._on_framepacking_visibility_changed)
+                self.framepacking_window.geometryChanged.connect(
+                    self._on_framepacking_geometry_changed)
 
             # 10-bit frames arrive as uint16 planes → the widget's R16 path needs a
             # plane_scale; HW D3D11VA copy-back (P010) is MSB-aligned (65535/65472),
@@ -9689,22 +10897,43 @@ class PlayerWindow(QMainWindow):
                 self._update_3d_button_state()
 
             # I2: clear any stale mpv time-pos cache left over from the previous file /
-            # session BEFORE the thread starts. While the cache is None, _mpv_time_pos_ms
-            # returns None, so the decode thread free-runs on its own pts clock until the
-            # first fresh observer tick — instead of re-anchoring to a leftover pre-load
-            # position and bursting decode speed to "catch up".
-            self._mpv_time_pos_cache = None
+            # session BEFORE the thread starts.  Audio-backed HEVC starts PAUSED and
+            # consumes no frame while this cache is None; video-only HEVC retains its
+            # proven PTS/wall-clock pacing.  A stale prior-session value can therefore
+            # neither release the startup barrier nor trigger a false catch-up burst.
+            self._prime_mpv_time_pos(None)
 
             # Decode thread: same frame contract as MVC → the SAME slot. Master clock =
             # mpv audio time-pos FROM CACHE ONLY (never a blocking read; crash 0xe24c4a02).
             self.hevc_source = src
             self.hevc_thread = HevcDecodeThread()
-            self.hevc_thread.configure(src, mode=mode, half=half, inverted=inverted)
+            _has_audio = (self.video_3d_info or {}).get('has_audio')
+            _clocked = _has_audio is not False
+            self._hevc_clocked = _clocked
+            self._hevc_start_request = None
+            try:
+                _av_trim = float(self._app_settings.get('av_sync_offset_s', 0.0))
+            except (TypeError, ValueError):
+                _av_trim = 0.0
+            self.hevc_thread.configure(
+                src, mode=mode, half=half, inverted=inverted,
+                start_paused=_clocked,
+                require_master_clock=_clocked,
+                bounded_delivery=True,
+                av_sync_offset_s=_av_trim)
             self.hevc_thread.clock_offset_provider = self._mpv_time_pos_ms
             self.hevc_thread.frameYUVTimedReady.connect(
-                self._on_mvc_frame_yuv_timed_ready, Qt.QueuedConnection)
+                self._on_hevc_frame_yuv_timed_ready, Qt.QueuedConnection)
             self.hevc_thread.decodeFailed.connect(self._on_hevc_failed)
             self.hevc_thread.endOfStream.connect(self._on_mvc_finished)  # shared EOS handler
+            # PGS streaming (miroir du chemin MVC) : la source lavf collecte les
+            # blocs au fil du demux — plus d'extraction ffmpeg 1-2 min. Le combo
+            # se remplit via le MEME handler que MVC ; pgsDataReady est connecte
+            # a la selection de piste (change_subtitle_track), comme en MVC.
+            self._streaming_subtitle_tracks = []
+            self._pgs_streaming_connected = False
+            self.hevc_thread.subtitleTracksDetected.connect(
+                self._on_subtitle_tracks_detected, Qt.QueuedConnection)
             # Timeline position from the decode thread itself (mirror of the MVC
             # per-frame timestamp slot): for a no-audio file the mpv shell never
             # reports time-pos, so without this the slider has no position source.
@@ -9808,11 +11037,15 @@ class PlayerWindow(QMainWindow):
         if th is not None:
             try:
                 for _sig in ('frameYUVReady', 'frameYUVTimedReady',
-                             'decodeFailed', 'endOfStream'):
+                             'decodeFailed', 'endOfStream',
+                             'pgsDataReady', 'subtitleTracksDetected'):
                     try:
                         getattr(th, _sig).disconnect()
                     except Exception:
                         pass
+                # Le connect pgsDataReady est par-thread : un nouveau thread doit
+                # pouvoir se reconnecter (meme regle que le teardown MVC).
+                self._pgs_streaming_connected = False
                 th.request_stop()
                 if not th.wait(5000):
                     thread_dead = False
@@ -9828,6 +11061,12 @@ class PlayerWindow(QMainWindow):
                                  "source NON fermee (fuite volontaire, anti use-after-free)")
             except Exception as e:
                 logger.warning(f"[HEVC] thread teardown error: {e}")
+            try:
+                stats = th.sync_stats()
+                logger.info("[HEVC-SYNC] teardown: sync_drops=%d backpressure_drops=%d",
+                            stats['sync_drops'], stats['backpressure_drops'])
+            except Exception:
+                pass
             self.hevc_thread = None
         src = getattr(self, 'hevc_source', None)
         if src is not None:
@@ -9843,9 +11082,16 @@ class PlayerWindow(QMainWindow):
         if getattr(self, '_hevc_mode_active', False):
             logger.info("[HEVC] path torn down")
         self._hevc_mode_active = False
+        self._hevc_clocked = False
+        self._hevc_start_request = None
         # C2: forget the stored MediaInfo/half so a stale aspect can't leak into the next file.
         self.hevc_media_info = None
         self._hevc_half = False
+        # Fix round 2: same reasoning for the Glasses per-eye plane-dims cache --
+        # this is the single shared teardown every session end routes through
+        # (see _stop_mvc_decoder's docstring), HEVC or plain MVC/edge264 alike,
+        # so it is the right place to drop it for both.
+        self._glasses_eye_plane_dims = None
         # Reset the 10-bit rescale AND the C2 display-aspect override so the reused widgets
         # render subsequent 8-bit / full-format content correctly.
         for _w in self._display_widgets():
@@ -9854,6 +11100,18 @@ class PlayerWindow(QMainWindow):
             except Exception:
                 pass
             try:
+                # Fix round 3: this reset is what makes a mid-session decoder
+                # restart (e.g. edge264 crash recovery) self-healing for
+                # Glasses -- it MUST stay paired with the
+                # `_glasses_eye_plane_dims = None` reset above (:9994). If a
+                # restart resumes the same file at the same resolution, the
+                # first post-restart frame's dims equal the OLD cached dims,
+                # so _note_decoded_eye_plane sees no change and skips
+                # re-applying -- UNLESS the cache was also cleared, which
+                # forces that first frame to register as a change regardless.
+                # Without both together, this line alone would leave the
+                # widget pillarboxed (0.0 = "derive", i.e. single-eye, not
+                # doubled) until an explicit mode switch fixes it by hand.
                 _w.source_aspect = 0.0
             except Exception:
                 pass
@@ -10046,7 +11304,10 @@ class PlayerWindow(QMainWindow):
                                       success=True)
             return
         if enable_3d and fp is not None:
-            fp.display_widget.set_stereo_mode('framepack')
+            fp.apply_output_geometry(stereo_mode)
+            self._apply_framepack_source_aspect(fp, stereo_mode)
+            fp.display_widget.set_stereo_mode(
+                'glasses' if stereo_mode == 'glasses' else 'framepack')
             self.active_mvc_widget = fp.display_widget
             if emb is not None:
                 # Keep the normal UI page selected and live. Frame delivery gives
@@ -10058,7 +11319,10 @@ class PlayerWindow(QMainWindow):
             if self._text_sub_active:
                 self._connect_text_subtitle_to_widget()
             self._show_framepacking_output()
-            self.show_3d_notification("3D Mode (HEVC framepack)", success=True)
+            if stereo_mode == 'glasses':
+                self.show_3d_notification("3D Mode: Glasses F-SBS (HEVC)", success=True)
+            else:
+                self.show_3d_notification("3D Mode (HEVC framepack)", success=True)
         else:
             if fp is not None and fp.isVisible():
                 fp.hide()
@@ -10541,6 +11805,28 @@ class PlayerWindow(QMainWindow):
             self, left_planes, right_planes, -1.0)
 
     @Slot(object, object, object)
+    def _on_hevc_frame_yuv_timed_ready(
+            self, left_planes, right_planes, video_time_ms):
+        """Bounded HEVC delivery wrapper.
+
+        The decoder marks one presentation pending before emitting.  Acknowledge
+        it only after the GUI has uploaded/presented this frame, even when the
+        shared presentation slot rejects malformed data or raises.
+        """
+        try:
+            return PlayerWindow._on_mvc_frame_yuv_timed_ready(
+                self, left_planes, right_planes, video_time_ms)
+        finally:
+            try:
+                owner = self.sender()
+            except Exception:
+                owner = None
+            if owner is None:
+                owner = getattr(self, 'hevc_thread', None)
+            if owner is not None and hasattr(owner, 'presentation_consumed'):
+                owner.presentation_consumed()
+
+    @Slot(object, object, object)
     def _on_mvc_frame_yuv_timed_ready(
             self, left_planes, right_planes, video_time_ms):
         """Dispatch one decoded stereo frame to every visible presentation target.
@@ -10602,10 +11888,24 @@ class PlayerWindow(QMainWindow):
 
         embedded = getattr(self, 'mvc_embedded_widget', None)
         fp_window = getattr(self, 'framepacking_window', None)
+
+        # Fix round 2 (Critical 1, completion): left_planes here is already the
+        # real per-eye plane for every source class (the HEVC decode thread and
+        # the _split_packed_stereo call above both split BEFORE this point) --
+        # keep the Glasses aspect cache current from it.
+        self._note_decoded_eye_plane(left_planes)
+
         presentations = _select_stereo_presentation_targets(
             embedded, fp_window, getattr(self, 'active_mvc_widget', None),
             getattr(self, 'eye_windows', None))
         targets = [widget for widget, _ in presentations]
+
+        # One shared asynchronous matte for every surface. Submission is
+        # latest-only and returns immediately; the result selected here always
+        # belongs to this media timeline (stale masks are rejected by PTS).
+        matte_for_frame = getattr(self, '_synth3d_human_matte_for_frame', None)
+        human_matte = (matte_for_frame(left_planes, video_time_ms)
+                       if matte_for_frame is not None else None)
 
         eye_active = bool(getattr(self, 'eye_windows', None))
         if len(presentations) > 1 and not getattr(self, '_dual_output_logged', False):
@@ -10630,6 +11930,10 @@ class PlayerWindow(QMainWindow):
                 # test and fallback widgets. NativeFramepackWidget consumes it
                 # immediately before uploading this same frame.
                 target.video_time_ms = float(video_time_ms)
+                try:
+                    target.set_synth3d_human_matte(human_matte)
+                except (AttributeError, TypeError):
+                    pass
                 _first, _second = self._planes_for_target(
                     target, left_planes, right_planes)
                 delivered = target.set_frame_yuv_views(_first, _second)
@@ -10769,11 +12073,20 @@ class PlayerWindow(QMainWindow):
         self._current_precise_time = float(t_s)
         if t_s > 0 and not self._is_scrubbing and not getattr(self, '_is_seeking', False):
             self._set_ui_time(t_s)
+        
+        if self._subtitle_manager is not None:
+            self._subtitle_manager.update_time(t_s)
 
     @Slot()
     def _on_mvc_finished(self):
         """Slot: MVC decoding finished"""
         logger.info("MVC playback finished")
+
+        # Per-file memory: a NATURAL end clears the resume point — replaying a
+        # finished film starts at the beginning, not at the credits.
+        _rem = getattr(self, '_remember_for_file', None)
+        if _rem is not None:
+            _rem(resume_pos=None)
 
         # V14 GRACEFUL ENDING: Set cleanup flag IMMEDIATELY to stop decoder memory access
         # This must be the VERY FIRST action to prevent Windows threading exceptions
@@ -10901,6 +12214,23 @@ class PlayerWindow(QMainWindow):
                 pass
         return float(self.controls_overlay.time_slider.value()) / 1000.0
 
+    def _on_framepacking_geometry_changed(self, width, height):
+        """Fix round 3: keep the Glasses aspect clamp (`_glasses_target_
+        aspect`) live across every real size change of the detached window --
+        an ordinary Qt resize AND fake-fullscreen enter/exit alike, both of
+        which deliver a ordinary Qt resizeEvent (see Framepacking3DWindow.
+        resizeEvent). `_apply_framepack_source_aspect` itself re-reads the
+        window's current size, so this slot's job is only to know WHEN to
+        call it again -- a value computed once at configure time would be
+        stale the instant the user toggles fullscreen, exactly when it
+        matters most. A no-op for every presentation but Glasses: the plain
+        baseline the others use doesn't depend on the surface size."""
+        if getattr(self, 'current_stereo_mode', None) != 'glasses':
+            return
+        fp = getattr(self, 'framepacking_window', None)
+        if fp is not None:
+            self._apply_framepack_source_aspect(fp, 'glasses')
+
     def _on_framepacking_visibility_changed(self, visible):
         self._framepacking_visible = visible
         self.monitoring_overlay.update_window_state(visible)
@@ -10909,8 +12239,16 @@ class PlayerWindow(QMainWindow):
         # V9 FIX: Update active widget and stereo mode when framepacking window visibility changes
         # This ensures frames go to the correct widget with correct stereo mode
         if visible and self.framepacking_window:
-            # Switch to framepack mode when window becomes visible
-            self.framepacking_window.display_widget.set_stereo_mode('framepack')
+            # Switch to framepack mode when window becomes visible -- except while
+            # Glasses is the active presentation (fix round 1, Critical 2). This
+            # handler used to stomp 'framepack' back on unconditionally on every
+            # show, including a plain resize-back-to-windowed while fullscreen
+            # (Framepacking3DWindow.enter_fake_fullscreen emits visibilityChanged
+            # (True) unconditionally) -- clobbering the Glasses layout at exactly
+            # the moment the user goes fullscreen on their glasses, and on every
+            # SBS/off/Dual -> Glasses transition that re-shows this window.
+            if getattr(self, 'current_stereo_mode', None) != 'glasses':
+                self.framepacking_window.display_widget.set_stereo_mode('framepack')
             self.active_mvc_widget = self.framepacking_window.display_widget
             if self.mvc_decoder_thread:
                 self.mvc_decoder_thread.set_display_widget(self.framepacking_window.display_widget)
@@ -11008,6 +12346,9 @@ class PlayerWindow(QMainWindow):
                     btn.blockSignals(False)
                     logger.info("[3D-BUTTON] Auto-deactivated (framepacking window closed)")
                 self.is_3d_enabled = False
+
+                # Restore 2D navigation bar UI - AFTER 3D state is fully disabled
+                QTimer.singleShot(250, lambda: (self._update_overlays_geometry(), self.show_controls()))
                 
                 # SyLC Cast: Auto-stop cast if running, because the 3D renderer is shutting down
                 if getattr(self, '_cast', None) is not None:

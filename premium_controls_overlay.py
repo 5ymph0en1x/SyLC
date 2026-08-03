@@ -1027,7 +1027,12 @@ class PremiumTimelineSlider(QSlider):
                     if pm is not None:
                         self._preview_widget.set_thumbnail(pm)
                         self._displayed_exact = None
-                self._preview_widget.show_at(gp.x(), gp.y())
+                
+                # Only show the native Qt tooltip widget if we are not rendering it via the 3D HUD
+                if not self.property('hud_mode'):
+                    self._preview_widget.show_at(gp.x(), gp.y())
+                else:
+                    self._preview_widget.hide()
 
             # Thumbnail request (0.3s hover-delta gate) — also active during MVC
             # playback; optical sources are governed by set_thumbnails_allowed
@@ -1571,6 +1576,12 @@ class PremiumControlsOverlay(QWidget):
     synth3d_strength_changed = Signal(int)      # tenths of a percent, 5..30
     synth3d_convergence_preview = Signal(int)   # 0..100
     synth3d_convergence_changed = Signal(int)   # 0..100
+    # Per-shot zero-parallax plane derived from the depth statistics; the
+    # Convergence slider above stays the manual fallback while unchecked.
+    synth3d_auto_convergence_toggled = Signal(bool)
+    # Round 5a: disocclusion holes prefer flow-transported, previously seen
+    # background over the stretch fallback (experimental, author gate).
+    synth3d_temporal_fill_toggled = Signal(bool)
     stereo_mode_changed = Signal(str)
     mode_3d_toggled = Signal(bool)
     audio_track_changed = Signal(int)
@@ -1578,7 +1589,11 @@ class PremiumControlsOverlay(QWidget):
 
     # Items offered by the stereo-mode combo (display labels only — the
     # internal mode keys are unaffected, see stereo_mode_combo below).
-    STEREO_COMBO_ITEMS = ("MultiView", "Side-by-Side", "Top-Bottom", "Dual Projector")
+    # "Glasses (F-SBS)" is an OUTPUT layout like MultiView and Dual Projector,
+    # not a source format: it emits Full Side-by-Side 3840x1080 whatever the
+    # input was. Named for what the user plugs in, not for the pixel layout.
+    STEREO_COMBO_ITEMS = ("MultiView", "Side-by-Side", "Top-Bottom",
+                          "Dual Projector", "Glasses (F-SBS)")
     METER_STANDARD_LAYOUT_WIDTH = 1180
 
     def __init__(self, parent=None):
@@ -2455,6 +2470,20 @@ class PremiumControlsOverlay(QWidget):
             menu, "Convergence", 0, 100, 50,
             self.synth3d_convergence_preview, self.synth3d_convergence_changed)
 
+        auto_convergence_action = QAction("Auto convergence", menu)
+        auto_convergence_action.setCheckable(True)
+        auto_convergence_action.setToolTip(
+            "Place the zero-parallax plane per shot from the scene's own "
+            "depth statistics (the Convergence slider is the manual fallback)")
+        menu.addAction(auto_convergence_action)
+
+        temporal_fill_action = QAction("Temporal fill (experimental)", menu)
+        temporal_fill_action.setCheckable(True)
+        temporal_fill_action.setToolTip(
+            "Fill disocclusions with background remembered from earlier "
+            "frames instead of stretching the edge")
+        menu.addAction(temporal_fill_action)
+
         # --- inspect ---------------------------------------------------------
         menu.addSeparator()
         self._add_export_menu_section(menu, "INSPECT", 340)
@@ -2480,6 +2509,8 @@ class PremiumControlsOverlay(QWidget):
         self.synth3d_depth_view_action = depth_view_action
         self.synth3d_strength_slider = strength_slider
         self.synth3d_convergence_slider = convergence_slider
+        self.synth3d_auto_convergence_action = auto_convergence_action
+        self.synth3d_temporal_fill_action = temporal_fill_action
         self.synth3d_diagnostics_action = diagnostics_action
         self.synth3d_preset_menu = preset_menu
         self.synth3d_preset_group = preset_group
@@ -2495,6 +2526,10 @@ class PremiumControlsOverlay(QWidget):
         enable_action.toggled.connect(self.synth3d_toggled)
         depth_view_action.toggled.connect(self.synth3d_depth_view_toggled)
         diagnostics_action.toggled.connect(self.synth3d_diagnostics_toggled)
+        auto_convergence_action.toggled.connect(
+            self.synth3d_auto_convergence_toggled)
+        temporal_fill_action.toggled.connect(
+            self.synth3d_temporal_fill_toggled)
 
         self.synth3d_menu_header = header
         self.synth3d_menu = menu
@@ -2870,7 +2905,7 @@ class PremiumControlsOverlay(QWidget):
         # internal). "MVC" kept as an alias for robustness against older callers.
         mode_map = {"MultiView": "mvc", "MVC": "mvc",
                     "Side-by-Side": "sbs", "Top-Bottom": "tab",
-                    "Dual Projector": "dual"}
+                    "Dual Projector": "dual", "Glasses (F-SBS)": "glasses"}
         self.stereo_mode_changed.emit(mode_map.get(text, "auto"))
 
     def _on_audio_track_changed(self, index):

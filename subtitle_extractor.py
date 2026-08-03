@@ -110,7 +110,12 @@ class SubtitleExtractor:
             )
 
             if result.returncode != 0:
-                logger.error(f"[SubtitleExtractor] ffprobe failed: {result.stderr}")
+                # ffprobe may return non-zero on streams with missing codec
+                # params ("Could not find codec parameters for stream X")
+                # while still outputting valid JSON. Log a warning and try
+                # to parse stdout anyway — the data is often still usable.
+                logger.warning(f"[SubtitleExtractor] ffprobe exit {result.returncode}: {result.stderr.strip()}")
+            if not result.stdout.strip():
                 return tracks
 
             data = json.loads(result.stdout)
@@ -355,6 +360,8 @@ class SubtitleExtractor:
             cmd = [
                 self._ffmpeg,
                 "-y",  # Overwrite output
+                "-analyzeduration", "100M",   # handle streams with missing codec params
+                "-probesize", "100M",
                 "-i", filepath,
                 "-map", f"0:{track_index}",
                 "-c", "copy",  # Copy without re-encoding
@@ -373,8 +380,9 @@ class SubtitleExtractor:
             )
 
             if result.returncode != 0:
-                logger.error(f"[SubtitleExtractor] ffmpeg extraction failed: {result.stderr}")
-                return None
+                # ffmpeg may exit non-zero on streams with missing codec
+                # parameters while still producing a valid output file.
+                logger.warning(f"[SubtitleExtractor] ffmpeg exit {result.returncode}: {result.stderr.strip()}")
 
             if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                 logger.info(f"[SubtitleExtractor] Extracted to {output_path} "
@@ -407,6 +415,8 @@ class SubtitleExtractor:
         try:
             cmd = [
                 self._ffmpeg,
+                "-analyzeduration", "100M",
+                "-probesize", "100M",
                 "-i", filepath,
                 "-map", f"0:{track_index}",
                 "-c", "copy",
@@ -423,8 +433,9 @@ class SubtitleExtractor:
             )
 
             if result.returncode != 0:
-                logger.error(f"[SubtitleExtractor] ffmpeg pipe extraction failed")
-                return None
+                # ffmpeg may exit non-zero on streams with missing codec
+                # parameters while still producing valid data on stdout.
+                logger.warning(f"[SubtitleExtractor] ffmpeg pipe exit {result.returncode}")
 
             if len(result.stdout) > 0:
                 logger.info(f"[SubtitleExtractor] Extracted {len(result.stdout)} bytes to memory")

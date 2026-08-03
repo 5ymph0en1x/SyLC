@@ -6,6 +6,7 @@ avcodec DIRECTEMENT. Perimetre v1: HEVC 4:2:0 8/10-bit; tout le reste -> open()=
 import os
 import ctypes
 import logging
+from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -16,6 +17,7 @@ from lavf_h264_demuxer import AVRational, AVFormatContext, AVCodecParameters, AV
 logger = logging.getLogger(__name__)
 
 _AVMEDIA_TYPE_VIDEO = 0
+_AVMEDIA_TYPE_SUBTITLE = 3
 _AV_NOPTS = -9223372036854775808
 _AVSEEK_FLAG_BACKWARD = 1
 _AVERROR_EAGAIN = -11            # AVERROR(EAGAIN), errno Windows/MinGW = 11
@@ -273,6 +275,18 @@ class LavfHevcSource:
         self._hw_on = False          # get_format A REELLEMENT retenu d3d11
         self._hw_ref = None          # AVBufferRef* du device (notre reference)
         self._keep_cb = None         # ref DURE sur le CFUNCTYPE (anti-GC = crash)
+        # --- etat sous-titres PGS (streaming, miroir du demuxeur MKV) ---
+        # av_read_frame demuxe DEJA chaque paquet PGS du conteneur ; avant ce
+        # robinet ils etaient simplement jetes dans _decode_next, condamnant le
+        # player a une extraction ffmpeg complete du fichier (1-2 min) pour
+        # afficher un sous-titre. La file est bornee ; les blocs sont collectes
+        # au fil de la lecture, legerement en avance sur l'horloge (meme
+        # contrat que mvc_decoder._poll_subtitles).
+        self._sub_tracks = []        # [{'trackNumber': stream_index, ...}]
+        self._sub_tbs = {}           # stream_index -> (tb_num, tb_den)
+        self._sub_idx = -1           # flux collecte (-1 = aucun)
+        self._sub_tb = (1, 1000)
+        self._sub_queue = deque(maxlen=256)
         # --- etat multiview (Task MV-2) ---
         self._mv_pending = None      # snapshot (dict) de la vue en attente de sa partenaire pts
         # Fix-4 (MV-5 final review): les VRAIS ids probes (ex b"0,1"), exposes pour que
@@ -344,6 +358,34 @@ class LavfHevcSource:
             tb = AVRational.from_address(sptr + _lavf._OFF_TIME_BASE)
             if 0 < tb.den <= 1_000_000_000 and 0 < tb.num <= 1_000_000_000:
                 self._tb_num, self._tb_den = tb.num, tb.den
+            # --- Enumeration des flux PGS (verif ABI PAR NOM, comme le hevc
+            # ci-dessus). Un re-open (multiview/repli SW) repart de zero. ---
+            self._sub_tracks, self._sub_tbs = [], {}
+            self._sub_idx, self._sub_queue = -1, deque(maxlen=256)
+            for si in range(int(fmt.contents.nb_streams)):
+                if si == self._vidx:
+                    continue
+                try:
+                    sp = fmt.contents.streams[si]
+                    cpa = ctypes.c_void_p.from_address(sp + _lavf._OFF_CODECPAR).value
+                    if not cpa:
+                        continue
+                    scp = AVCodecParameters.from_address(cpa)
+                    if scp.codec_type != _AVMEDIA_TYPE_SUBTITLE:
+                        continue
+                    if AC.avcodec_get_name(scp.codec_id) != b"hdmv_pgs_subtitle":
+                        continue
+                    stb = AVRational.from_address(sp + _lavf._OFF_TIME_BASE)
+                    good = (0 < stb.den <= 1_000_000_000 and 0 < stb.num <= 1_000_000_000)
+                    self._sub_tbs[si] = (stb.num, stb.den) if good else (1, 1000)
+                    self._sub_tracks.append({
+                        'trackNumber': si, 'codecId': 'S_HDMV/PGS', 'isPGS': True,
+                        'language': '', 'name': f'PGS Track {len(self._sub_tracks) + 1}'})
+                except Exception:
+                    continue
+            if self._sub_tracks:
+                logger.info(f"[HEVC] flux PGS detectes: "
+                            f"{[t['trackNumber'] for t in self._sub_tracks]}")
             codec = AC.avcodec_find_decoder_by_name(b"hevc")
             if not codec:
                 raise RuntimeError("decoder hevc absent")
@@ -504,6 +546,19 @@ class LavfHevcSource:
                     break
                 pk = pkt.contents
                 if pk.stream_index != self._vidx or pk.size <= 0:
+                    # Robinet PGS : un paquet du flux sous-titre selectionne est
+                    # copie dans la file au lieu d'etre jete. Blocs MKV = segments
+                    # PGS bruts sans en-tete 'PG' + pts conteneur — exactement la
+                    # branche MKV de PGSSubtitleParser.feed_pes_packet.
+                    if (pk.stream_index == self._sub_idx and pk.size > 0
+                            and pk.data and pk.pts != _AV_NOPTS):
+                        try:
+                            num, den = self._sub_tb
+                            self._sub_queue.append({
+                                'timestampMs': float(pk.pts) * 1000.0 * num / den,
+                                'data': ctypes.string_at(pk.data, pk.size)})
+                        except Exception:
+                            pass
                     AC.av_packet_unref(self._pkt)
                     continue
                 if pk.pts != _AV_NOPTS:
@@ -559,6 +614,35 @@ class LavfHevcSource:
             p = ctypes.c_void_p(tmp)
             AU.av_frame_free(ctypes.byref(p))
 
+    # ------------------------------------------------------------------ PGS
+    # Miroir du contrat du demuxeur MKV (mvc_decoder._poll_subtitles) : le
+    # thread de decode draine has_subtitle_data()/read_subtitle_block() dans sa
+    # boucle. trackNumber = index de flux ffmpeg ; 0/None desactive (les flux
+    # sous-titres d'un fichier video ne sont jamais a l'index 0, la video y est).
+    def get_subtitle_tracks(self):
+        return [dict(t) for t in self._sub_tracks]
+
+    def set_subtitle_track(self, stream_index):
+        idx = int(stream_index or 0)
+        if idx <= 0 or all(t['trackNumber'] != idx for t in self._sub_tracks):
+            if idx > 0:
+                logger.warning(f"[HEVC] set_subtitle_track({idx}): flux PGS inconnu")
+            self._sub_idx = -1
+            self._sub_queue.clear()
+            return
+        self._sub_idx = idx
+        self._sub_tb = self._sub_tbs.get(idx, (1, 1000))
+        self._sub_queue.clear()
+        logger.info(f"[HEVC] streaming PGS active pour le flux {idx}")
+
+    def has_subtitle_data(self):
+        return len(self._sub_queue) > 0
+
+    def read_subtitle_block(self):
+        if not self._sub_queue:
+            return False, None
+        return True, self._sub_queue.popleft()
+
     def seek(self, timestamp_ms):
         if not self._opened:
             return False
@@ -567,6 +651,9 @@ class LavfHevcSource:
         ok = AF.av_seek_frame(self._ctx, -1, ts, _AVSEEK_FLAG_BACKWARD) >= 0
         if ok:
             AC.avcodec_flush_buffers(self._dec)
+            # Blocs PGS d'avant-seek = positions perimees ; le manager fait de
+            # son cote clear_streaming_buffer() via on_seek().
+            self._sub_queue.clear()
             # Fix-5 (MV-5 final review): a view snapshot left over from BEFORE the seek
             # (self._mv_pending, spec §4 buffer) can never pair with the pts stream that
             # resumes after the flush -- keeping it guarantees a spurious "vue orpheline"

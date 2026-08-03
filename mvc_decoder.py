@@ -1086,6 +1086,11 @@ class MVCDecoderThread(QThread):
         self._native_ring = None
         self._native_decoder = None
         self._use_native_pipeline = False
+        # Two-filter look-ahead scout (spec 2026-08-03): fed with each decoded
+        # luma at delivery time (frames sit ~12 ahead of presentation), read by
+        # the player's advisory pump. Armed lazily, only while synth3d runs.
+        self._lookahead_scout = None
+        self._lookahead_enabled = False
         if mvc_demuxer_cpp:
             try:
                 if hasattr(mvc_demuxer_cpp, "FrameRingBuffer"):
@@ -4789,6 +4794,22 @@ class MVCDecoderThread(QThread):
             self._frame_delivery_active = False
             self._frame_delivery_lock.release()
 
+    def set_lookahead_enabled(self, enabled):
+        """Arm/disarm the two-filter look-ahead scout (player-driven: only a
+        running synth3d session pays the ~1.4 ms/frame miniature analysis)."""
+        enabled = bool(enabled)
+        if enabled and self._lookahead_scout is None:
+            try:
+                from lookahead_scout import LookAheadScout
+                self._lookahead_scout = LookAheadScout()
+            except Exception:
+                logger.exception("[LOOKAHEAD] scout unavailable")
+                enabled = False
+        self._lookahead_enabled = enabled
+
+    def lookahead_scout(self):
+        return self._lookahead_scout if self._lookahead_enabled else None
+
     def _deliver_pybind_frame(self, frame, timestamp_seconds=None):
         """Fast-path delivery using the C++ decoder bindings."""
         try:
@@ -4845,6 +4866,18 @@ class MVCDecoderThread(QThread):
 
             y_l = to_np(frame.base_view.y_plane, w, h, frame.base_view.stride_y)
             u_l, v_l = extract_uv_planes(frame.base_view, w, h)
+
+            # LOOK-AHEAD TAP (two-filter scout): this frame is decoded but
+            # will only be PRESENTED ~12 frames from now — its miniature is
+            # the advisory's crystal ball. Base view only, gated on synth3d.
+            if self._lookahead_enabled and timestamp_seconds is not None:
+                scout = self._lookahead_scout
+                if scout is not None:
+                    try:
+                        scout.push(y_l, float(timestamp_seconds) * 1000.0)
+                    except Exception:
+                        logger.exception("[LOOKAHEAD] scout push failed")
+                        self._lookahead_enabled = False
 
             if getattr(frame, "has_mvc", False):
                 y_r = to_np(frame.dependent_view.y_plane, w, h, frame.dependent_view.stride_y)
@@ -5527,6 +5560,12 @@ class MVCDecoderThread(QThread):
         def prepare_seek(target):
             nonlocal preroll_target_s, preroll_source_until_ms
             logger.info(f"[MVC-NATIVE] Seeking to {target:.3f}s")
+            # Look-ahead: pre-seek events belong to the old timeline.
+            if self._lookahead_scout is not None:
+                try:
+                    self._lookahead_scout.reset()
+                except Exception:
+                    pass
             self._native_ring.clear()
             self.frame_buffer.clear()
             self.presentation_queue.clear()
@@ -5573,6 +5612,17 @@ class MVCDecoderThread(QThread):
             eos = False
             waiting_for_keyframe = True
             pending_seek_signal = False
+            # STARTUP UNPAUSE CONTRACT: the player leaves mpv PAUSED after load and
+            # waits for seekIDRFound to start the audio (V10 SSIF fix). The V62
+            # landing-reconciliation only emitted it for the 'rebase' plan or when a
+            # queue seek was in flight — a clean start at t=0 resolves 'aligned' and
+            # emitted NOTHING, so mpv stayed paused: picture ran, audio silent until
+            # the first user seek (user report + author log 2026-08-01 18:08). Track
+            # the debt explicitly: exactly one seekIDRFound per pipeline start.
+            startup_signal_pending = True
+            # A bounded no-pair scan is NOT end-of-stream: only the demuxer's at_eof()
+            # (real file end) may finish playback; anything else retries with a cap.
+            no_pair_reads = 0
             consecutive_decode_errors = 0
             # Read-lookahead headroom: stop reading 2 slots before the ring is
             # full, because a push into a full ring silently drops the pair.
@@ -5604,6 +5654,7 @@ class MVCDecoderThread(QThread):
                     eos = False
                     waiting_for_keyframe = True
                     pending_seek_signal = True
+                    no_pair_reads = 0
 
                 # READ LOOKAHEAD: read into the ring BEFORE (and regardless of)
                 # the decode backpressure gate below. The old order stopped
@@ -5625,9 +5676,35 @@ class MVCDecoderThread(QThread):
                     read_ok = False
                     try:
                         read_ok = bool(self.demuxer.read_next_into_ring(self._native_ring))
-                        if not read_ok:
-                            eos = True
-                            logger.info("[MVC-NATIVE] End of stream")
+                        if read_ok:
+                            no_pair_reads = 0
+                        else:
+                            # A False read is only END OF STREAM when the demuxer
+                            # actually exhausted the file. The SSIF streaming scan
+                            # also returns False after its bounded packet budget
+                            # with no pair (seek landed on a unit whose head GOP
+                            # has its dep anchor behind the boundary — real discs
+                            # do this) — treating that as EOS tore playback down
+                            # mid-movie ("the film suddenly ends at 21%").
+                            _at_eof = getattr(self.demuxer, 'at_eof', None)
+                            if _at_eof is None or _at_eof():
+                                eos = True
+                                logger.info("[MVC-NATIVE] End of stream")
+                            else:
+                                no_pair_reads += 1
+                                if no_pair_reads >= 4:
+                                    # ~4 full scan budgets (~400MB) of forward
+                                    # progress without one pair: the stream is
+                                    # genuinely undecodable from here.
+                                    eos = True
+                                    logger.error(
+                                        "[MVC-NATIVE] %d consecutive no-pair "
+                                        "scans — giving up (treated as EOS)",
+                                        no_pair_reads)
+                                else:
+                                    logger.warning(
+                                        "[MVC-NATIVE] no-pair scan (not EOF) — "
+                                        "retrying (%d/3)", no_pair_reads)
                     except Exception as exc:
                         logger.error(f"[MVC-NATIVE] Demuxer read failed: {exc}")
                         eos = True
@@ -5735,15 +5812,28 @@ class MVCDecoderThread(QThread):
                             self.base_timestamp = true_kf_s
                             self.start_time = time.time() - true_kf_s
                             self.seekIDRFound.emit(true_kf_s)
+                            startup_signal_pending = False
                             if pending_seek_signal:
                                 self.seekFinished.emit()
                                 self._seek_in_progress = False
                                 pending_seek_signal = False
                         elif pending_seek_signal:
                             self.seekIDRFound.emit(self.base_timestamp)
+                            startup_signal_pending = False
                             self.seekFinished.emit()
                             self._seek_in_progress = False
                             pending_seek_signal = False
+                        elif startup_signal_pending:
+                            # STARTUP, 'aligned' plan: no queue seek is in flight
+                            # and decode starts where the anchor says — but mpv is
+                            # still PAUSED waiting for this very signal. Emit it or
+                            # the whole session plays silent (user report).
+                            logger.info(
+                                f"[MVC-NATIVE] Startup aligned at "
+                                f"{self.base_timestamp:.3f}s — releasing the "
+                                f"audio start gate")
+                            self.seekIDRFound.emit(self.base_timestamp)
+                            startup_signal_pending = False
 
                 self._dbg_au_index = getattr(self, '_dbg_au_index', 0) + 1
                 self._dbg_au_ts = ts_ms
@@ -5811,9 +5901,15 @@ class MVCDecoderThread(QThread):
                     drain_frames(discard=False)
                     if pending_seek_signal:
                         self.seekIDRFound.emit(self.base_timestamp)
+                        startup_signal_pending = False
                         self.seekFinished.emit()
                         self._seek_in_progress = False
                         pending_seek_signal = False
+                    elif startup_signal_pending:
+                        # STARTUP that began at a position (preroll plan): the
+                        # audio gate is still closed — release it at the target.
+                        self.seekIDRFound.emit(self.base_timestamp)
+                        startup_signal_pending = False
                     preroll_target_s = None
                     preroll_source_until_ms = None
                 else:

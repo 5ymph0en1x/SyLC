@@ -9,7 +9,7 @@
 
 *Stereoscopic 3D Blu-ray (MVC) playback, decoded from scratch, rendered in native HDR — given to the community, no strings attached.*
 
-![Version](https://img.shields.io/badge/version-5.2.0-1f6feb?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-5.2.1-1f6feb?style=for-the-badge)
 ![Platform](https://img.shields.io/badge/Windows-x64-0078D6?style=for-the-badge&logo=windows&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.14-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/license-free%20%26%20open--source-2ea44f?style=for-the-badge)
@@ -79,6 +79,41 @@ worker count from the available logical/physical CPU budget (three workers on a 
 4-core/8-thread Zen 2 handheld) and releases the GIL across native demux/decode calls.
 `SYLC_EDGE264_THREADS` remains available for controlled A/B qualification.
 
+### 5. 2D→3D — one depth engine, many surfaces, and a hard deadline
+
+Turning a flat film into stereo in real time is a scheduling problem before it
+is a machine-learning one. The model is the easy part: **Depth Anything V3**
+infers a depth map, the renderer warps the frame into a stereo pair. The hard
+part is that the answer is due **every 41.7 ms**, forever, while the same GPU is
+also decoding video and drawing two output surfaces.
+
+The pipeline that came out of it looks like this. A **single process-wide
+inference service** owns the model, so attaching more surfaces — embedded
+preview, frame-packed window, two projector eyes, SyLC Cast — never duplicates
+model work; one surface holds a short renewable *input leader* lease and does
+the GPU readback, and everyone consumes the same published map on their own
+device. The service worker overlaps stages deliberately: the GPU infers map *N*
+while the CPU runs boundary refinement, temporal fusion and geometry for map
+*N-1*, with optical flow farmed to a persistent thread pool. Depth is
+**temporally stabilized in video time, not compute time** — the two clocks are
+kept separate on purpose, so a faster or slower GPU changes how *often* the
+depth refreshes, never how the depth *behaves*.
+
+Cuts get special treatment, because a depth map is always a frame or two behind
+the picture it describes. A **look-ahead scout** runs a miniature analysis of
+each decoded frame far enough ahead of presentation to see a cut coming, and
+the renderer flattens disparity through the transition rather than warping the
+first frame of a new shot with the previous shot's geometry. The temporal
+history, the accumulated background plate and the depth EMA all re-prime on the
+confirmed cut.
+
+Everything above is instrumented and readable at runtime — the 2D→3D menu
+footer reports the provider, the active preset and grid, the delivered depth
+rate and the age of the current map, and the log carries the full per-stage
+breakdown. That instrumentation is not decoration: all three fixes in 5.2.1
+were found by reading it, and two of them turned out to be the opposite of what
+the symptom suggested.
+
 ---
 
 ## War stories
@@ -89,6 +124,10 @@ Months of work hide inside a few one-line fixes. A taste:
 - **The decoder that worked everywhere but Windows.** Every slice failed with `EBADMSG`. The culprit: Windows' `<windows.h>` defines `min`/`max` as **macros**, which silently replaced edge264's own inline `min`/`max` and made the **CABAC** arithmetic diverge bit-for-bit. The fix is three characters — `NOMINMAX` — and finding it took considerably longer than typing it.
 - **The deadlock between two eyes.** Under load the per-view buffers could wedge against each other; it took an entry-guard bypass, a graceful frame-bump path, and a force-complete with chroma concealment to guarantee the stereo pair always advances.
 - **The corruption that wasn't ours.** Some 3D discs played with maddening, repeatable artifacts — a strobing band, a "stair-step" stutter, transient blocks of garbage, always in the same spots. After a long decoder hunt, the truth was humbler and stranger: the **optical drive itself was returning corrupt reads.** Imaging the very same disc to an `.iso` and playing *that* is flawless — the decoder had been right all along. That finding is exactly why 4.0.0 ships a built-in **disc→ISO archiver**: a clean image routes around a dying drive.
+
+- **The 4K film that converted faster than the 1080p one.** A 4K HEVC master hit 24 depth maps per second; the *same film* in 1080p H.264 managed 19.5. Same inference grid, same engine — and the 1080p file's GPU inference was measured **2.3× faster** (9 ms vs 21 ms). A component that is faster inside a system that is slower is never a throughput problem; it is a *phase* problem. The depth engine turned out to be idle-waiting 45 % of every cycle: the readback copy it needs was being issued but **not submitted** — a 1080p frame carries so little GPU work that the driver never accumulated enough to flush its command buffer on its own, so the copy was still unreadable a whole frame later, no work was handed to the engine at all, and it lost 41.7 ms. On the 4K path the heavy per-frame work flushed it implicitly, which is precisely why the *harder* file never missed. One `Flush()` after the copy: stalled hand-offs went from 436 in 1991 to **1**, and the cycle locked to 41.7 ms.
+- **The cut that tore one frame, every time.** Every shot change produced a single wavy, "gravitational-lensing" frame. The cut *detection* was never at fault — it is reliable — and every piece of temporal state (flow, plate, EMA, history) was correctly re-primed. The culprit was the **advisory** that carries the news: it was refreshed by a **10 Hz** timer while frames present at **24 fps**, so it stayed frozen for up to 100 ms. On the first frame of a new shot it still read "a cut is coming in +δ ms" — so the renderer re-opened up to 55 % of the disparity budget and kept filling disocclusions from a background plate made entirely of *the previous shot's* pixels. Dead-reckoning the advisory against its own age puts the deadline back where it belongs.
+- **The seek that cost a second of depth.** Every seek deliberately bounced the adaptive selection back through the square inference grid so the new position could re-earn its verdict. Sound in principle — a film really can switch between Scope and IMAX reels — but on a natively wide master the selection comes from the **coded frame dimensions**, and those belong to the file, not to the position: no seek can invalidate them. The detour was protecting nothing, and charging ~1-3 s of flat-then-square-then-flat depth and two full temporal re-primes for it. Now only a selection derived from an encoded matte still takes the safe route.
 
 This is the kind of work that doesn't show up in a feature list — but it's the difference between "plays MVC" and *plays MVC correctly, every frame, on every disc.*
 
@@ -115,6 +154,15 @@ This is the kind of work that doesn't show up in a feature list — but it's the
   prebuilt engines for it or compiles them locally, then proves a real engine
   builds and infers correctly on your machine before the player will use it.
   No Python toolchain, and never required.
+  **5.2.1 makes the conversion keep up with the film.** The converter now
+  reaches the source cadence on ordinary 1080p H.264 films instead of
+  hovering around 19-20 depth maps per second (see the war story below), it
+  no longer tears the first frame of every new shot, and a click in the
+  timeline no longer costs a second of flat, half-finished depth. On
+  letterboxed or natively wide **Scope** masters it also detects the black
+  bars and infers on a **rectangular grid** — 756×322 instead of 756×756,
+  57 % fewer depth pixels, roughly twice the depth rate for the same picture,
+  because black bars carry no depth worth computing.
 - **Frame-packed 3D output** (detached window) + embedded 2D view.
 - **Broad container support** — **MKV / MP4 / AVI / MOV / FLV / WebM / raw `.h264`** (the native C++ demuxer + a libavformat-backed demuxer), all decoded by edge264.
 - **Raw Blu-ray streams** — plays **SSIF** (3D) and **M2TS** (2D) directly, *no remux*, with frame-accurate seeking.
