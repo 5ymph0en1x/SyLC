@@ -65,6 +65,13 @@ public:
                       float sdr_white_level, float output_gamma = 0.0f,
                       float subtitle_disparity = 0.0f);
 
+    // Independent stereoscopic UI/HUD layer. Its normalized rectangle is in
+    // one-eye video coordinates, exactly like subtitles, so SBS/TAB/FramePack
+    // receive one complete copy per eye. opacity is clamped to [0,1].
+    void set_hud_state(bool enabled,
+                       float rect_x, float rect_y, float rect_w, float rect_h,
+                       float disparity = 0.0f, float opacity = 1.0f);
+
     // Upload one R8 plane. plane_index: 0=Y_L,1=U_L,2=V_L,3=Y_R,4=U_R,5=V_R.
     // The texture is (re)created to (width,height) on first use / size change, so
     // no padding is needed (texture matches source exactly). src_stride is the
@@ -134,13 +141,15 @@ public:
     //   crop_top/crop_bottom are normalized source-image mattes removed before
     //   inference; the warp maps the rectangular depth back into that same ROI.
     // set_synth3d(false): detach and return to untouched source planes on the next
-    //   present. The service remains warm and is never joined under a renderer mutex.
+    //   present. At most one idle service stays warm; cleanup is never joined under
+    //   a renderer mutex.
     // synth3d_status(): one parseable line beginning with
     //   "state=... provider=... side=... fps=... source_ms=... update_ms=... "
     //   "age_ms=... clients=... cuts=... motion=... alpha=... scene=... "
-    //   "crop=top:bottom:sourceW:sourceH crop_conf=... grid=WxH err=...".
+    //   "crop=top:bottom:sourceW:sourceH crop_conf=... crop_ready=... "
+    //   "grid=WxH instance=... err=...".
     //   source_ms is media-PTS spacing; update_ms is compute/map cadence.
-    //   state is the shared engine's state;
+    //   state reports a renderer-local GPU error before the shared engine's state;
     //   a debug test depth drives the warp independently of it. side is 0 when
     //   nothing is attached (the running line also carries views= before side=).
     bool set_synth3d(bool enabled, float strength_pct = 1.5f, float convergence = 0.5f,
@@ -150,7 +159,9 @@ public:
                       bool diagnostics = false,
                       int side = kDefaultDepthSide,
                       int grid_width = 0, int grid_height = 0,
-                      float crop_top = 0.0f, float crop_bottom = 0.0f);
+                      float crop_top = 0.0f, float crop_bottom = 0.0f,
+                      bool auto_convergence = false,
+                      bool temporal_fill = false);
     std::string synth3d_status() const;
     // Debug/tests. set_test_depth(nullptr, 0) returns to the engine; otherwise q16
     // points at a synth3d_grid_width()*synth3d_grid_height() map that bypasses inference
@@ -162,6 +173,19 @@ public:
     // is read. read_plane stages one warp output back to the CPU (slot 0..5 =
     // Y_L,U_L,V_L,Y_R,U_R,V_R); it MAPs blocking, never on the playback path.
     bool synth3d_set_test_depth(const uint16_t* q16_or_null, size_t count);
+    bool synth3d_set_test_geometry(const uint16_t* depth,
+                                   const uint16_t* owned,
+                                   const uint16_t* safety,
+                                   const uint16_t* ownership,
+                                   size_t count);
+    // Prototype: attach an externally generated R8 human alpha matte to the
+    // current frame. It may be lower resolution than the source but must keep
+    // its aspect ratio. mode 1 is a conservative safety/ownership guard;
+    // mode 2 also enables transition-band alpha reconstruction. nullptr
+    // disables the prototype with no change to depth or renderer state.
+    bool synth3d_set_test_matte(const uint8_t* alpha_or_null,
+                                uint32_t width, uint32_t height,
+                                size_t count, int mode);
     // The live inference grid every depth-side resource is sized for (and the
     // element count per side that set_test_depth demands); 0 before any synth3d
     // pipeline has been created.
@@ -170,6 +194,14 @@ public:
     int synth3d_grid_height() const;
     bool synth3d_read_plane(int slot, std::vector<uint8_t>& out, uint32_t& w,
                             uint32_t& h, uint32_t& bpp, std::string& err);
+    // Debug/tests (round 5a): the temporal background plate, grid-sized
+    // RGBA16_UNORM (Y,U,V,confidence). Fails until temporal_fill has run.
+    // Look-ahead advisory (two-filter scout): presented-relative delays in ms
+    // to the next observed cut / motion-storm onset (<0 = none). False when
+    // synth3d is not running. Lock-free beyond the renderer mutex.
+    bool synth3d_set_lookahead(double cut_in_ms, double storm_in_ms);
+    bool synth3d_read_plate(std::vector<uint8_t>& out, uint32_t& w,
+                            uint32_t& h, std::string& err);
     // Seek: re-prime the temporal depth filter on the next inference rather than let it
     // blend the EMA across the discontinuity (the same mechanism as its scene-cut snap).
     // Cheap, and a no-op when no synth3d pipeline exists.
@@ -182,6 +214,11 @@ public:
     // Upload the RGBA8 subtitle overlay (texture slot t0). Straight alpha.
     bool upload_subtitle(const uint8_t* data,
                          uint32_t width, uint32_t height, uint32_t src_stride);
+
+    // Straight-alpha RGBA8 playback HUD (texture slot t7), independent from
+    // t0 so subtitles and controls can be shown at different stereo depths.
+    bool upload_hud(const uint8_t* data,
+                    uint32_t width, uint32_t height, uint32_t src_stride);
 
     // Forget the current frame (present() falls back to clearing black).
     void clear_frame();

@@ -502,13 +502,104 @@ else()
 endif()
 
 if(BUILD_NATIVE_RENDERER)
-    target_sources(mvc_demuxer_cpp PRIVATE src/native_renderer.cpp)
+    # Compile every HLSL entry point as a dependency-aware build artifact and
+    # embed the resulting bytecode in the PYD. Release machines no longer need
+    # D3DCompile, source strings, or loose shader files next to the application.
+    enable_language(RC)
+
+    get_filename_component(_sylc_rc_dir "${CMAKE_RC_COMPILER}" DIRECTORY)
+    set(_sylc_fxc_hints "${_sylc_rc_dir}")
+    if(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION)
+        list(APPEND _sylc_fxc_hints
+            "C:/Program Files (x86)/Windows Kits/10/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
+            "C:/Program Files/Windows Kits/10/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
+            "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows Kits\\Installed Roots;KitsRoot10]/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64")
+    endif()
+    if(DEFINED ENV{WindowsSdkVerBinPath})
+        file(TO_CMAKE_PATH "$ENV{WindowsSdkVerBinPath}" _sylc_sdk_bin)
+        list(APPEND _sylc_fxc_hints "${_sylc_sdk_bin}/x64")
+    endif()
+    find_program(SYLC_FXC_EXECUTABLE NAMES fxc.exe fxc
+        HINTS ${_sylc_fxc_hints})
+    if(NOT SYLC_FXC_EXECUTABLE)
+        get_filename_component(_sylc_kits_root
+            "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows Kits\\Installed Roots;KitsRoot10]"
+            ABSOLUTE)
+        file(GLOB _sylc_fxc_candidates LIST_DIRECTORIES FALSE
+            "${_sylc_kits_root}/bin/*/x64/fxc.exe"
+            "${_sylc_kits_root}/bin/x64/fxc.exe")
+        list(SORT _sylc_fxc_candidates)
+        list(REVERSE _sylc_fxc_candidates)
+        if(_sylc_fxc_candidates)
+            list(GET _sylc_fxc_candidates 0 SYLC_FXC_EXECUTABLE)
+            set(SYLC_FXC_EXECUTABLE "${SYLC_FXC_EXECUTABLE}" CACHE FILEPATH
+                "DirectX shader compiler used for SyLC D3D11 resources" FORCE)
+        endif()
+    endif()
+    if(NOT SYLC_FXC_EXECUTABLE)
+        message(FATAL_ERROR
+            "BUILD_NATIVE_RENDERER requires fxc.exe from the Windows SDK")
+    endif()
+
+    set(SYLC_SHADER_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated_shaders")
+    file(MAKE_DIRECTORY "${SYLC_SHADER_BINARY_DIR}")
+    function(sylc_compile_hlsl output_var output_name source entry profile)
+        set(_output "${SYLC_SHADER_BINARY_DIR}/${output_name}.cso")
+        add_custom_command(
+            OUTPUT "${_output}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${SYLC_SHADER_BINARY_DIR}"
+            COMMAND "${SYLC_FXC_EXECUTABLE}"
+                /nologo /Ges /O3 /Qstrip_debug /Qstrip_reflect
+                /E "${entry}" /T "${profile}"
+                /Fo "${_output}" "${source}"
+            DEPENDS "${source}"
+            COMMENT "FXC ${output_name} (${entry}/${profile})"
+            VERBATIM)
+        set(${output_var} "${_output}" PARENT_SCOPE)
+    endfunction()
+
+    set(_native_vert "${CMAKE_CURRENT_SOURCE_DIR}/../native_renderer/shaders/yuv_framepack.vert.hlsl")
+    set(_native_frag "${CMAKE_CURRENT_SOURCE_DIR}/../native_renderer/shaders/yuv_framepack.frag.hlsl")
+    set(_sbs_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/shaders/yuv_to_nv12_sbs.hlsl")
+    set(_synth_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/shaders/synth3d.hlsl")
+
+    sylc_compile_hlsl(SYLC_NATIVE_VS_CSO native_vs "${_native_vert}" main vs_5_0)
+    sylc_compile_hlsl(SYLC_NATIVE_PS_CSO native_ps "${_native_frag}" main ps_5_0)
+    sylc_compile_hlsl(SYLC_SBS_VS_CSO sbs_vs "${_sbs_hlsl}" VS vs_5_0)
+    sylc_compile_hlsl(SYLC_SBS_PS_LUMA_CSO sbs_ps_luma "${_sbs_hlsl}" PS_Luma ps_5_0)
+    sylc_compile_hlsl(SYLC_SBS_PS_CHROMA_CSO sbs_ps_chroma "${_sbs_hlsl}" PS_Chroma ps_5_0)
+    sylc_compile_hlsl(SYLC_SYNTH3D_VS_FULL_CSO synth3d_vs_full "${_synth_hlsl}" VS_Full vs_5_0)
+    sylc_compile_hlsl(SYLC_SYNTH3D_PS_DEPTH_PREP_CSO synth3d_ps_depth_prep "${_synth_hlsl}" PS_DepthPrep ps_5_0)
+    sylc_compile_hlsl(SYLC_SYNTH3D_PS_WARP_LUMA_CSO synth3d_ps_warp_luma "${_synth_hlsl}" PS_WarpLuma ps_5_0)
+    sylc_compile_hlsl(SYLC_SYNTH3D_PS_WARP_CHROMA_CSO synth3d_ps_warp_chroma "${_synth_hlsl}" PS_WarpChroma ps_5_0)
+    sylc_compile_hlsl(SYLC_SYNTH3D_PS_DEPTH_VIEW_LUMA_CSO synth3d_ps_depth_view_luma "${_synth_hlsl}" PS_DepthViewLuma ps_5_0)
+    sylc_compile_hlsl(SYLC_SYNTH3D_PS_DEPTH_VIEW_CHROMA_CSO synth3d_ps_depth_view_chroma "${_synth_hlsl}" PS_DepthViewChroma ps_5_0)
+    sylc_compile_hlsl(SYLC_SYNTH3D_PS_PLATE_ACCUM_CSO synth3d_ps_plate_accum "${_synth_hlsl}" PS_PlateAccum ps_5_0)
+
+    set(SYLC_SHADER_OUTPUTS
+        "${SYLC_NATIVE_VS_CSO}" "${SYLC_NATIVE_PS_CSO}"
+        "${SYLC_SBS_VS_CSO}" "${SYLC_SBS_PS_LUMA_CSO}" "${SYLC_SBS_PS_CHROMA_CSO}"
+        "${SYLC_SYNTH3D_VS_FULL_CSO}" "${SYLC_SYNTH3D_PS_DEPTH_PREP_CSO}"
+        "${SYLC_SYNTH3D_PS_WARP_LUMA_CSO}" "${SYLC_SYNTH3D_PS_WARP_CHROMA_CSO}"
+        "${SYLC_SYNTH3D_PS_DEPTH_VIEW_LUMA_CSO}"
+        "${SYLC_SYNTH3D_PS_DEPTH_VIEW_CHROMA_CSO}"
+        "${SYLC_SYNTH3D_PS_PLATE_ACCUM_CSO}")
+    add_custom_target(sylc_shader_bytecode DEPENDS ${SYLC_SHADER_OUTPUTS})
+
+    set(_sylc_shader_rc "${CMAKE_CURRENT_BINARY_DIR}/generated_shaders/shader_resources.rc")
+    configure_file(src/shader_resources.rc.in "${_sylc_shader_rc}" @ONLY)
+    set_source_files_properties("${_sylc_shader_rc}" PROPERTIES GENERATED TRUE)
+
+    target_sources(mvc_demuxer_cpp PRIVATE
+        src/native_renderer.cpp
+        src/shader_resources.cpp
+        "${_sylc_shader_rc}")
+    add_dependencies(mvc_demuxer_cpp sylc_shader_bytecode)
     # SyLC Cast: NVENC HEVC encoder wrapper (NV12 D3D11 texture -> HEVC NAL bytes).
     # Windows-only body; nvEncodeAPI64.dll is dynamic-loaded at runtime (no NVENC .lib linked).
     target_sources(mvc_demuxer_cpp PRIVATE src/nvenc_encoder.cpp)
     # SyLC Cast: YUV -> NV12 side-by-side packer. Renders the renderer's 6 YUV plane SRVs
-    # into one NV12 3840x1080 SBS texture (the NVENC input). HLSL compiled at runtime via
-    # d3dcompiler (already linked below), same idiom as native_renderer.cpp.
+    # into one NV12 3840x1080 SBS texture (the NVENC input).
     target_sources(mvc_demuxer_cpp PRIVATE src/sbs_nv12_packer.cpp)
     # synth3d (2D->3D): ONNX Runtime depth inference wrapper. ORT is dynamic-loaded
     # at runtime (LoadLibraryExW + GetProcAddress) -- no onnxruntime.lib is linked,
@@ -524,20 +615,18 @@ if(BUILD_NATIVE_RENDERER)
     # synth3d: the GPU half -- side^2 depth-prep pass (side = the depth preset's
     # inference grid), non-blocking staging readback ring, inference worker thread
     # (DepthEngine + DepthStabilizer), depth upload and
-    # the DIBR warp / depth-view passes. HLSL compiled at runtime via d3dcompiler
-    # (already linked below) from the generated src/synth3d_shaders.h.
+    # the DIBR warp / depth-view passes. Shader bytecode is embedded above.
     target_sources(mvc_demuxer_cpp PRIVATE src/synth3d.cpp)
     target_include_directories(mvc_demuxer_cpp PRIVATE third_party/onnxruntime/include)
     target_compile_definitions(mvc_demuxer_cpp PRIVATE SYLC_NATIVE_RENDERER)
-    # Windows SDK (MSVC) and MinGW both resolve these to the system D3D libs.
-    # d3dcompiler is used to compile the embedded HLSL at runtime (S2+).
-    target_link_libraries(mvc_demuxer_cpp PRIVATE d3d11 dxgi dxguid d3dcompiler)
+    # Runtime needs only D3D11/DXGI; shader compilation is a build dependency.
+    target_link_libraries(mvc_demuxer_cpp PRIVATE d3d11 dxgi dxguid)
     # SyLC Cast (NVENC): vendored MIT nv-codec-headers only (nvEncodeAPI.h) — the
     # encoder DLL itself is dynamic-loaded from the user's NVIDIA driver at runtime,
     # nothing NVIDIA-licensed is compiled/linked in. See third_party/nv-codec-headers/LICENSE.
     target_include_directories(mvc_demuxer_cpp PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nv-codec-headers)
-    message(STATUS "Native D3D11 renderer: ENABLED (NativeRenderer exposed)")
+    message(STATUS "Native D3D11 renderer: ENABLED (FXC=${SYLC_FXC_EXECUTABLE})")
 else()
     message(STATUS "Native D3D11 renderer: disabled")
 endif()

@@ -7,7 +7,7 @@
 // The path stays in YUV/NV12 end to end — never RGB — so the cast is lossless. The NV12
 // texture, its luma/chroma render-target views, and the two pixel shaders all live behind
 // an opaque Impl, exactly like NativeRenderer / NvencEncoder, so this header drags in
-// neither <d3d11.h> nor d3dcompiler.
+// neither <d3d11.h> nor shader-compilation APIs.
 #pragma once
 #include <string>
 

@@ -3,16 +3,16 @@
 #ifdef SYLC_NATIVE_RENDERER
 
 #include "native_renderer.h"
-#include "native_renderer_shaders.h"   // kVertexHLSL / kFragmentHLSL (exact, embedded)
 #include "nvenc_encoder.h"             // SyLC Cast: Task-1 NVENC HEVC encoder wrapper
 #include "sbs_nv12_packer.h"           // SyLC Cast: Task-2 YUV -> NV12 SBS packer
+#include "shader_resource_ids.h"
+#include "shader_resources.h"
 #include "synth3d.h"                   // synth3d (2D->3D): depth prep + DIBR warp passes
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_6.h>
-#include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <algorithm>
 #include <cstdio>
@@ -41,13 +41,15 @@ static std::string d3d_error(const char* operation, HRESULT hr,
 }
 
 // Texture slots match the HLSL register bindings:
-//   t0 = subtitle (RGBA8), t1..t3 = Y/U/V left, t4..t6 = Y/U/V right.
-static constexpr int kNumTex = 7;
+//   t0 = subtitle (RGBA8), t1..t3 = Y/U/V left, t4..t6 = Y/U/V right,
+//   t7 = stereoscopic playback HUD (RGBA8). Appending the HUD keeps every
+// existing YUV/synth3d/cast slot stable.
+static constexpr int kNumTex = 8;
 
 // cbuffer 'buf' (register b0) — layout must match the HLSL packoffsets:
 //   c0.x int stereo_mode, c0.y int subtitle_enabled, c0.z float subtitle_disparity,
-//   c1 float4 subtitle_rect, c2.x float sdr_white_level, c3.x float plane_scale.
-//   64 bytes total (4 x 16).
+//   c1 float4 subtitle_rect, c2.x float sdr_white_level, c3.x float plane_scale,
+//   c4 HUD flags/depth/opacity, c5 float4 HUD rect. 96 bytes total (6 x 16).
 struct FrameCB {
     int   stereo_mode;        // c0.x (offset 0)
     int   subtitle_enabled;   // c0.y (offset 4)
@@ -62,10 +64,13 @@ struct FrameCB {
     int   yuv_matrix_sel;     // c3.y (offset 52)  0=BT.601 legacy, 1=BT.709, 2=BT.2020nc
     int   transfer_sel;       // c3.z (offset 56)  0=legacy, 1=PQ->scRGB abs, 2=PQ->tonemap SDR
     float _pad1;              // c3.w (offset 60)
+    int   hud_enabled;        // c4.x (offset 64)
+    float hud_disparity;      // c4.y (offset 68) normalized eye-width; >0 = pop-out
+    float hud_opacity;        // c4.z (offset 72)
+    float _pad2;              // c4.w (offset 76)
+    float hud_rect[4];        // c5   (offset 80)
 };
-// The two HDR selectors reuse the former c3.yz padding, so the cbuffer stays 64 bytes and
-// the ABI is unchanged. Both 0 (DEFAULT) is byte-identical to the pre-HDR shader.
-static_assert(sizeof(FrameCB) == 64, "cbuffer must be 64 bytes");
+static_assert(sizeof(FrameCB) == 96, "cbuffer must be 96 bytes");
 
 // SyLC Cast pipeline: the Task-2 NV12-SBS packer + the Task-1 NVENC encoder, both
 // bound to the renderer's D3D11 device. Held by value (both are non-copyable, unique
@@ -103,7 +108,7 @@ struct NativeRenderer::Impl {
     uint32_t   tex_h[kNumTex] = {0};
     TexFormat  tex_fmt[kNumTex] = { TexFormat::R8, TexFormat::R8, TexFormat::R8,
                                     TexFormat::R8, TexFormat::R8, TexFormat::R8,
-                                    TexFormat::R8 };
+                                    TexFormat::R8, TexFormat::R8 };
 
     // SyLC Cast: the offscreen NV12-SBS pack + NVENC encode pipeline. Null until
     // cast_start() builds it on `device`; reset by cast_stop()/shutdown(). Held by
@@ -269,28 +274,18 @@ bool NativeRenderer::resize(uint32_t width, uint32_t height) {
 bool NativeRenderer::create_pipeline() {
     pipeline_ready_ = false;
 
-    auto compile = [&](const char* src, const char* target, ComPtr<ID3DBlob>& out) -> bool {
-        ComPtr<ID3DBlob> err;
-        const UINT cflags = D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_ENABLE_STRICTNESS;
-        HRESULT hr = D3DCompile(src, std::strlen(src), "yuv_framepack", nullptr, nullptr,
-                                "main", target, cflags, 0, &out, &err);
-        if (FAILED(hr)) {
-            last_error_ = std::string("D3DCompile(") + target + ") failed";
-            if (err) { last_error_ += ": "; last_error_ += static_cast<const char*>(err->GetBufferPointer()); }
-            return false;
-        }
-        return true;
-    };
+    ShaderBytecode vsBytecode;
+    ShaderBytecode psBytecode;
+    if (!load_shader_bytecode(IDR_SYLC_NATIVE_VS, vsBytecode, last_error_))
+        return false;
+    if (!load_shader_bytecode(IDR_SYLC_NATIVE_PS, psBytecode, last_error_))
+        return false;
 
-    ComPtr<ID3DBlob> vsBlob, psBlob;
-    if (!compile(kVertexHLSL,   "vs_5_0", vsBlob)) return false;
-    if (!compile(kFragmentHLSL, "ps_5_0", psBlob)) return false;
-
-    if (FAILED(impl_->device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(),
+    if (FAILED(impl_->device->CreateVertexShader(vsBytecode.data, vsBytecode.size,
                                                  nullptr, &impl_->vs))) {
         last_error_ = "CreateVertexShader failed"; return false;
     }
-    if (FAILED(impl_->device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(),
+    if (FAILED(impl_->device->CreatePixelShader(psBytecode.data, psBytecode.size,
                                                 nullptr, &impl_->ps))) {
         last_error_ = "CreatePixelShader failed"; return false;
     }
@@ -300,8 +295,8 @@ bool NativeRenderer::create_pipeline() {
         { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 8,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
     };
-    if (FAILED(impl_->device->CreateInputLayout(layout, 2, vsBlob->GetBufferPointer(),
-                                                vsBlob->GetBufferSize(), &impl_->input_layout))) {
+    if (FAILED(impl_->device->CreateInputLayout(layout, 2, vsBytecode.data,
+                                                vsBytecode.size, &impl_->input_layout))) {
         last_error_ = "CreateInputLayout failed"; return false;
     }
 
@@ -351,10 +346,11 @@ bool NativeRenderer::create_pipeline() {
         last_error_ = "CreateRasterizerState failed"; return false;
     }
 
-    // Slot t0 (subtitle) always valid: a 1x1 transparent texture so the SRV is
-    // never null even when subtitles are disabled.
+    // RGBA overlay slots are always valid: transparent 1x1 textures keep their
+    // SRVs non-null even while subtitles/HUD are disabled.
     static const uint8_t kTransparent[4] = { 0, 0, 0, 0 };
     if (!upload_subtitle(kTransparent, 1, 1, 4)) return false;
+    if (!upload_hud(kTransparent, 1, 1, 4)) return false;
 
     pipeline_ready_ = true;
     return true;
@@ -490,6 +486,22 @@ bool NativeRenderer::upload_subtitle(const uint8_t* data, uint32_t width, uint32
     return true;
 }
 
+bool NativeRenderer::upload_hud(const uint8_t* data, uint32_t width, uint32_t height,
+                                uint32_t src_stride) {
+    if (!impl_ || !impl_->context) { last_error_ = "upload_hud before initialize"; return false; }
+    if (!data) { last_error_ = "upload_hud: null data"; return false; }
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    if (!ensure_texture(7, width, height, TexFormat::RGBA8)) return false;
+    const HRESULT hr = upload_to_tex(
+        impl_->context.Get(), impl_->tex[7].Get(),
+        data, width, height, src_stride, 4);
+    if (FAILED(hr)) {
+        last_error_ = d3d_error("Map(hud)", hr, impl_->device.Get());
+        return false;
+    }
+    return true;
+}
+
 // Store the per-sample plane scale in the cbuffer. set_uniforms rewrites the full
 // cbuffer (including this value from plane_scale_) each frame, so this only needs
 // to re-upload when the value actually changes — the plane upload calls this after
@@ -550,6 +562,12 @@ void NativeRenderer::set_uniforms(int stereo_mode, int subtitle_enabled,
     std::lock_guard<std::mutex> lk(impl_->mtx);
     stereo_mode_ = stereo_mode;
     FrameCB cb = {};
+    // HUD state has an independent setter/cadence. Carry it across the
+    // per-frame subtitle/color rewrite instead of blanking it every frame.
+    cb.hud_enabled    = impl_->cb.hud_enabled;
+    cb.hud_disparity  = impl_->cb.hud_disparity;
+    cb.hud_opacity    = impl_->cb.hud_opacity;
+    std::copy_n(impl_->cb.hud_rect, 4, cb.hud_rect);
     cb.stereo_mode        = stereo_mode;
     cb.subtitle_enabled   = subtitle_enabled;
     cb.subtitle_disparity = subtitle_disparity;
@@ -579,6 +597,23 @@ void NativeRenderer::set_uniforms(int stereo_mode, int subtitle_enabled,
     cb.fp_vfill = vfill;
     cb.fp_hfill = hfill;
     impl_->cb = cb;   // cache so set_plane_scale can re-upload with the rest intact
+    impl_->context->UpdateSubresource(impl_->cbuffer.Get(), 0, nullptr, &impl_->cb, 0, 0);
+}
+
+void NativeRenderer::set_hud_state(bool enabled,
+                                   float rx, float ry, float rw, float rh,
+                                   float disparity, float opacity) {
+    if (!impl_ || !impl_->cbuffer || !impl_->context) return;
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    impl_->cb.hud_enabled = enabled ? 1 : 0;
+    impl_->cb.hud_disparity = std::isfinite(disparity) ? disparity : 0.0f;
+    impl_->cb.hud_opacity = std::clamp(opacity, 0.0f, 1.0f);
+    impl_->cb.hud_rect[0] = rx;
+    impl_->cb.hud_rect[1] = ry;
+    // windows.h defines max as a macro in this translation unit; explicit
+    // conditionals keep this header-order independent.
+    impl_->cb.hud_rect[2] = rw > 0.0f ? rw : 0.0f;
+    impl_->cb.hud_rect[3] = rh > 0.0f ? rh : 0.0f;
     impl_->context->UpdateSubresource(impl_->cbuffer.Get(), 0, nullptr, &impl_->cb, 0, 0);
 }
 
@@ -726,7 +761,8 @@ bool NativeRenderer::present(uint32_t sync_interval) {
             samps[i] = impl_->sampler.Get();
         }
         // synth3d: swap the six plane slots (t1..t6) for the synthesized stereo pair.
-        // t0 (subtitle) is untouched — the overlay is composited exactly as in 2D.
+        // t0 (subtitle) and t7 (HUD) are untouched — both overlays are
+        // composited independently after the eye image is selected.
         if (synth_ok) {
             ID3D11ShaderResourceView* const* o = impl_->synth3d->output_srvs();
             for (int i = 0; i < 6; ++i) srvs[1 + i] = o[i];
@@ -934,7 +970,8 @@ bool NativeRenderer::set_synth3d(bool enabled, float strength_pct, float converg
                                   bool depth_view, const std::wstring& model_path,
                                   const std::wstring& ort_dir, bool diagnostics,
                                   int side, int grid_width, int grid_height,
-                                  float crop_top, float crop_bottom) {
+                                  float crop_top, float crop_bottom,
+                                  bool auto_convergence, bool temporal_fill) {
     last_error_.clear();
     if (!impl_) { last_error_ = "set_synth3d: no impl"; return false; }
     std::lock_guard<std::mutex> lk(impl_->mtx);
@@ -942,8 +979,9 @@ bool NativeRenderer::set_synth3d(bool enabled, float strength_pct, float converg
 
     if (!enabled) {
         impl_->synth3d_params.enabled = false;
-        // Detach only. SharedDepthService remains warm in the process registry,
-        // therefore disabling can never wait for ORT under this renderer mutex.
+        // Detach only. The bounded registry either keeps this one warm or hands
+        // its final reference to the reaper, so disabling never waits for ORT
+        // under this renderer mutex.
         if (impl_->synth3d) impl_->synth3d->request_stop();
         return true;
     }
@@ -952,6 +990,8 @@ bool NativeRenderer::set_synth3d(bool enabled, float strength_pct, float converg
     p.enabled      = true;
     p.strength_pct = strength_pct;
     p.convergence  = convergence;
+    p.auto_convergence = auto_convergence;
+    p.temporal_fill = temporal_fill;
     p.depth_view   = depth_view;
     p.diagnostics  = diagnostics;
     p.model_path   = model_path;
@@ -988,7 +1028,7 @@ std::string NativeRenderer::synth3d_status() const {
         "stab_ms=0.0 "
         "source_ms=120.0 update_ms=120.0 age_ms=-1 clients=0 cuts=0 "
         "motion=0.000 alpha=0.000 stable=0.000 history=1.00 scene=0.000 "
-        "crop=0:0:0:0 crop_conf=0.00 grid=0x0 err=-";
+        "crop=0:0:0:0 crop_conf=0.00 crop_ready=0 grid=0x0 instance=0 err=-";
     if (!impl_) return kOff;
     std::lock_guard<std::mutex> lk(impl_->mtx);
     if (!impl_->synth3d || !impl_->synth3d_params.enabled) return kOff;
@@ -1020,6 +1060,28 @@ bool NativeRenderer::synth3d_set_test_depth(const uint16_t* q16_or_null,
     return impl_->synth3d->set_test_depth(q16_or_null, count);
 }
 
+bool NativeRenderer::synth3d_set_test_geometry(const uint16_t* depth,
+                                               const uint16_t* owned,
+                                               const uint16_t* safety,
+                                               const uint16_t* ownership,
+                                               size_t count) {
+    if (!impl_) return true;
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    if (!impl_->synth3d) return true;
+    return impl_->synth3d->set_test_geometry(
+        depth, owned, safety, ownership, count);
+}
+
+bool NativeRenderer::synth3d_set_test_matte(const uint8_t* alpha_or_null,
+                                            uint32_t width, uint32_t height,
+                                            size_t count, int mode) {
+    if (!impl_) return true;
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    if (!impl_->synth3d) return true;
+    return impl_->synth3d->set_test_matte(
+        alpha_or_null, width, height, count, mode);
+}
+
 int NativeRenderer::synth3d_side() const {
     if (!impl_) return 0;
     std::lock_guard<std::mutex> lk(impl_->mtx);
@@ -1044,6 +1106,22 @@ bool NativeRenderer::synth3d_read_plane(int slot, std::vector<uint8_t>& out, uin
     std::lock_guard<std::mutex> lk(impl_->mtx);
     if (!impl_->synth3d) { err = "synth3d_read_plane: synth3d not enabled"; return false; }
     return impl_->synth3d->read_plane(impl_->context.Get(), slot, out, w, h, bpp, err);
+}
+
+bool NativeRenderer::synth3d_set_lookahead(double cut_in_ms, double storm_in_ms) {
+    if (!impl_) return false;
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    if (!impl_->synth3d) return false;
+    impl_->synth3d->set_lookahead_advisory(cut_in_ms, storm_in_ms);
+    return true;
+}
+
+bool NativeRenderer::synth3d_read_plate(std::vector<uint8_t>& out, uint32_t& w,
+                                        uint32_t& h, std::string& err) {
+    if (!impl_ || !impl_->context) { err = "synth3d_read_plate: not initialized"; return false; }
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    if (!impl_->synth3d) { err = "synth3d_read_plate: synth3d not enabled"; return false; }
+    return impl_->synth3d->read_plate(impl_->context.Get(), out, w, h, err);
 }
 
 void NativeRenderer::shutdown() {

@@ -88,7 +88,18 @@ public:
     float motion_high = 0.12f;     // luma delta above this accepts quickly
     float tone_alpha = 0.06f;      // slow per-shot depth-range adaptation
     float depth_contrast = 0.82f;  // soft depth-budget compression about 0.5
+    // Gentle monotonic S-curve before depth_contrast: separates middle planes
+    // while the existing headroom still protects the near/far extremes.
+    float depth_scurve = 0.12f;
     float confidence_floor = 0.12f;// never completely freeze uncertain pixels
+    // Once a smooth, confident surface has remained stable, tiny fitted-depth
+    // changes are model jitter rather than useful geometry. Reduce (never zero)
+    // their local alpha; motion/boundaries bypass this deadband immediately.
+    float local_stability_low = 0.62f;
+    float local_stability_high = 0.86f;
+    float local_jitter_low = 0.006f;
+    float local_jitter_high = 0.040f;
+    float local_jitter_alpha_scale = 0.28f;
     // Robust multi-timescale memory. In locally calm regions, the fitted DA3
     // observation is selected from a short reprojected history instead of
     // averaging mutually exclusive foreground/background depths into a ramp.
@@ -126,6 +137,17 @@ public:
     // provably 0/anything regardless of cut_threshold -- see step()).
     float cut_threshold = 0.35f;
     float scene_cut_threshold = 0.42f;
+    // Auto-convergence: per-shot zero-parallax suggestion. The percentile of
+    // the SAME confidence-filtered stabilized sample the tone range uses,
+    // expressed in the SAME normalized nearness space the warp samples (the
+    // s-curve/contrast transform is monotonic, so transforming the percentile
+    // value equals the percentile of the transformed map). 0.55 places most
+    // of an ordinary scene slightly behind the screen (broadcast comfort).
+    // Smoothed in VIDEO time with a per-unit-time cap (anti-breathing, same
+    // pattern as the tone range) and snapped on cut/prime -- the existing
+    // post-snap disparity ramp then hides the zero-plane teleport.
+    float auto_convergence_percentile = 0.55f;
+    float convergence_alpha = 0.08f;
 
     // Last-step observability. These values feed the renderer's diagnostics
     // line and are intentionally read-only to callers.
@@ -138,6 +160,7 @@ public:
     uint64_t snap_count() const { return snap_count_; }
     float last_stability() const { return last_stability_; }
     float last_history_support() const { return last_history_support_; }
+    float suggested_convergence() const { return auto_convergence_; }
 
     // least-squares closed form: argmin_{a,b} sum (a*cur+b - ref)^2
     static void fit_scale_shift(const float* ref, const float* cur, size_t n,
@@ -160,6 +183,8 @@ private:
     bool tone_primed_ = false;
     float tone_lo_ = 0.0f;
     float tone_hi_ = 1.0f;
+    bool convergence_primed_ = false;
+    float auto_convergence_ = 0.5f;
     // 0 = no pending outlier; otherwise sign = outlier direction and
     // magnitude = consecutive same-sign candidate cycles seen so far (the
     // snap fires when the count reaches ceil(snap_confirm_ms / source_dt_ms_)).

@@ -8,24 +8,20 @@
 //   * chroma pass -> an R8G8_UNORM RTV of the NV12 chroma plane (1920x540, U,V)
 // The NV12 output is what Task 1's NvencEncoder registers + encodes zero-copy.
 //
-// Shader-embed idiom mirrors native_renderer.cpp exactly: the HLSL is hand-authored in
-// shaders/yuv_to_nv12_sbs.hlsl, embedded into the committed sbs_nv12_packer_shaders.h by
-// native_renderer/gen_shader_header.py (SINGLE source of truth -- re-run the generator if
-// the .hlsl changes; do NOT hand-edit the generated header), and compiled at RUNTIME by
-// d3dcompiler with the same flags. No RGB anywhere in this path.
+// The hand-authored shaders/yuv_to_nv12_sbs.hlsl is compiled by FXC during the
+// CMake build and embedded as RCDATA in the PYD. No RGB enters this path.
 //
 // Gated on SYLC_NATIVE_RENDERER (like native_renderer.cpp): it is only added to the
-// build inside the Windows-only BUILD_NATIVE_RENDERER block, which links d3d11 +
-// d3dcompiler and defines this macro.
+// build inside the Windows-only BUILD_NATIVE_RENDERER block.
 #ifdef SYLC_NATIVE_RENDERER
 
 #include "sbs_nv12_packer.h"
-#include "sbs_nv12_packer_shaders.h"   // kSbsPackHLSL, generated from shaders/yuv_to_nv12_sbs.hlsl
+#include "shader_resource_ids.h"
+#include "shader_resources.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11.h>
-#include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <cstdint>
 #include <cstring>
@@ -41,9 +37,6 @@ static constexpr uint32_t kSbsHeight = 1080;
 static constexpr uint32_t kChromaW   = kSbsWidth  / 2;   // 1920
 static constexpr uint32_t kChromaH   = kSbsHeight / 2;   // 540
 static constexpr int      kNumSrv    = 6;
-
-// kSbsPackHLSL (the VS + PS_Luma + PS_Chroma source) is #included above from the
-// generated sbs_nv12_packer_shaders.h and compiled once per entry point in init().
 
 // cbuffer b0 (SubCB in the HLSL): subtitle burn-in parameters. 32 bytes (2 x 16).
 struct SubCB {
@@ -87,36 +80,22 @@ bool SbsNv12Packer::init(ID3D11Device* dev, std::string& err, bool tenBit) {
     impl_->device = dev;
     impl_->tenBit = tenBit;
 
-    // --- Compile VS + both PS from the embedded HLSL (runtime d3dcompiler) --------
-    // Same source string compiled once per entry point; unused functions/textures for
-    // a given entry point are simply not referenced (standard D3DCompile behavior).
-    auto compile = [&](const char* entry, const char* target, ComPtr<ID3DBlob>& out) -> bool {
-        ComPtr<ID3DBlob> errBlob;
-        const UINT cflags = D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_ENABLE_STRICTNESS;
-        HRESULT hr = D3DCompile(kSbsPackHLSL, std::strlen(kSbsPackHLSL), "yuv_to_nv12_sbs",
-                                nullptr, nullptr, entry, target, cflags, 0, &out, &errBlob);
-        if (FAILED(hr)) {
-            err = std::string("D3DCompile(") + entry + ") failed";
-            if (errBlob) { err += ": "; err += static_cast<const char*>(errBlob->GetBufferPointer()); }
-            return false;
-        }
-        return true;
-    };
+    ShaderBytecode vsBytecode;
+    ShaderBytecode psLumaBytecode;
+    ShaderBytecode psChromaBytecode;
+    if (!load_shader_bytecode(IDR_SYLC_SBS_VS, vsBytecode, err)) return false;
+    if (!load_shader_bytecode(IDR_SYLC_SBS_PS_LUMA, psLumaBytecode, err)) return false;
+    if (!load_shader_bytecode(IDR_SYLC_SBS_PS_CHROMA, psChromaBytecode, err)) return false;
 
-    ComPtr<ID3DBlob> vsBlob, psLumaBlob, psChromaBlob;
-    if (!compile("VS",        "vs_5_0", vsBlob))       return false;
-    if (!compile("PS_Luma",   "ps_5_0", psLumaBlob))   return false;
-    if (!compile("PS_Chroma", "ps_5_0", psChromaBlob)) return false;
-
-    if (FAILED(impl_->device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(),
+    if (FAILED(impl_->device->CreateVertexShader(vsBytecode.data, vsBytecode.size,
                                                  nullptr, &impl_->vs))) {
         err = "CreateVertexShader failed"; return false;
     }
-    if (FAILED(impl_->device->CreatePixelShader(psLumaBlob->GetBufferPointer(), psLumaBlob->GetBufferSize(),
+    if (FAILED(impl_->device->CreatePixelShader(psLumaBytecode.data, psLumaBytecode.size,
                                                 nullptr, &impl_->psLuma))) {
         err = "CreatePixelShader(luma) failed"; return false;
     }
-    if (FAILED(impl_->device->CreatePixelShader(psChromaBlob->GetBufferPointer(), psChromaBlob->GetBufferSize(),
+    if (FAILED(impl_->device->CreatePixelShader(psChromaBytecode.data, psChromaBytecode.size,
                                                 nullptr, &impl_->psChroma))) {
         err = "CreatePixelShader(chroma) failed"; return false;
     }

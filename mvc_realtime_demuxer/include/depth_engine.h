@@ -5,8 +5,8 @@
 // onnxruntime.dll (and its execution providers: DirectML.dll, TensorRT on
 // GPU builds that have it) is DYNAMIC-LOADED at runtime via LoadLibraryExW +
 // GetProcAddress — nothing is linked against onnxruntime.lib. This mirrors
-// the dynamic-loading idiom already used for NVENC (nvenc_encoder.cpp) and
-// D3DCompile: only the vendored ONNX Runtime C API headers are compiled in.
+// the dynamic-loading idiom already used for NVENC (nvenc_encoder.cpp): only
+// the vendored ONNX Runtime C API headers are compiled in.
 //
 // NOT thread-safe: single owner thread. Per spec §7 ("playback never dies
 // for 3D"), init()/infer() run on the synth3d worker thread, never the GUI

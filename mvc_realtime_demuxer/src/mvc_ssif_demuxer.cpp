@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdlib>  // for std::abs
 #include <chrono>   // DIAG: slow-read timing
+#include <limits>   // partner-missing drop rule
 
 namespace mvc_demux {
 
@@ -277,6 +278,7 @@ bool MVCSSIFDemuxer::open(const std::string& path) {
     // The first valid PTS will be captured and used as offset
     basePtsOffset_ = 0;
     basePtsInitialized_ = false;
+    sawEof_ = false;
 
     std::cout << "[MVCSSIFDemuxer] All PES states and buffers cleared for fresh start" << std::endl;
 
@@ -410,6 +412,7 @@ bool MVCSSIFDemuxer::openDual(const std::string& basePath, const std::string& de
     subtitlePesStates_.clear();
     subtitleQueue_.clear();
     abortRequested_.store(false, std::memory_order_relaxed);
+    sawEof_ = false;
 
     isOpen_ = true;
     std::cout << "[SSIF-DUAL] openDual complete (dual-file mode, "
@@ -662,11 +665,35 @@ bool MVCSSIFDemuxer::readNextFramePairStreaming(FramePair& framePair) {
         // buffers slide forward together the lead is preserved and pairing never re-establishes
         // (the post-seek failure). So: whenever the base front is behind the entire dependent
         // buffer, drop it — advancing the base toward the dependent's range until they overlap.
+        //
+        // SECOND unpairable shape (user EOS report, proven on the Avatar SSIF): the base front
+        // sits INSIDE the dependent PTS range but its partner will never arrive. Real discs may
+        // split a dependent GOP across an interleave-unit boundary with the ANCHOR as the last
+        // PES of the PREVIOUS unit's extent: a seek to the unit boundary then reads the unit's
+        // head GOP with the dep anchor missing (it is behind the landing byte). The base IDR of
+        // that GOP waited forever, the scan burned maxPackets without a pair and the caller
+        // treated it as END OF STREAM — mid-movie teardown. The dependent stream arrives in
+        // decode order, so a frame can trail its display position by at most the reorder depth
+        // (~4 AUs): once the dependent buffer holds a dozen SANE frames NEWER than the base
+        // front with still no candidate inside the pairing window, the partner is provably
+        // absent — drop the front. The drop walks decode order to the next complete GOP (the
+        // very IDR the seek targeted) instead of wedging.
         if (dependentFrameBuffer_.size() >= 64 && !baseFrameBuffer_.empty()) {
             int64_t bf = baseFrameBuffer_.front().pts;
             int64_t dmin = dependentFrameBuffer_.front().pts;
-            for (const auto& dd : dependentFrameBuffer_) dmin = std::min(dmin, dd.pts);
-            if (bf < dmin - PTS_MATCH_TOLERANCE) {
+            int64_t nearest = std::numeric_limits<int64_t>::max();
+            int saneNewer = 0;
+            for (const auto& dd : dependentFrameBuffer_) {
+                dmin = std::min(dmin, dd.pts);
+                nearest = std::min(nearest, std::llabs(dd.pts - bf));
+                if (dd.pts > bf + PTS_MATCH_TOLERANCE &&
+                    dd.pts < bf + 30 * 90000LL)   // sane window: corrupt PTS can't vote
+                    saneNewer++;
+            }
+            const bool baseBehindDep = bf < dmin - PTS_MATCH_TOLERANCE;
+            const bool partnerMissing =
+                nearest > PTS_MATCH_TOLERANCE && saneNewer >= 12;
+            if (baseBehindDep || partnerMissing) {
                 // Orphaned base front (its dependent partner is gone — typical right
                 // after a seek resync). With the strict pairing window this drop is
                 // what re-locks base/dep alignment EXACTLY instead of letting the
@@ -677,13 +704,18 @@ bool MVCSSIFDemuxer::readNextFramePairStreaming(FramePair& framePair) {
                 orphanBaseDrops_++;
                 if (orphanBaseDrops_ <= 10 || orphanBaseDrops_ % 100 == 0)
                     fprintf(stderr, "[SSIF-PAIR] dropped orphaned base front pts=%.3fs "
-                            "(dep starts %.3fs later; drop #%ld)\n",
-                            bf / 90000.0, (dmin - bf) / 90000.0, orphanBaseDrops_);
+                            "(%s; nearest dep %+.3fs; drop #%ld)\n",
+                            bf / 90000.0,
+                            baseBehindDep ? "behind dep window" : "partner missing",
+                            nearest == std::numeric_limits<int64_t>::max()
+                                ? 0.0 : nearest / 90000.0,
+                            orphanBaseDrops_);
             }
         }
     }
 
     if (!readSuccess) {
+        sawEof_ = true;
         fprintf(stderr, "[SSIF-BUFFER] EOF reached: baseBuffer=%zu, depBuffer=%zu\n",
                 baseFrameBuffer_.size(), dependentFrameBuffer_.size());
     } else {
@@ -696,6 +728,21 @@ bool MVCSSIFDemuxer::readNextFramePairStreaming(FramePair& framePair) {
         fprintf(stderr, "[SSIF-STRM] maxPackets no-pair: baseFront=%.2fs depRange=%.2f..%.2fs baseBuf=%zu depBuf=%zu\n",
                 bf / 90000.0, dmn / 90000.0, dmx / 90000.0,
                 baseFrameBuffer_.size(), dependentFrameBuffer_.size());
+        // DIAG (user EOS report): dump the dep PTS nearest the base front, raw ticks.
+        {
+            std::vector<int64_t> deps;
+            deps.reserve(dependentFrameBuffer_.size());
+            for (const auto& x : dependentFrameBuffer_) deps.push_back(x.pts);
+            std::sort(deps.begin(), deps.end(),
+                      [&](int64_t a, int64_t b) { return std::llabs(a - bf) < std::llabs(b - bf); });
+            fprintf(stderr, "[SSIF-STRM-DIAG] baseFront pts=%lld; nearest dep pts (diff ticks):", (long long)bf);
+            for (size_t i = 0; i < deps.size() && i < 8; i++)
+                fprintf(stderr, " %lld(%+lld)", (long long)deps[i], (long long)(deps[i] - bf));
+            fprintf(stderr, "\n[SSIF-STRM-DIAG] first base pts:");
+            for (size_t i = 0; i < baseFrameBuffer_.size() && i < 6; i++)
+                fprintf(stderr, " %lld", (long long)baseFrameBuffer_[i].pts);
+            fprintf(stderr, "\n");
+        }
     }
     _logslow("no-pair");
     return false;
@@ -822,6 +869,8 @@ bool MVCSSIFDemuxer::readNextFramePairDualFile(FramePair& framePair) {
         if (baseEof && depEof) break;
         if (!progressed) break;
     }
+
+    if (baseEof && depEof) sawEof_ = true;
 
     if (!baseFrameBuffer_.empty() && !dependentFrameBuffer_.empty()) {
         fprintf(stderr, "[SSIF-DUAL] no pair: baseFront=%.3fs depRange=%.3f..%.3fs (baseBuf=%zu depBuf=%zu eof b=%d d=%d)\n",
@@ -1379,6 +1428,25 @@ bool MVCSSIFDemuxer::seek(int64_t timestampMs) {
         return false;
     }
     if (timestampMs < 0) timestampMs = 0;
+    sawEof_ = false;   // a seek re-arms reading; EOF is a property of a position
+
+    // TIMELINE GUARD: if a seek runs before the first pair ever matched (fresh open at a
+    // position, e.g. resume-from-bookmark), basePtsOffset_ would later be captured from the
+    // LANDING's first pair — silently rebasing the whole normalized timeline to the landing
+    // (measured: every timestamp shifted by minutes; audio anchored elsewhere). The seek
+    // tables carry the true first-IDR PTS (== the clip's presentation start on BD), so pin
+    // the offset from them before any table lookup uses it.
+    if (!basePtsInitialized_) {
+        int64_t firstMs = -1;
+        if (!ssifSeekTable_.empty())      firstMs = ssifSeekTable_.front().first;
+        else if (!baseSeekTable_.empty()) firstMs = baseSeekTable_.front().first;
+        if (firstMs >= 0) {
+            basePtsOffset_ = firstMs * 90;
+            basePtsInitialized_ = true;
+            fprintf(stderr, "[SSIF] PTS offset pinned from seek table: %lld ms "
+                    "(seek before first pair)\n", (long long)firstMs);
+        }
+    }
 
     // Clear all reassembly/pairing state so we resync cleanly from the new position.
     // Keep basePtsOffset_/basePtsInitialized_ so the normalized timeline stays consistent.

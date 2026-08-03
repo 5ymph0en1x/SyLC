@@ -68,6 +68,8 @@ void DepthStabilizer::reset() {
     last_confidence_ = 1.0f;
     last_cut_ = false;
     tone_primed_ = false;
+    convergence_primed_ = false;
+    auto_convergence_ = 0.5f;
     std::fill(snap_pending_.begin(), snap_pending_.end(), int8_t(0));
     clear_history();
 }
@@ -574,6 +576,34 @@ bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
                     snap_pending_[i] = 0;
                 }
 
+                // Local calm-surface deadband. DA3 can move a perfectly still
+                // wall/face by a few percent of the established range from one
+                // inference to the next. Once that pixel has accumulated stable,
+                // confident evidence, slow only those sub-threshold changes.
+                // Boundaries and motion bypass this immediately, so this cannot
+                // leave a stale silhouette or articulated feature behind.
+                if (!moving_boundary && boundary < 0.12f && tone_primed_ &&
+                    history_count_ >= 2) {
+                    const float established =
+                        std::max(1.0e-6f, tone_hi_ - tone_lo_);
+                    const float jitter =
+                        std::abs(target - ema_[i]) / established;
+                    float stable_t = (stability_[i] - local_stability_low) /
+                        std::max(1.0e-6f,
+                                 local_stability_high - local_stability_low);
+                    stable_t = std::max(0.0f, std::min(1.0f, stable_t));
+                    stable_t = stable_t * stable_t * (3.0f - 2.0f * stable_t);
+                    float jitter_t = (jitter - local_jitter_low) /
+                        std::max(1.0e-6f,
+                                 local_jitter_high - local_jitter_low);
+                    jitter_t = std::max(0.0f, std::min(1.0f, jitter_t));
+                    jitter_t = jitter_t * jitter_t * (3.0f - 2.0f * jitter_t);
+                    const float calm = stable_t * (1.0f - motion_t) * conf;
+                    const float scale = std::max(
+                        0.0f, std::min(1.0f, local_jitter_alpha_scale));
+                    al *= 1.0f - calm * (1.0f - jitter_t) * (1.0f - scale);
+                }
+
                 bool snapped = false;
                 if (snap_active && !moving_boundary) {
                     const float diff = target - ema_[i];
@@ -695,19 +725,64 @@ bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
     }
 
     const float range = tone_hi_ - tone_lo_;
+    // Shared by the quantization below AND the auto-convergence suggestion:
+    // both must live in the exact normalized nearness space the warp samples.
+    auto normalize_tone = [&](float v) {
+        float t = (v - tone_lo_) / range;
+        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        // Monotonic S-curve: a little more separation between middle
+        // planes, continuously, without changing ordering or consuming
+        // the near/far headroom applied below.
+        const float smooth = t * t * (3.0f - 2.0f * t);
+        const float curve = std::max(0.0f, std::min(1.0f, depth_scurve));
+        t += curve * (smooth - t);
+        // Reserve headroom at both comfort extremes. Strength remains the
+        // user's maximum budget; ordinary scenes no longer hit it merely
+        // because their own percentiles were stretched to 0 and 1.
+        t = 0.5f + depth_contrast * (t - 0.5f);
+        return t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+    };
+
+    // Auto-convergence suggestion. tmp_ still holds the confidence-filtered
+    // sample the tone percentiles selected from (nth_element only reorders).
+    // The transform is monotonic, so normalize_tone(percentile(sample)) IS the
+    // percentile of the normalized map.
+    {
+        float target = 0.5f;
+        if (range >= 1e-6f && tone_n > 0) {
+            const float p = std::max(0.0f, std::min(
+                1.0f, auto_convergence_percentile));
+            const size_t conv_i = static_cast<size_t>(
+                static_cast<double>(p) * static_cast<double>(tone_n - 1));
+            std::nth_element(tmp_.begin(),
+                             tmp_.begin() + static_cast<ptrdiff_t>(conv_i),
+                             tmp_.end());
+            target = normalize_tone(tmp_[conv_i]);
+        }
+        if (!convergence_primed_ || cut) {
+            auto_convergence_ = target;
+            convergence_primed_ = true;
+        } else {
+            // Same video-time discipline as the tone range: identical
+            // half-life whether the same second arrives as 8 maps or 19,
+            // and a hard per-unit-time cap so the zero-plane cannot breathe.
+            const float conv_eff =
+                unit_time ? convergence_alpha
+                          : 1.0f - std::pow(1.0f - convergence_alpha, video_ts);
+            const float max_step = 0.05f * std::min(video_ts, 4.0f);
+            const float delta = std::max(-max_step, std::min(
+                max_step, conv_eff * (target - auto_convergence_)));
+            auto_convergence_ += delta;
+        }
+        auto_convergence_ = std::max(0.0f, std::min(1.0f, auto_convergence_));
+    }
+
     if (range < 1e-6f) {
         std::fill(out_q16, out_q16 + n, static_cast<uint16_t>(32768));
     } else {
-        for (size_t i = 0; i < n; ++i) {
-            float t = (ema_[i] - tone_lo_) / range;
-            t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
-            // Reserve headroom at both comfort extremes. Strength remains the
-            // user's maximum budget; ordinary scenes no longer hit it merely
-            // because their own percentiles were stretched to 0 and 1.
-            t = 0.5f + depth_contrast * (t - 0.5f);
-            t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
-            out_q16[i] = static_cast<uint16_t>(t * 65535.0f + 0.5f);
-        }
+        for (size_t i = 0; i < n; ++i)
+            out_q16[i] = static_cast<uint16_t>(
+                normalize_tone(ema_[i]) * 65535.0f + 0.5f);
     }
 
     return cut;

@@ -135,6 +135,12 @@ public:
     void requestAbort() { abortRequested_.store(true, std::memory_order_relaxed); }
     void clearAbort()   { abortRequested_.store(false, std::memory_order_relaxed); }
 
+    /**
+     * True when the last failed read hit the actual end of the file (vs a bounded
+     * no-pair scan or a cooperative abort). Cleared by seek() and open().
+     */
+    bool atEof() const { return sawEof_; }
+
     // ---- Cast-audio stream tap (SyLC Cast; see StreamTapBuffer) ----
     // Tee of the raw bytes the ACTIVE reader already pulls off the disk, so
     // the cast's AudioTap can demux audio without opening its own (third)
@@ -318,6 +324,10 @@ private:
 
     // Cooperative-abort flag for readNextFramePairStreaming()/findByteForPts() (see requestAbort).
     std::atomic<bool> abortRequested_{false};
+    // True only when a read actually exhausted the underlying reader (file end). Lets the
+    // caller distinguish REAL end-of-stream from a bounded scan that found no pair (which
+    // used to be reported identically and tore playback down mid-movie).
+    bool sawEof_ = false;
 };
 
 } // namespace mvc_demux
