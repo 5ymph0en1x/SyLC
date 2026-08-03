@@ -9,7 +9,8 @@ upload copy, no Qt RHI overhead). It replaced the former Qt RHI widget
 It implements the subset of the widget contract the player actually calls on the
 display widget (verified by grep): set_frame_yuv_views, set_stereo_mode,
 pause_rendering, resume_rendering, clear_textures, set_subtitle, clear_subtitle,
-plus the deprecated set_frame_fast (no-op) and refresh_sdr_white_level.
+set_hud, clear_hud, plus the deprecated set_frame_fast (no-op) and
+refresh_sdr_white_level.
 
 Frame delivery runs on the GUI thread (the frameYUVReady QueuedConnection slot),
 reusing the player's existing pacing + serialization. The decode-thread raw-pointer
@@ -24,7 +25,10 @@ from PySide6.QtCore import Qt
 
 logger = logging.getLogger("SyLC.NativeWidget")
 
-_MODE = {'2d': 0, 'framepack': 1, 'sbs': 2, 'tab': 3}
+# 'glasses' deliberately shares SBS's value: it IS the side-by-side arrangement.
+# The distinct key exists so the window can choose a 3840x1080 geometry for it
+# (see Framepacking3DWindow.apply_output_geometry), not so the shader differs.
+_MODE = {'2d': 0, 'framepack': 1, 'sbs': 2, 'tab': 3, 'glasses': 2}
 
 
 def _pct(sorted_vals, q):
@@ -125,6 +129,15 @@ class NativeFramepackWidget(QWidget):
         self._sub = None               # (rgba_ndarray, (x,y,w,h) normalized, disparity) or None
         self._sub_dirty = False        # upload the RGBA to the GPU only when it changed
         self._sub_depth_override = None  # BD3D dynamic depth (OFMD); None = per-cue value
+        # Playback HUD is a second, independent RGBA layer. It is authored once
+        # in one-eye coordinates and duplicated by the native shader for every
+        # packed stereo layout, while subtitles retain their own depth/texture.
+        self._hud = None               # (rgba, rect, disparity, opacity) or None
+        self._hud_dirty = False
+        self._hud_state_dirty = False
+        self._have_hud_api = True
+        self._hud_api_warned = False
+        self._last_eye_size = None      # decoded eye plane dimensions for hit-testing/aspect
         self.eye_view = None      # 'left'/'right' in Dual Projector windows
         self._uniforms_take_disparity = True   # probed once; False on an older renderer build
         self._fail_logged = False
@@ -175,10 +188,21 @@ class NativeFramepackWidget(QWidget):
         self.synth3d_grid_height = 0
         self.synth3d_crop_top = 0.0
         self.synth3d_crop_bottom = 0.0
+        self.synth3d_auto_convergence = False
+        self.synth3d_temporal_fill = False
         self._have_synth3d = True        # old-.pyd probe, same idiom as _have_yuv16
         self._synth3d_takes_side = True  # False after an old .pyd rejects side=
         self._synth3d_takes_rect = True  # False after a pre-aspect .pyd rejects ROI=
+        self._synth3d_takes_auto_conv = True  # False after a pre-round-5 .pyd rejects it
+        self._synth3d_takes_temporal_fill = True  # idem, round 5a
         self._synth3d_pushed = None
+        # Optional MatAnyone 2 alpha. The player shares one immutable result
+        # across all presentation surfaces; each D3D11 renderer uploads it only
+        # when the worker's sequence changes.
+        self._synth3d_human_matte = None
+        self._synth3d_human_matte_key = None
+        self._synth3d_human_matte_uploaded = object()
+        self._have_synth3d_human_matte = True
 
         # Public attrs some call sites read on the Qt widget.
         self.has_video = False
@@ -234,11 +258,15 @@ class NativeFramepackWidget(QWidget):
         self.has_video = False
         if self._sub is not None:
             self._sub_dirty = True
+        if self._hud is not None:
+            self._hud_dirty = True
+        self._hud_state_dirty = True
         # The rebuilt instance has never received the synth3d state -- force a
         # re-push on the next delivered frame instead of trusting the stale cache
         # from the old (now-discarded) renderer object. _have_synth3d (the old-.pyd
         # verdict) stays as-is: it describes this .pyd build, not this instance.
         self._synth3d_pushed = None
+        self._synth3d_human_matte_uploaded = object()
         error = str(exception) if exception is not None else ""
         if not error and r and r is not False:
             try:
@@ -289,6 +317,11 @@ class NativeFramepackWidget(QWidget):
                 return self._invalidate_renderer("initialize", renderer=r)
             logger.info(f"[NATIVE-WIDGET] {r.backend_info()} | hdr={self._hdr} gamma={self._gamma} sdr_white={self._sdr_white}")
             self._r = r
+            # A rebuilt D3D instance starts with transparent/default HUD state.
+            # Re-push both the texture and its rect on the next frame.
+            if self._hud is not None:
+                self._hud_dirty = True
+            self._hud_state_dirty = True
             self._renderer_failures = 0
             self._next_renderer_retry = 0.0
             self._fail_logged = False
@@ -310,6 +343,12 @@ class NativeFramepackWidget(QWidget):
         else:
             yl, ul, vl = y_l_or_tuple, u_l_or_right, v_l
             yr, ur, vr = y_r, u_r, v_r
+
+        try:
+            if yl is not None and getattr(yl, 'ndim', 0) >= 2:
+                self._last_eye_size = (int(yl.shape[1]), int(yl.shape[0]))
+        except Exception:
+            pass
 
         # A 2D presentation samples only t1..t3. Do not upload the unused right
         # eye to an embedded preview: this halves its CPU->GPU traffic when the
@@ -391,10 +430,20 @@ class NativeFramepackWidget(QWidget):
                          int(self.synth3d_grid_width),
                          int(self.synth3d_grid_height),
                          float(self.synth3d_crop_top),
-                         float(self.synth3d_crop_bottom))
+                         float(self.synth3d_crop_bottom),
+                         bool(self.synth3d_auto_convergence),
+                         bool(self.synth3d_temporal_fill))
                 if state != self._synth3d_pushed:
                     kwargs = dict(model_path=state[5], ort_dir=state[6],
                                   diagnostics=state[4])
+                    # Per-shot auto-convergence (round 5). A pre-round-5 .pyd
+                    # has no such parameter: retry without it (manual
+                    # convergence continues) -- same probe idiom as side=.
+                    if self._synth3d_takes_auto_conv and state[12]:
+                        kwargs['auto_convergence'] = True
+                    # Temporal disocclusion plate (round 5a), same idiom.
+                    if self._synth3d_takes_temporal_fill and state[13]:
+                        kwargs['temporal_fill'] = True
                     # The grid is part of the shared depth service's key, so a
                     # preset switch must reach the renderer with it. A .pyd from
                     # before round 4 has no side= parameter: retry without it
@@ -412,7 +461,26 @@ class NativeFramepackWidget(QWidget):
                     try:
                         ok = self._r.set_synth3d(*state[:4], **kwargs)
                     except (AttributeError, TypeError) as exc:
-                        if isinstance(exc, TypeError) and 'grid_width' in kwargs:
+                        if (isinstance(exc, TypeError)
+                                and 'temporal_fill' in kwargs):
+                            # Only temporal_fill is unsupported: retry without
+                            # it on the next frame (stretch fill continues).
+                            self._synth3d_takes_temporal_fill = False
+                            logger.warning(
+                                "[NATIVE-WIDGET] set_synth3d has no "
+                                "temporal_fill= (old .pyd); stretch "
+                                "disocclusion fill only")
+                        elif (isinstance(exc, TypeError)
+                                and 'auto_convergence' in kwargs):
+                            # Only auto_convergence is unsupported: leave
+                            # _synth3d_pushed alone so the next frame retries
+                            # without it (manual convergence still applies).
+                            self._synth3d_takes_auto_conv = False
+                            logger.warning(
+                                "[NATIVE-WIDGET] set_synth3d has no "
+                                "auto_convergence= (old .pyd); manual "
+                                "convergence only")
+                        elif isinstance(exc, TypeError) and 'grid_width' in kwargs:
                             # A renderer old enough not to understand rectangular
                             # grids cannot safely open the rectangular ONNX path.
                             # Do not cache the attempted state; the host will keep
@@ -437,12 +505,40 @@ class NativeFramepackWidget(QWidget):
                         # initialize) -- do not cache it as pushed, so it retries next frame.
                         if ok:
                             self._synth3d_pushed = state
+            # MatAnyone 2 refines ownership only; depth remains the source of
+            # geometry. A stale/absent result explicitly disarms t4 so the
+            # shader falls back to its normal robust warp without retaining a
+            # contour from an earlier scene or seek.
+            if self._have_synth3d_human_matte:
+                matte_key = self._synth3d_human_matte_key
+                if matte_key != self._synth3d_human_matte_uploaded:
+                    frame = self._synth3d_human_matte
+                    try:
+                        setter = getattr(self._r, 'synth3d_set_human_matte', None)
+                        if setter is None:
+                            setter = self._r.synth3d_set_test_matte
+                        if frame is None:
+                            ok = setter(None)
+                        else:
+                            ok = setter(frame.alpha, 'contour')
+                    except (AttributeError, TypeError):
+                        self._have_synth3d_human_matte = False
+                        logger.warning("[NATIVE-WIDGET] human-matte API unavailable "
+                                       "(old .pyd); MatAnyone 2 guidance disabled")
+                    else:
+                        # The production binding returns bool. Pre-production
+                        # builds exposed the same operation as a void method;
+                        # ``None`` therefore also means the upload completed.
+                        if ok is not False:
+                            self._synth3d_human_matte_uploaded = matte_key
             # The subtitle texture persists on the GPU (slot t0) — upload only
             # when the image actually changed, not on every frame.
             if self._sub is not None and self._sub_dirty:
                 if not self._r.set_subtitle_rgba(self._sub[0]):
                     return self._invalidate_renderer("subtitle upload")
                 self._sub_dirty = False
+            if not self._push_hud_to_renderer():
+                return self._invalidate_renderer("HUD upload/state")
             if self._have_video_time:
                 try:
                     self._r.set_video_time_ms(float(self.video_time_ms))
@@ -514,9 +610,168 @@ class NativeFramepackWidget(QWidget):
             return self._invalidate_renderer("frame delivery exception", e)
 
     # --- contract: control ----------------------------------------------------
+    def set_lookahead_advisory(self, cut_in_ms, storm_in_ms):
+        """Two-filter look-ahead advisory → renderer → depth service.
+        None means 'no upcoming event'. False when the renderer or its
+        synth3d session is not up (harmless: the pump retries next tick)."""
+        r = self._r
+        if r is None or not hasattr(r, 'synth3d_set_lookahead'):
+            return False
+        # None -> -1e9 (the C++ NONE sentinel). NEVER -1.0: small negative
+        # delays are real hold-window data ("the cut landed a frame ago").
+        _NONE = -1.0e9
+        try:
+            return bool(r.synth3d_set_lookahead(
+                _NONE if cut_in_ms is None else float(cut_in_ms),
+                _NONE if storm_in_ms is None else float(storm_in_ms)))
+        except Exception:
+            return False
+
     def set_stereo_mode(self, mode_str):
         self._stereo_mode = _MODE.get(str(mode_str).lower(), 1)
         self.current_stereo_mode = self._stereo_mode
+
+    def _push_hud_to_renderer(self):
+        """Push changed HUD state/texture to the live renderer.
+
+        The compatibility probe keeps a pre-HUD .pyd playable: video and
+        subtitles continue normally, while the host can fall back to the Qt bar.
+        """
+        if not self._have_hud_api or not self._r or self._r is False:
+            return True
+        try:
+            if self._hud_state_dirty:
+                if self._hud is None:
+                    self._r.set_hud_state(False)
+                else:
+                    _rgba, rect, disparity, opacity = self._hud
+                    self._r.set_hud_state(True, rect[0], rect[1], rect[2], rect[3],
+                                          disparity, opacity)
+                self._hud_state_dirty = False
+            if self._hud is not None and self._hud_dirty:
+                if not self._r.set_hud_rgba(self._hud[0]):
+                    return False
+                self._hud_dirty = False
+            return True
+        except (AttributeError, TypeError):
+            self._have_hud_api = False
+            self._hud_state_dirty = False
+            self._hud_dirty = False
+            if not self._hud_api_warned:
+                logger.warning("[NATIVE-WIDGET] stereo HUD API unavailable (old .pyd)")
+                self._hud_api_warned = True
+            return True
+        except Exception as exc:
+            logger.warning(f"[NATIVE-WIDGET] stereo HUD push failed: {exc}")
+            return False
+
+    def set_hud(self, rgba_array, x, y, w, h, disparity=0.003, opacity=1.0):
+        """Stage an HxWx4 HUD in normalized one-eye video coordinates."""
+        try:
+            rect = (float(x), float(y), float(w), float(h))
+            # This texture is normally uploaded on the next video-frame slot,
+            # after the caller's capture buffer may have been destroyed.  A
+            # forced copy is therefore part of this API's ownership contract;
+            # np.ascontiguousarray() is insufficient when the input is already
+            # contiguous because it aliases the caller's memory.
+            owned_rgba = np.array(rgba_array, dtype=np.uint8, order="C", copy=True)
+            if owned_rgba.ndim != 3 or owned_rgba.shape[2] != 4:
+                raise ValueError("HUD texture must have shape HxWx4")
+            self._hud = (owned_rgba, rect,
+                         float(disparity), max(0.0, min(1.0, float(opacity))))
+            self._hud_dirty = True
+            self._hud_state_dirty = True
+        except Exception as exc:
+            logger.warning(f"[NATIVE-WIDGET] set_hud failed: {exc}")
+            self._hud = None
+            self._hud_state_dirty = True
+
+    def clear_hud(self):
+        if self._hud is None and not self._hud_state_dirty:
+            return
+        self._hud = None
+        self._hud_dirty = False
+        self._hud_state_dirty = True
+
+    def refresh_hud(self):
+        """Upload/present a changed HUD while media is paused.
+
+        Video playback already pushes it from set_frame_yuv_views; this path is
+        used only when no new frame is expected, and presents with interval 0.
+        """
+        if not self._r or self._r is False or self._rendering_paused:
+            return False
+        if not self._push_hud_to_renderer():
+            return self._invalidate_renderer("HUD refresh")
+        if not self.has_video:
+            return True
+        try:
+            if not self._r.present(0):
+                return self._invalidate_renderer("HUD refresh Present")
+            return True
+        except Exception as exc:
+            return self._invalidate_renderer("HUD refresh exception", exc)
+
+    def stereo_hud_video_uv(self, x, y):
+        """Map one Qt-local output point to normalized one-eye video UV.
+
+        This mirrors native_renderer.cpp's aspect viewport and the HLSL's
+        SBS/TAB/FramePack split, including the 45-pixel HDMI gap and per-eye
+        letterbox. None means the point is in a black bar/gap.
+        """
+        ow, oh = float(max(1, self.width())), float(max(1, self.height()))
+        px, py = float(x), float(y)
+        if px < 0.0 or py < 0.0 or px >= ow or py >= oh:
+            return None
+
+        eye_aspect = 0.0
+        try:
+            eye_aspect = float(self.source_aspect)
+        except Exception:
+            pass
+        if eye_aspect <= 0.0 and self._last_eye_size and self._last_eye_size[1]:
+            eye_aspect = self._last_eye_size[0] / self._last_eye_size[1]
+        if eye_aspect <= 0.0:
+            eye_aspect = 16.0 / 9.0
+
+        target_aspect = 1920.0 / 2205.0 if self._stereo_mode == 1 else eye_aspect
+        out_aspect = ow / oh
+        vx = vy = 0.0
+        vw, vh = ow, oh
+        if out_aspect > target_aspect:
+            vw = oh * target_aspect
+            vx = (ow - vw) * 0.5
+        else:
+            vh = ow / target_aspect
+            vy = (oh - vh) * 0.5
+        if px < vx or px >= vx + vw or py < vy or py >= vy + vh:
+            return None
+        sx, sy = (px - vx) / vw, (py - vy) / vh
+
+        if self._stereo_mode == 2:       # SBS
+            return ((sx * 2.0) if sx < 0.5 else ((sx - 0.5) * 2.0), sy)
+        if self._stereo_mode == 3:       # TAB
+            return (sx, (sy * 2.0) if sy < 0.5 else ((sy - 0.5) * 2.0))
+        if self._stereo_mode != 1:       # 2D / one-eye projector
+            return (sx, sy)
+
+        top = 1080.0 / 2205.0
+        gap_end = 1125.0 / 2205.0
+        if sy < top:
+            slot_y = sy / top
+        elif sy > gap_end:
+            slot_y = (sy - gap_end) / top
+        else:
+            return None
+        slot_aspect = 1920.0 / 1080.0
+        if eye_aspect >= slot_aspect:
+            hfill, vfill = 1.0, slot_aspect / eye_aspect
+        else:
+            hfill, vfill = eye_aspect / slot_aspect, 1.0
+        hbar, vbar = (1.0 - hfill) * 0.5, (1.0 - vfill) * 0.5
+        if sx < hbar or sx > 1.0 - hbar or slot_y < vbar or slot_y > 1.0 - vbar:
+            return None
+        return ((sx - hbar) / hfill, (slot_y - vbar) / vfill)
 
     def pause_rendering(self):
         self._rendering_paused = True
@@ -534,8 +789,24 @@ class NativeFramepackWidget(QWidget):
             except Exception:
                 pass
 
+    def set_synth3d_human_matte(self, frame):
+        """Stage one shared MatAnyone result for upload on the next frame.
+
+        ``frame`` is intentionally duck-typed (sequence, generation, alpha) so
+        this display module does not import or own the worker service.
+        """
+        if frame is None:
+            key = None
+        else:
+            key = (int(frame.generation), int(frame.sequence))
+        if key == self._synth3d_human_matte_key:
+            return
+        self._synth3d_human_matte = frame
+        self._synth3d_human_matte_key = key
+
     def clear_textures(self):
         self.has_video = False
+        self.set_synth3d_human_matte(None)
         # C2: reset the display-aspect override so the next source derives aspect from
         # planes again until the player re-sets it.
         self.source_aspect = 0.0

@@ -19,11 +19,18 @@ cbuffer buf : register(b0)
     float _401_plane_scale : packoffset(c3);
     // HDR10/PQ color path (HEVC). Both 0 (DEFAULT) reproduces the pre-HDR shader
     // BYTE-FOR-BYTE (legacy BT.601 limited matrix + gamma/sdr_white output). These two
-    // ints reuse the free c3.y/c3.z padding, so the cbuffer stays 64 bytes.
+    // ints reuse the original c3.y/c3.z padding, so all established video/HDR
+    // fields keep their byte offsets; the independent HUD starts at c4.
     //   yuv_matrix_sel: 0 = BT.601 limited (legacy), 1 = BT.709 limited, 2 = BT.2020nc limited.
     //   transfer_sel:   0 = legacy, 1 = PQ -> scRGB absolute (HDR), 2 = PQ -> tone-mapped SDR.
     int _401_yuv_matrix_sel : packoffset(c3.y);
     int _401_transfer_sel : packoffset(c3.z);
+    // Independent stereoscopic playback HUD. Kept separate from subtitles so
+    // both layers can be visible and carry different depths at the same time.
+    int _401_hud_enabled : packoffset(c4);
+    float _401_hud_disparity : packoffset(c4.y);
+    float _401_hud_opacity : packoffset(c4.z);
+    float4 _401_hud_rect : packoffset(c5);
 };
 
 Texture2D<float4> texSubtitle : register(t0);
@@ -40,6 +47,8 @@ Texture2D<float4> texU_R : register(t5);
 SamplerState _texU_R_sampler : register(s5);
 Texture2D<float4> texV_R : register(t6);
 SamplerState _texV_R_sampler : register(s6);
+Texture2D<float4> texHud : register(t7);
+SamplerState _texHud_sampler : register(s7);
 
 static float2 v_texCoord;
 static float4 fragColor;
@@ -316,11 +325,38 @@ float3 blendSubtitle(float3 videoRGB, float4 subtitleRGBA)
     return lerp(videoRGB, subtitleRGBA.xyz, subtitleRGBA.w.xxx);
 }
 
+float4 sampleHud(float2 videoUV, float eyeShift)
+{
+    if (_401_hud_enabled == 0)
+    {
+        return 0.0f.xxxx;
+    }
+    // eyeShift is the displayed shift for this eye. Positive disparity is
+    // crossed (HUD floats gently in front of the screen), matching subtitles.
+    float x = videoUV.x - eyeShift;
+    float sx = _401_hud_rect.x;
+    float sy = _401_hud_rect.y;
+    float sw = _401_hud_rect.z;
+    float sh = _401_hud_rect.w;
+    if (sw <= 0.0f || sh <= 0.0f || x < sx || x >= (sx + sw) ||
+        videoUV.y < sy || videoUV.y >= (sy + sh))
+    {
+        return 0.0f.xxxx;
+    }
+    float2 hudUV = float2((x - sx) / sw, (videoUV.y - sy) / sh);
+    float4 hud = texHud.Sample(_texHud_sampler, hudUV);
+    hud.w *= _401_hud_opacity;
+    return hud;
+}
+
 void frag_main()
 {
     float y_flipped = 1.0f - v_texCoord.y;
-    float3 rgb;
-    float2 videoUV;
+    // Defensive defaults for an unknown future stereo mode: black video and
+    // an out-of-rect UV. Every current mode overwrites both, but explicit
+    // initialization also prevents an invalid enum from sampling either HUD.
+    float3 rgb = 0.0f.xxx;
+    float2 videoUV = (-1.0f).xx;
     // Which eye this pixel belongs to, for stereoscopic subtitle depth:
     // +1 = left eye, -1 = right eye, 0 = mono/2D (no disparity applied).
     float eyeSign = 0.0f;
@@ -437,6 +473,10 @@ void frag_main()
     float3 param_8 = rgb;
     float4 param_9 = subtitle;
     rgb = blendSubtitle(param_8, param_9);
+    // Controls deliberately sit above subtitles so the timeline remains
+    // readable when a cue overlaps the lower safe area.
+    float4 hud = sampleHud(videoUV, eyeSign * _401_hud_disparity * 0.5f);
+    rgb = lerp(rgb, hud.xyz, hud.w.xxx);
     // Legacy output encode. transfer_sel == 0 (all existing content) runs it UNCHANGED:
     //   Optional EOTF: linearize the gamma-domain RGB before scaling into the (linear)
     //   scRGB FP16 buffer. output_gamma <= 0 disables it (raw passthrough).
