@@ -14,6 +14,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -25,7 +26,7 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-// cbuffer b0 (SynthCB in the HLSL) — 96 bytes (6 x 16). Layout must match the
+// cbuffer b0 (SynthCB in the HLSL) — 112 bytes (7 x 16). Layout must match the
 // cbuffer declaration in shaders/synth3d.hlsl.
 struct SynthCB {
     float max_disp;        // c0.x  disparity budget, fraction of image WIDTH
@@ -50,8 +51,12 @@ struct SynthCB {
     float comfort_hard_disp; // c5.y: asymptotic envelope, image-width fraction
     int   comfort_enabled;   // c5.z
     float pad5;              // c5.w
+    int   lookahead_fill;    // c6.x: one-frame future evidence armed
+    float lookahead_min_conf;// c6.y: confidence knee
+    float lookahead_strength;// c6.z: maximum future-evidence blend
+    float pad6;              // c6.w
 };
-static_assert(sizeof(SynthCB) == 96, "SynthCB must be 96 bytes");
+static_assert(sizeof(SynthCB) == 112, "SynthCB must be 112 bytes");
 
 // ImageNet normalization — the SAME constants DepthEngine's input contract expects
 // and that python_bindings.cpp's depth_infer_test applies (Task 2).
@@ -59,6 +64,20 @@ constexpr float kMean[3]   = {0.485f, 0.456f, 0.406f};
 constexpr float kInvStd[3] = {1.0f / 0.229f, 1.0f / 0.224f, 1.0f / 0.225f};
 
 std::atomic<uint64_t> gSynthClientId{0};
+
+bool gpu_ownership_requested() {
+    static const bool requested = []() {
+        char* env = nullptr;
+        size_t len = 0;
+        bool on = true;
+        if (_dupenv_s(&env, &len, "SYLC_SYNTH3D_GPU_OWNERSHIP") == 0 && env) {
+            on = env[0] != '0';
+            free(env);
+        }
+        return on;
+    }();
+    return requested;
+}
 
 void set_viewport(ID3D11DeviceContext* ctx, uint32_t w, uint32_t h) {
     D3D11_VIEWPORT vp = {};
@@ -94,6 +113,17 @@ bool Synth3D::ensure_pipeline(std::string& err) {
         }
         return true;
     };
+    auto make_cs = [&](int resource_id, const char* entry,
+                       ComPtr<ID3D11ComputeShader>& out) -> bool {
+        sylc::ShaderBytecode bytecode;
+        if (!sylc::load_shader_bytecode(resource_id, bytecode, err)) return false;
+        if (FAILED(device_->CreateComputeShader(bytecode.data, bytecode.size,
+                                                nullptr, &out))) {
+            err = std::string("CreateComputeShader(") + entry + ") failed";
+            return false;
+        }
+        return true;
+    };
 
     sylc::ShaderBytecode vsBytecode;
     if (!sylc::load_shader_bytecode(
@@ -113,7 +143,28 @@ bool Synth3D::ensure_pipeline(std::string& err) {
     if (!make_ps(IDR_SYLC_SYNTH3D_PS_DEPTH_VIEW_CHROMA,
                  "PS_DepthViewChroma", psViewChroma_)) { vs_.Reset(); return false; }
     if (!make_ps(IDR_SYLC_SYNTH3D_PS_PLATE_ACCUM,
-                 "PS_PlateAccum", psPlateAccum_)) { vs_.Reset(); return false; }
+                  "PS_PlateAccum", psPlateAccum_)) { vs_.Reset(); return false; }
+    if (gpu_ownership_requested()) {
+        const bool compute_ok =
+            make_cs(IDR_SYLC_SYNTH3D_CS_OWNER_UNCERTAINTY,
+                    "CS_OwnerUncertainty", csOwnerUncertainty_) &&
+            make_cs(IDR_SYLC_SYNTH3D_CS_OWNER_DILATE,
+                    "CS_OwnerDilate", csOwnerDilate_) &&
+            make_cs(IDR_SYLC_SYNTH3D_CS_OWNER_LOCAL,
+                    "CS_OwnerLocal", csOwnerLocal_) &&
+            make_cs(IDR_SYLC_SYNTH3D_CS_OWNER_PROPAGATE,
+                    "CS_OwnerPropagate", csOwnerPropagate_) &&
+            make_cs(IDR_SYLC_SYNTH3D_CS_OWNER_COMPOSE,
+                    "CS_OwnerCompose", csOwnerCompose_);
+        if (!compute_ok) {
+            // Optional optimization: keep the renderer alive and let the
+            // service publish its historical CPU-composed map.
+            csOwnerCompose_.Reset(); csOwnerPropagate_.Reset();
+            csOwnerLocal_.Reset(); csOwnerDilate_.Reset();
+            csOwnerUncertainty_.Reset();
+            err.clear();
+        }
+    }
 
     // LINEAR + CLAMP: the prep pass downscales to the inference grid and the warp resamples at
     // fractional offsets, so bilinear is wanted in both (unlike the lossless packer).
@@ -142,6 +193,19 @@ bool Synth3D::ensure_pipeline(std::string& err) {
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     if (FAILED(device_->CreateBuffer(&cbd, nullptr, &cb_))) {
         err = "synth3d: CreateBuffer(SynthCB) failed"; vs_.Reset(); return false;
+    }
+    if (csOwnerCompose_) {
+        D3D11_BUFFER_DESC owner_cbd = {};
+        owner_cbd.ByteWidth = 16;
+        owner_cbd.Usage = D3D11_USAGE_DEFAULT;
+        owner_cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        if (FAILED(device_->CreateBuffer(&owner_cbd, nullptr, &ownerCb_))) {
+            // Same optional fallback as shader creation.
+            csOwnerCompose_.Reset(); csOwnerPropagate_.Reset();
+            csOwnerLocal_.Reset(); csOwnerDilate_.Reset();
+            csOwnerUncertainty_.Reset();
+            err.clear();
+        }
     }
     return true;
 }
@@ -217,14 +281,66 @@ bool Synth3D::ensure_depth(std::string& err) {
     td.ArraySize        = 1;
     td.Format           = DXGI_FORMAT_R16G16_UNORM;
     td.SampleDesc.Count = 1;
-    td.Usage            = D3D11_USAGE_DYNAMIC;
-    td.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
-    td.CPUAccessFlags   = D3D11_CPU_ACCESS_WRITE;
+    td.Usage            = D3D11_USAGE_DEFAULT;
+    const bool compute_available = csOwnerCompose_ && ownerCb_;
+    td.BindFlags        = D3D11_BIND_SHADER_RESOURCE |
+                          (compute_available ? D3D11_BIND_UNORDERED_ACCESS : 0);
     if (FAILED(device_->CreateTexture2D(&td, nullptr, &depthTex_))) {
         err = "synth3d: CreateTexture2D(depth) failed"; return false;
     }
     if (FAILED(device_->CreateShaderResourceView(depthTex_.Get(), nullptr, &depthSrv_))) {
         err = "synth3d: CreateShaderResourceView(depth) failed"; depthTex_.Reset(); return false;
+    }
+    if (compute_available) {
+        if (FAILED(device_->CreateUnorderedAccessView(
+                depthTex_.Get(), nullptr, &depthUav_))) {
+            err = "synth3d: CreateUnorderedAccessView(depth) failed";
+            depthSrv_.Reset(); depthTex_.Reset(); return false;
+        }
+
+    // Dynamic input planes are filled from the immutable worker publication.
+    // Intermediate grids stay device-local and ping-pong through SRV/UAV views.
+    D3D11_TEXTURE2D_DESC input_desc = td;
+    input_desc.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
+    input_desc.Usage = D3D11_USAGE_DYNAMIC;
+    input_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    input_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    auto make_input = [&](CP<ID3D11Texture2D>& tex,
+                          CP<ID3D11ShaderResourceView>& srv,
+                          const char* name) -> bool {
+        if (FAILED(device_->CreateTexture2D(&input_desc, nullptr, &tex)) ||
+            FAILED(device_->CreateShaderResourceView(tex.Get(), nullptr, &srv))) {
+            err = std::string("synth3d: ownership input creation failed: ") + name;
+            return false;
+        }
+        return true;
+    };
+    if (!make_input(ownerSurfaceTex_, ownerSurfaceSrv_, "surface") ||
+        !make_input(ownerRgbTex_, ownerRgbSrv_, "rgb")) return false;
+
+    auto make_intermediate = [&](DXGI_FORMAT format,
+                                 CP<ID3D11Texture2D>& tex,
+                                 CP<ID3D11ShaderResourceView>& srv,
+                                 CP<ID3D11UnorderedAccessView>& uav,
+                                 const char* name) -> bool {
+        D3D11_TEXTURE2D_DESC d = td;
+        d.Format = format;
+        if (FAILED(device_->CreateTexture2D(&d, nullptr, &tex)) ||
+            FAILED(device_->CreateShaderResourceView(tex.Get(), nullptr, &srv)) ||
+            FAILED(device_->CreateUnorderedAccessView(tex.Get(), nullptr, &uav))) {
+            err = std::string("synth3d: ownership intermediate creation failed: ") + name;
+            return false;
+        }
+        return true;
+    };
+    for (int i = 0; i < 2; ++i) {
+        if (!make_intermediate(DXGI_FORMAT_R16_FLOAT,
+                               ownerUncertaintyTex_[i], ownerUncertaintySrv_[i],
+                               ownerUncertaintyUav_[i], "uncertainty") ||
+            !make_intermediate(DXGI_FORMAT_R16G16B16A16_UNORM,
+                               ownerStateTex_[i], ownerStateSrv_[i],
+                               ownerStateUav_[i], "state")) return false;
+    }
     }
 
     // Round 5a: transport (flow x/y + reliability from the published map) and
@@ -233,6 +349,9 @@ bool Synth3D::ensure_depth(std::string& err) {
     // needs no resource churn; the passes themselves are gated on the flag.
     D3D11_TEXTURE2D_DESC tt = td;
     tt.Format = DXGI_FORMAT_R16G16B16A16_UNORM;
+    tt.Usage = D3D11_USAGE_DYNAMIC;
+    tt.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    tt.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(device_->CreateTexture2D(&tt, nullptr, &transportTex_))) {
         err = "synth3d: CreateTexture2D(transport) failed"; return false;
     }
@@ -400,7 +519,17 @@ void Synth3D::release_depth_grid() {
         stag_capture_time_[i] = {};
         stag_video_time_ms_[i] = -1.0;
     }
-    depthSrv_.Reset(); depthTex_.Reset();
+    depthUav_.Reset(); depthSrv_.Reset(); depthTex_.Reset();
+    ownerSurfaceSrv_.Reset(); ownerSurfaceTex_.Reset();
+    ownerRgbSrv_.Reset(); ownerRgbTex_.Reset();
+    for (int i = 0; i < 2; ++i) {
+        ownerUncertaintyUav_[i].Reset();
+        ownerUncertaintySrv_[i].Reset();
+        ownerUncertaintyTex_[i].Reset();
+        ownerStateUav_[i].Reset();
+        ownerStateSrv_[i].Reset();
+        ownerStateTex_[i].Reset();
+    }
     transportSrv_.Reset(); transportTex_.Reset();
     for (int i = 0; i < 2; ++i) {
         plateSrv_[i].Reset();
@@ -434,8 +563,20 @@ void Synth3D::release_gpu() {
     matteSrv_.Reset(); matteTex_.Reset();
     matte_texture_width_ = matte_texture_height_ = 0;
     matte_dirty_ = matte_armed_;
+    for (int i = 0; i < 3; ++i) {
+        lookaheadSrv_[i].Reset();
+        lookaheadTex_[i].Reset();
+        lookaheadWidth_[i] = lookaheadHeight_[i] = 0;
+    }
+    lookaheadFlowSrv_.Reset(); lookaheadFlowTex_.Reset();
+    lookaheadFlowWidth_ = lookaheadFlowHeight_ = 0;
+    lookaheadFlowScratch_.clear();
+    lookaheadPlaneFmt_ = DXGI_FORMAT_UNKNOWN;
+    clear_lookahead();
     readTex_.Reset(); read_w_ = read_h_ = 0; read_fmt_ = DXGI_FORMAT_UNKNOWN;
-    cb_.Reset(); raster_.Reset(); sampler_.Reset();
+    ownerCb_.Reset(); cb_.Reset(); raster_.Reset(); sampler_.Reset();
+    csOwnerCompose_.Reset(); csOwnerPropagate_.Reset(); csOwnerLocal_.Reset();
+    csOwnerDilate_.Reset(); csOwnerUncertainty_.Reset();
     psProvenance_.Reset();
     psViewChroma_.Reset(); psViewLuma_.Reset();
     psWarpChroma_.Reset(); psWarpLuma_.Reset(); psPrep_.Reset();
@@ -569,15 +710,292 @@ void Synth3D::drain_readback(ID3D11DeviceContext* ctx) {
         static_cast<int>(y_w_), static_cast<int>(y_h_));
 }
 
+bool Synth3D::run_gpu_ownership(
+        ID3D11DeviceContext* ctx,
+        const SharedDepthService::GeometryFrame& frame,
+        std::string& err) {
+    const size_t n = static_cast<size_t>(grid_width_) * grid_height_;
+    if (frame.surface_rgba16.size() != 4 * n ||
+        frame.rgb_rgba16.size() != 4 * n || !ownerSurfaceTex_ ||
+        !ownerRgbTex_ || !depthUav_ || !ownerCb_) {
+        err = "synth3d: incomplete GPU ownership publication/resources";
+        return false;
+    }
+    auto upload_rgba16 = [&](ID3D11Texture2D* texture,
+                             const std::vector<uint16_t>& values,
+                             const char* name) -> bool {
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (FAILED(ctx->Map(texture, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+            err = std::string("synth3d: Map(") + name + ") failed";
+            return false;
+        }
+        auto* dst = static_cast<uint8_t*>(mapped.pData);
+        const size_t row_bytes = 8 * static_cast<size_t>(grid_width_);
+        for (int row = 0; row < grid_height_; ++row) {
+            std::memcpy(dst + static_cast<size_t>(row) * mapped.RowPitch,
+                        values.data() + 4 * static_cast<size_t>(row) * grid_width_,
+                        row_bytes);
+        }
+        ctx->Unmap(texture, 0);
+        return true;
+    };
+    if (!upload_rgba16(ownerSurfaceTex_.Get(), frame.surface_rgba16, "owner surface") ||
+        !upload_rgba16(ownerRgbTex_.Get(), frame.rgb_rgba16, "owner rgb")) {
+        return false;
+    }
+
+    const uint32_t owner_cb[4] = {
+        static_cast<uint32_t>(grid_width_),
+        static_cast<uint32_t>(grid_height_), 0u, 0u};
+    ctx->UpdateSubresource(ownerCb_.Get(), 0, nullptr, owner_cb, 0, 0);
+    ID3D11Buffer* owner_cb_ptr = ownerCb_.Get();
+    ctx->CSSetConstantBuffers(0, 1, &owner_cb_ptr);
+    const UINT groups_x = (static_cast<UINT>(grid_width_) + 15u) / 16u;
+    const UINT groups_y = (static_cast<UINT>(grid_height_) + 15u) / 16u;
+
+    auto dispatch = [&](ID3D11ComputeShader* shader,
+                        ID3D11ShaderResourceView* const srvs[4],
+                        ID3D11UnorderedAccessView* const uavs[3]) {
+        ctx->CSSetShader(shader, nullptr, 0);
+        ctx->CSSetShaderResources(0, 4, srvs);
+        ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
+        ctx->Dispatch(groups_x, groups_y, 1);
+        ID3D11ShaderResourceView* no_srvs[4] = {};
+        ID3D11UnorderedAccessView* no_uavs[3] = {};
+        ctx->CSSetShaderResources(0, 4, no_srvs);
+        ctx->CSSetUnorderedAccessViews(0, 3, no_uavs, nullptr);
+    };
+
+    ID3D11ShaderResourceView* srvs[4] = {};
+    ID3D11UnorderedAccessView* uavs[3] = {};
+    srvs[0] = ownerSurfaceSrv_.Get();
+    uavs[0] = ownerUncertaintyUav_[0].Get();
+    dispatch(csOwnerUncertainty_.Get(), srvs, uavs);
+
+    std::fill(std::begin(srvs), std::end(srvs), nullptr);
+    std::fill(std::begin(uavs), std::end(uavs), nullptr);
+    srvs[2] = ownerUncertaintySrv_[0].Get();
+    uavs[0] = ownerUncertaintyUav_[1].Get();
+    dispatch(csOwnerDilate_.Get(), srvs, uavs);
+
+    std::fill(std::begin(srvs), std::end(srvs), nullptr);
+    std::fill(std::begin(uavs), std::end(uavs), nullptr);
+    srvs[0] = ownerSurfaceSrv_.Get();
+    srvs[1] = ownerRgbSrv_.Get();
+    srvs[2] = ownerUncertaintySrv_[1].Get();
+    uavs[1] = ownerStateUav_[0].Get();
+    dispatch(csOwnerLocal_.Get(), srvs, uavs);
+
+    int read_state = 0;
+    for (int hop = 0; hop < 6; ++hop) {
+        const int write_state = 1 - read_state;
+        std::fill(std::begin(srvs), std::end(srvs), nullptr);
+        std::fill(std::begin(uavs), std::end(uavs), nullptr);
+        srvs[0] = ownerSurfaceSrv_.Get();
+        srvs[1] = ownerRgbSrv_.Get();
+        srvs[3] = ownerStateSrv_[read_state].Get();
+        uavs[1] = ownerStateUav_[write_state].Get();
+        dispatch(csOwnerPropagate_.Get(), srvs, uavs);
+        read_state = write_state;
+    }
+
+    std::fill(std::begin(srvs), std::end(srvs), nullptr);
+    std::fill(std::begin(uavs), std::end(uavs), nullptr);
+    srvs[0] = ownerSurfaceSrv_.Get();
+    srvs[3] = ownerStateSrv_[read_state].Get();
+    uavs[2] = depthUav_.Get();
+    dispatch(csOwnerCompose_.Get(), srvs, uavs);
+    ctx->CSSetShader(nullptr, nullptr, 0);
+    ID3D11Buffer* no_cb = nullptr;
+    ctx->CSSetConstantBuffers(0, 1, &no_cb);
+    gpu_ownership_active_ = true;
+    return true;
+}
+
+bool Synth3D::ensure_lookahead_plane(int slot, uint32_t width,
+                                     uint32_t height, DXGI_FORMAT fmt,
+                                     std::string& err) {
+    if (slot < 0 || slot >= 3 || !width || !height ||
+        (fmt != DXGI_FORMAT_R8_UNORM && fmt != DXGI_FORMAT_R16_UNORM)) {
+        err = "synth3d lookahead: invalid future plane";
+        return false;
+    }
+    if (lookaheadTex_[slot] && lookaheadSrv_[slot] &&
+        lookaheadWidth_[slot] == width && lookaheadHeight_[slot] == height &&
+        lookaheadPlaneFmt_ == fmt) {
+        return true;
+    }
+    lookaheadSrv_[slot].Reset();
+    lookaheadTex_[slot].Reset();
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = width;
+    td.Height = height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = fmt;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DYNAMIC;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(device_->CreateTexture2D(&td, nullptr, &lookaheadTex_[slot])) ||
+        FAILED(device_->CreateShaderResourceView(
+            lookaheadTex_[slot].Get(), nullptr, &lookaheadSrv_[slot]))) {
+        lookaheadSrv_[slot].Reset();
+        lookaheadTex_[slot].Reset();
+        err = "synth3d lookahead: future plane allocation failed";
+        return false;
+    }
+    lookaheadWidth_[slot] = width;
+    lookaheadHeight_[slot] = height;
+    return true;
+}
+
+bool Synth3D::ensure_lookahead_flow(uint32_t width, uint32_t height,
+                                    std::string& err) {
+    if (!width || !height) {
+        err = "synth3d lookahead: empty flow grid";
+        return false;
+    }
+    if (lookaheadFlowTex_ && lookaheadFlowSrv_ &&
+        lookaheadFlowWidth_ == width && lookaheadFlowHeight_ == height) {
+        return true;
+    }
+    lookaheadFlowSrv_.Reset();
+    lookaheadFlowTex_.Reset();
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = width;
+    td.Height = height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DYNAMIC;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(device_->CreateTexture2D(&td, nullptr, &lookaheadFlowTex_)) ||
+        FAILED(device_->CreateShaderResourceView(
+            lookaheadFlowTex_.Get(), nullptr, &lookaheadFlowSrv_))) {
+        lookaheadFlowSrv_.Reset();
+        lookaheadFlowTex_.Reset();
+        err = "synth3d lookahead: flow texture allocation failed";
+        return false;
+    }
+    lookaheadFlowWidth_ = width;
+    lookaheadFlowHeight_ = height;
+    return true;
+}
+
+bool Synth3D::set_lookahead_frame(
+        ID3D11DeviceContext* ctx,
+        const void* y, uint32_t y_w, uint32_t y_h, uint32_t y_stride,
+        const void* u, uint32_t u_w, uint32_t u_h, uint32_t u_stride,
+        const void* v, uint32_t v_w, uint32_t v_h, uint32_t v_stride,
+        DXGI_FORMAT plane_fmt, float plane_scale,
+        const float* flow_x, const float* flow_y,
+        const float* flow_reliability,
+        uint32_t flow_w, uint32_t flow_h, size_t flow_count,
+        double current_pts_ms, double future_pts_ms, std::string& err) {
+    clear_lookahead();
+    err.clear();
+    const uint32_t bytes = plane_fmt == DXGI_FORMAT_R16_UNORM ? 2u : 1u;
+    const bool valid_fmt = plane_fmt == DXGI_FORMAT_R8_UNORM ||
+                           plane_fmt == DXGI_FORMAT_R16_UNORM;
+    const double gap_ms = future_pts_ms - current_pts_ms;
+    if (!ctx || !device_ || !y || !u || !v || !flow_x || !flow_y ||
+        !flow_reliability || !valid_fmt || !y_w || !y_h || !u_w || !u_h ||
+        !v_w || !v_h || u_w != v_w || u_h != v_h ||
+        y_stride < y_w * bytes || u_stride < u_w * bytes ||
+        v_stride < v_w * bytes || !flow_w || !flow_h ||
+        flow_count != static_cast<size_t>(flow_w) * flow_h ||
+        !std::isfinite(current_pts_ms) || !std::isfinite(future_pts_ms) ||
+        gap_ms <= 0.0 || gap_ms > 250.0 ||
+        !std::isfinite(plane_scale) || plane_scale <= 0.0f) {
+        err = "synth3d lookahead: invalid frame/flow contract";
+        return false;
+    }
+    // Rebuilding one plane for a format switch must rebuild all three: the
+    // single lookaheadPlaneFmt_ describes the trio.
+    if (lookaheadPlaneFmt_ != DXGI_FORMAT_UNKNOWN &&
+        lookaheadPlaneFmt_ != plane_fmt) {
+        for (int i = 0; i < 3; ++i) {
+            lookaheadSrv_[i].Reset(); lookaheadTex_[i].Reset();
+            lookaheadWidth_[i] = lookaheadHeight_[i] = 0;
+        }
+    }
+    lookaheadPlaneFmt_ = plane_fmt;
+    if (!ensure_lookahead_plane(0, y_w, y_h, plane_fmt, err) ||
+        !ensure_lookahead_plane(1, u_w, u_h, plane_fmt, err) ||
+        !ensure_lookahead_plane(2, v_w, v_h, plane_fmt, err) ||
+        !ensure_lookahead_flow(flow_w, flow_h, err)) {
+        return false;
+    }
+    const void* planes[3] = {y, u, v};
+    const uint32_t widths[3] = {y_w, u_w, v_w};
+    const uint32_t heights[3] = {y_h, u_h, v_h};
+    const uint32_t strides[3] = {y_stride, u_stride, v_stride};
+    for (int i = 0; i < 3; ++i) {
+        D3D11_MAPPED_SUBRESOURCE mapped = {};
+        if (FAILED(ctx->Map(lookaheadTex_[i].Get(), 0,
+                            D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+            err = "synth3d lookahead: future plane Map failed";
+            return false;
+        }
+        const auto* src = static_cast<const uint8_t*>(planes[i]);
+        auto* dst = static_cast<uint8_t*>(mapped.pData);
+        const size_t row_bytes = static_cast<size_t>(widths[i]) * bytes;
+        for (uint32_t row = 0; row < heights[i]; ++row)
+            std::memcpy(dst + static_cast<size_t>(row) * mapped.RowPitch,
+                        src + static_cast<size_t>(row) * strides[i], row_bytes);
+        ctx->Unmap(lookaheadTex_[i].Get(), 0);
+    }
+    lookaheadFlowScratch_.resize(flow_count * 4u);
+    for (size_t i = 0; i < flow_count; ++i) {
+        const float fx = std::isfinite(flow_x[i]) ? flow_x[i] : 0.0f;
+        const float fy = std::isfinite(flow_y[i]) ? flow_y[i] : 0.0f;
+        const float q = std::isfinite(flow_reliability[i])
+            ? (std::max)(0.0f, (std::min)(1.0f, flow_reliability[i])) : 0.0f;
+        lookaheadFlowScratch_[4u * i + 0u] = fx;
+        lookaheadFlowScratch_[4u * i + 1u] = fy;
+        lookaheadFlowScratch_[4u * i + 2u] = q;
+        lookaheadFlowScratch_[4u * i + 3u] = 0.0f;
+    }
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(ctx->Map(lookaheadFlowTex_.Get(), 0,
+                        D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+        err = "synth3d lookahead: flow Map failed";
+        return false;
+    }
+    const size_t flow_row_bytes = static_cast<size_t>(flow_w) * 4u * sizeof(float);
+    auto* dst = static_cast<uint8_t*>(mapped.pData);
+    const auto* src = reinterpret_cast<const uint8_t*>(lookaheadFlowScratch_.data());
+    for (uint32_t row = 0; row < flow_h; ++row)
+        std::memcpy(dst + static_cast<size_t>(row) * mapped.RowPitch,
+                    src + static_cast<size_t>(row) * flow_row_bytes,
+                    flow_row_bytes);
+    ctx->Unmap(lookaheadFlowTex_.Get(), 0);
+    lookaheadPlaneScale_ = plane_scale;
+    lookaheadCurrentPtsMs_ = current_pts_ms;
+    lookaheadFuturePtsMs_ = future_pts_ms;
+    lookaheadValid_ = true;
+    return true;
+}
+
+void Synth3D::clear_lookahead() {
+    lookaheadValid_ = false;
+    lookaheadCurrentPtsMs_ = -1.0;
+    lookaheadFuturePtsMs_ = -1.0;
+}
+
 bool Synth3D::upload_depth(ID3D11DeviceContext* ctx, std::string& err) {
     const uint16_t* geometry = nullptr;
+    const std::vector<uint16_t>* gpu_transport = nullptr;
     // Declared at function scope: geometry aliases this map's storage, so the
     // reference must outlive the Map+memcpy loop below. Scoping it to the
     // else-block dropped the last renderer-side reference before the copy;
     // the worker publishing the next map then freed the buffer mid-copy
     // (use-after-free on the GUI thread, ~5x likelier under TensorRT's
     // higher publication rate).
-    std::shared_ptr<const SharedDepthService::GeometryMap> snapshot;
+    std::shared_ptr<const SharedDepthService::GeometryFrame> snapshot;
     if (test_armed_) {
         // The debug bypass wins over the engine: re-upload only when it changed.
         if (!depth_dirty_) return true;
@@ -588,6 +1006,7 @@ bool Synth3D::upload_depth(ID3D11DeviceContext* ctx, std::string& err) {
             return false;
         }
         geometry = test_geometry_.data();
+        gpu_ownership_active_ = false;
     } else {
         if (!depth_service_) return true;
         uint64_t sequence = depth_sequence_;
@@ -598,13 +1017,24 @@ bool Synth3D::upload_depth(ID3D11DeviceContext* ctx, std::string& err) {
         // Shot identity of the map this surface is about to warp with:
         // adopted together with the pixels (cross-shot gate, 04/08).
         depth_video_ms_ = source_video_ms;
-        if (snapshot->size() !=
-            SharedDepthService::kGeometryChannels *
-            static_cast<size_t>(grid_width_) * grid_height_) {
-            err = "synth3d: shared geometry map size does not match the live grid";
-            return false;
+        const size_t n = static_cast<size_t>(grid_width_) * grid_height_;
+        if (snapshot->gpu_ownership) {
+            if (!run_gpu_ownership(ctx, *snapshot, err)) return false;
+            if (snapshot->transport_rgba16.size() != 4 * n) {
+                err = "synth3d: GPU ownership transport size mismatch";
+                return false;
+            }
+            gpu_transport = &snapshot->transport_rgba16;
+            geometry = nullptr;
+        } else {
+            if (snapshot->geometry.size() !=
+                SharedDepthService::kGeometryChannels * n) {
+                err = "synth3d: shared geometry map size does not match the live grid";
+                return false;
+            }
+            geometry = snapshot->geometry.data();
+            gpu_ownership_active_ = false;
         }
-        geometry = snapshot->data();
         depth_sequence_ = sequence;
     }
 
@@ -612,23 +1042,22 @@ bool Synth3D::upload_depth(ID3D11DeviceContext* ctx, std::string& err) {
     // 2-5 the RGBA16 transport texture (round 5a). Strided copies replace the
     // historical row memcpy, whose layout only matched the 2-channel era.
     constexpr size_t kCh = SharedDepthService::kGeometryChannels;
-    D3D11_MAPPED_SUBRESOURCE m = {};
-    if (FAILED(ctx->Map(depthTex_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-        err = "synth3d: Map(depth texture) failed";
-        return false;
-    }
-    auto* out = static_cast<uint8_t*>(m.pData);
-    for (int row = 0; row < grid_height_; ++row) {
-        auto* dst = reinterpret_cast<uint16_t*>(
-            out + static_cast<size_t>(row) * m.RowPitch);
-        const uint16_t* src_row = geometry +
-            kCh * static_cast<size_t>(row) * grid_width_;
-        for (int x = 0; x < grid_width_; ++x) {
-            dst[2 * x + 0] = src_row[kCh * x + 0];
-            dst[2 * x + 1] = src_row[kCh * x + 1];
+    if (geometry) {
+        std::vector<uint16_t> depth_upload(
+            2 * static_cast<size_t>(grid_width_) * grid_height_);
+        for (int row = 0; row < grid_height_; ++row) {
+            const uint16_t* src_row = geometry +
+                kCh * static_cast<size_t>(row) * grid_width_;
+            uint16_t* dst = depth_upload.data() +
+                2 * static_cast<size_t>(row) * grid_width_;
+            for (int x = 0; x < grid_width_; ++x) {
+                dst[2 * x + 0] = src_row[kCh * x + 0];
+                dst[2 * x + 1] = src_row[kCh * x + 1];
+            }
         }
+        ctx->UpdateSubresource(depthTex_.Get(), 0, nullptr, depth_upload.data(),
+                               4 * static_cast<UINT>(grid_width_), 0);
     }
-    ctx->Unmap(depthTex_.Get(), 0);
     if (transportTex_) {
         D3D11_MAPPED_SUBRESOURCE mt = {};
         if (FAILED(ctx->Map(transportTex_.Get(), 0,
@@ -640,13 +1069,20 @@ bool Synth3D::upload_depth(ID3D11DeviceContext* ctx, std::string& err) {
         for (int row = 0; row < grid_height_; ++row) {
             auto* dst = reinterpret_cast<uint16_t*>(
                 tout + static_cast<size_t>(row) * mt.RowPitch);
-            const uint16_t* src_row = geometry +
-                kCh * static_cast<size_t>(row) * grid_width_;
-            for (int x = 0; x < grid_width_; ++x) {
-                dst[4 * x + 0] = src_row[kCh * x + 2];
-                dst[4 * x + 1] = src_row[kCh * x + 3];
-                dst[4 * x + 2] = src_row[kCh * x + 4];
-                dst[4 * x + 3] = src_row[kCh * x + 5];
+            if (gpu_transport) {
+                std::memcpy(dst,
+                    gpu_transport->data() +
+                        4 * static_cast<size_t>(row) * grid_width_,
+                    8 * static_cast<size_t>(grid_width_));
+            } else {
+                const uint16_t* src_row = geometry +
+                    kCh * static_cast<size_t>(row) * grid_width_;
+                for (int x = 0; x < grid_width_; ++x) {
+                    dst[4 * x + 0] = src_row[kCh * x + 2];
+                    dst[4 * x + 1] = src_row[kCh * x + 3];
+                    dst[4 * x + 2] = src_row[kCh * x + 4];
+                    dst[4 * x + 3] = src_row[kCh * x + 5];
+                }
             }
         }
         ctx->Unmap(transportTex_.Get(), 0);
@@ -711,8 +1147,14 @@ bool Synth3D::process(ID3D11DeviceContext* ctx,
     if (!ensure_pipeline(err) || !ensure_prep(err) || !ensure_depth(err) ||
         !ensure_matte(err) ||
         !ensure_warp(y_w, y_h, c_w, c_h, plane_fmt, err)) {
+        if (depth_service_) depth_service_->set_gpu_ownership_enabled(false);
         set_local_error(err);
         return false;
+    }
+    if (depth_service_) {
+        depth_service_->set_gpu_ownership_enabled(
+            csOwnerCompose_ && ownerCb_ && depthUav_ && ownerSurfaceTex_ &&
+            ownerRgbTex_ && ownerStateUav_[0] && ownerStateUav_[1]);
     }
 
     // The final Stereo Lab pass uses through t11. Any of its corrected outputs
@@ -772,6 +1214,41 @@ bool Synth3D::process(ID3D11DeviceContext* ctx,
     cb.comfort_enabled = (params_.comfort_enabled &&
                           cb.comfort_soft_disp >= 0.0f &&
                           cb.comfort_hard_disp > cb.comfort_soft_disp) ? 1 : 0;
+    // A future upload is single-use and PTS-addressed.  Merely having four
+    // textures allocated is never enough: the held frame must be the exact
+    // frame being presented, the source geometry/format must match, and no
+    // decoder-reported cut may lie between t and t+1.
+    const bool lookahead_armed = lookaheadValid_;
+    bool lookahead_on = lookahead_armed && lookaheadFlowSrv_ &&
+        lookaheadSrv_[0] && lookaheadSrv_[1] && lookaheadSrv_[2] &&
+        lookaheadWidth_[0] == y_w && lookaheadHeight_[0] == y_h &&
+        lookaheadWidth_[1] == c_w && lookaheadHeight_[1] == c_h &&
+        lookaheadWidth_[2] == c_w && lookaheadHeight_[2] == c_h &&
+        lookaheadPlaneFmt_ == plane_fmt &&
+        std::isfinite(video_time_ms) && video_time_ms >= 0.0 &&
+        std::abs(lookaheadCurrentPtsMs_ - video_time_ms) <= 3.0 &&
+        lookaheadFuturePtsMs_ > lookaheadCurrentPtsMs_ &&
+        lookaheadFuturePtsMs_ - lookaheadCurrentPtsMs_ <= 250.0 &&
+        std::abs(lookaheadPlaneScale_ - cb.plane_scale) <=
+            1.0e-3f * (std::max)(1.0f, cb.plane_scale);
+    if (lookahead_on && depth_service_) {
+        const double boundary = depth_service_->latest_presented_cut(
+            lookaheadFuturePtsMs_);
+        if (boundary > lookaheadCurrentPtsMs_ +
+                           SharedDepthService::kPtsJitterMs &&
+            boundary <= lookaheadFuturePtsMs_ +
+                           SharedDepthService::kPtsJitterMs) {
+            lookahead_on = false;
+        }
+    }
+    cb.lookahead_fill = lookahead_on ? 1 : 0;
+    cb.lookahead_min_conf = 0.24f;
+    cb.lookahead_strength = 1.0f;
+    if (lookahead_on) ++lookaheadFrames_;
+    else if (lookahead_armed) ++lookaheadRejects_;
+    // Consume now, including on the no-depth early return below.  Reusing t+1
+    // for a later t would be a temporal identity bug, not a graceful fallback.
+    lookaheadValid_ = false;
     if (cb.crop_top + cb.crop_bottom > 0.55f) {
         cb.crop_top = 0.0f;
         cb.crop_bottom = 0.0f;
@@ -1034,13 +1511,23 @@ bool Synth3D::process(ID3D11DeviceContext* ctx,
         }
     }
 
-    // (3) The two image-forming passes below are the exact v5.2.1c shaders.
-    // Their six outputs remain the immutable raw stereo reference.
+    // (3) These image-forming passes remain byte-identical to the v5.2.1c raw
+    // reference whenever lookahead_fill==0 (the default/rollback).  When one
+    // exact-PTS future frame is armed, only their pre-existing disocclusion
+    // branch may replace the background fallback; their six textures remain
+    // the immutable input to the additive Stereo Lab below.
     ID3D11ShaderResourceView* geometry_matte_plate[3] = {
         depthSrv_.Get(), matte_armed_ ? matteSrv_.Get() : nullptr,
         plate_on ? plateSrv_[plate_read_].Get() : nullptr
     };
     ctx->PSSetShaderResources(3, 3, geometry_matte_plate);
+    ID3D11ShaderResourceView* lookahead_inputs[4] = {
+        lookahead_on ? lookaheadSrv_[0].Get() : nullptr,
+        lookahead_on ? lookaheadSrv_[1].Get() : nullptr,
+        lookahead_on ? lookaheadSrv_[2].Get() : nullptr,
+        lookahead_on ? lookaheadFlowSrv_.Get() : nullptr
+    };
+    ctx->PSSetShaderResources(7, 4, lookahead_inputs);
     if (params_.depth_view) {
         ID3D11RenderTargetView* rtvs[2] = {
             warpRtv_[0].Get(), warpRtv_[3].Get()
@@ -1445,6 +1932,7 @@ void Synth3D::request_stop() {
     plate_snap_seen_ = -1;
     plate_cut_seen_ms_ = -1.0;
     lab_outputs_valid_ = false;
+    clear_lookahead();
     if (stereo_lab_) stereo_lab_->reset_epoch();
     params_.enabled = false;
     local_error_.clear();
@@ -1467,6 +1955,7 @@ void Synth3D::notify_seek() {
     plate_valid_ = false;
     plate_cut_seen_ms_ = -1.0;
     lab_outputs_valid_ = false;
+    clear_lookahead();
     if (stereo_lab_) stereo_lab_->reset_epoch();
     if (depth_service_) depth_service_->notify_seek();
 }
@@ -1515,14 +2004,24 @@ std::string Synth3D::status() const {
         comfort_valid ? params_.comfort_hard_pct : 0.0f);
     const std::string render_mode =
         params_.stereo_lab && lab_outputs_valid_ ? "v521c+lab" : "v521c";
+    char lookahead_buf[128] = {};
+    std::snprintf(
+        lookahead_buf, sizeof(lookahead_buf),
+        " lookahead=%s la_frames=%llu la_rejects=%llu",
+        lookaheadFrames_ > 0 ? "live" : "off",
+        static_cast<unsigned long long>(lookaheadFrames_),
+        static_cast<unsigned long long>(lookaheadRejects_));
     const std::string final_suffix =
-        " render=" + render_mode + lab_suffix + comfort_buf;
+        " render=" + render_mode + lab_suffix + comfort_buf + lookahead_buf;
     if (!local_error_.empty()) {
         char buf[640] = {};
         std::snprintf(
             buf, sizeof(buf),
             "state=error provider=renderer side=%d fps=0.0 "
-            "flow_ms=0.0 infer_ms=0.0 stab_ms=0.0 source_ms=120.0 "
+            "flow_ms=0.0 infer_ms=0.0 stab_ms=0.0 obs_ms=0.0 guard_ms=0.0 "
+            "reproj_ms=0.0 step_ms=0.0 realign_ms=0.0 owner_ms=0.0 "
+            "owner_local_ms=0.0 owner_prop_ms=0.0 pack_ms=0.0 owner_gpu=0 "
+            "source_ms=120.0 "
             "update_ms=120.0 age_ms=-1 clients=%d cuts=0 motion=0.000 "
             "alpha=0.000 stable=0.000 history=1.00 scene=0.000 "
             "crop=0:0:0:0 crop_conf=0.00 crop_ready=0 grid=%dx%d "
@@ -1547,7 +2046,10 @@ std::string Synth3D::status() const {
             buf, sizeof(buf),
             "state=running provider=test side=%d fps=0.0 "
             "flow_ms=0.0 infer_ms=0.0 "
-            "stab_ms=0.0 source_ms=120.0 update_ms=120.0 age_ms=0 clients=1 "
+            "stab_ms=0.0 obs_ms=0.0 guard_ms=0.0 reproj_ms=0.0 step_ms=0.0 "
+            "realign_ms=0.0 owner_ms=0.0 owner_local_ms=0.0 "
+            "owner_prop_ms=0.0 pack_ms=0.0 owner_gpu=0 source_ms=120.0 "
+            "update_ms=120.0 age_ms=0 clients=1 "
             "cuts=0 motion=0.000 alpha=1.000 stable=0.000 history=1.00 "
             "scene=0.000 crop=0:0:0:0 crop_conf=0.00 crop_ready=0 "
             "grid=%dx%d instance=0 err=-",
@@ -1559,7 +2061,10 @@ std::string Synth3D::status() const {
     // added to one of these two lines MUST be added to the other.
     return std::string(
            "state=off provider=none side=0 fps=0.0 flow_ms=0.0 infer_ms=0.0 "
-           "stab_ms=0.0 source_ms=120.0 update_ms=120.0 age_ms=-1 clients=0 "
+           "stab_ms=0.0 obs_ms=0.0 guard_ms=0.0 reproj_ms=0.0 step_ms=0.0 "
+           "realign_ms=0.0 owner_ms=0.0 owner_local_ms=0.0 "
+           "owner_prop_ms=0.0 pack_ms=0.0 owner_gpu=0 source_ms=120.0 "
+           "update_ms=120.0 age_ms=-1 clients=0 "
            "cuts=0 motion=0.000 alpha=0.000 stable=0.000 history=1.00 "
            "scene=0.000 crop=0:0:0:0 crop_conf=0.00 crop_ready=0 "
            "grid=0x0 instance=0 err=-") + final_suffix;

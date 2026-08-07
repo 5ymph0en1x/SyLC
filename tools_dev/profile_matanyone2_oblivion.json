@@ -1,0 +1,71 @@
+{
+  "video": "H:\\Newsleecher\\Oblivion.2013.MULTi.TRUEFRENCH.1080p.BluRay.x264-ROUGH\\Oblivion.2013.MULTi.TRUEFRENCH.1080p.BluRay.x264-ROUGH.mkv",
+  "source_fps": 23.976023976023978,
+  "presented_fps": 23.960106183606793,
+  "frames": 480,
+  "outputs": 213,
+  "dropped": 265,
+  "reported_output_fps": 16.711690999504082,
+  "short_side": 512,
+  "transport": "yuv420",
+  "stages": {
+    "inference_ms": {
+      "median": 55.62420000205748,
+      "p95": 98.12928000319516,
+      "mean": 61.32201707361851,
+      "min": 46.20120000618044,
+      "max": 110.74910000024829
+    },
+    "model_ms": {
+      "median": 49.96915054321289,
+      "p95": 91.92980346679687,
+      "mean": 55.83967661043493,
+      "min": 41.15846252441406,
+      "max": 103.7158432006836
+    },
+    "upload_ms": {
+      "median": 1.3359359502792358,
+      "p95": 2.2192639827728273,
+      "mean": 1.4441532914231463,
+      "min": 0.8301439881324768,
+      "max": 3.2992959022521973
+    },
+    "readback_ms": {
+      "median": 0.2992000008816831,
+      "p95": 0.6156000032206059,
+      "mean": 0.34252048786672784,
+      "min": 0.21120000019436702,
+      "max": 1.4063999988138676
+    },
+    "prep_ms": {
+      "median": 1.990600001590792,
+      "p95": 2.908639999805018,
+      "mean": 2.0880219512391927,
+      "min": 1.458200000342913,
+      "max": 3.816600001300685
+    }
+  },
+  "contour_lock_ms": {
+    "median": 14.597200002754107,
+    "p95": 23.215559998061504,
+    "mean": 14.547407294247238,
+    "min": 4.992599999241065,
+    "max": 44.30240000510821
+  },
+  "contour_accepted": 267,
+  "contour_attempts": 329,
+  "contour_status": {
+    "enabled": true,
+    "kind": "luma-contour-sparse",
+    "confidence": 0.7819706634317569,
+    "local_reject_pct": 10.230404586043434,
+    "sparse_pct": 9.209511046133853,
+    "lock_ms": 12.876199994934723,
+    "age_ms": 83.41666666662786,
+    "max_age_ms": 520.0,
+    "error": "",
+    "rejected": 62,
+    "track_side": 288,
+    "mode": "parallel"
+  }
+}

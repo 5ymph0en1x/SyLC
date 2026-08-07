@@ -1081,7 +1081,9 @@ std::string NativeRenderer::synth3d_status() const {
     // Any field added to one of these two lines MUST be added to the other.
     static const char* kOff =
         "state=off provider=none side=0 fps=0.0 flow_ms=0.0 infer_ms=0.0 "
-        "stab_ms=0.0 "
+        "stab_ms=0.0 obs_ms=0.0 guard_ms=0.0 reproj_ms=0.0 step_ms=0.0 "
+        "realign_ms=0.0 owner_ms=0.0 owner_local_ms=0.0 owner_prop_ms=0.0 "
+        "pack_ms=0.0 owner_gpu=0 "
         "source_ms=120.0 update_ms=120.0 age_ms=-1 clients=0 cuts=0 "
         "motion=0.000 alpha=0.000 stable=0.000 history=1.00 scene=0.000 "
         "crop=0:0:0:0 crop_conf=0.00 crop_ready=0 grid=0x0 instance=0 err=- "
@@ -1141,6 +1143,50 @@ bool NativeRenderer::synth3d_set_test_matte(const uint8_t* alpha_or_null,
     return impl_->synth3d->set_test_matte(
         alpha_or_null, width, height, count, mode,
         reliability_or_null, reliability_count);
+}
+
+bool NativeRenderer::synth3d_set_lookahead_frame(
+        const void* y, uint32_t y_w, uint32_t y_h, uint32_t y_stride,
+        const void* u, uint32_t u_w, uint32_t u_h, uint32_t u_stride,
+        const void* v, uint32_t v_w, uint32_t v_h, uint32_t v_stride,
+        int bytes_per_sample, float plane_scale,
+        const float* flow_x, const float* flow_y,
+        const float* flow_reliability,
+        uint32_t flow_w, uint32_t flow_h, size_t flow_count,
+        double current_pts_ms, double future_pts_ms) {
+    last_error_.clear();
+    if (!impl_ || !impl_->context) {
+        last_error_ = "synth3d lookahead: renderer not initialized";
+        return false;
+    }
+    if (bytes_per_sample != 1 && bytes_per_sample != 2) {
+        last_error_ = "synth3d lookahead: bytes_per_sample must be 1 or 2";
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    if (!impl_->synth3d || !impl_->synth3d_params.enabled) {
+        last_error_ = "synth3d lookahead: synthesis is not enabled";
+        return false;
+    }
+    std::string err;
+    const DXGI_FORMAT fmt = bytes_per_sample == 2
+        ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
+    if (!impl_->synth3d->set_lookahead_frame(
+            impl_->context.Get(), y, y_w, y_h, y_stride,
+            u, u_w, u_h, u_stride, v, v_w, v_h, v_stride,
+            fmt, plane_scale, flow_x, flow_y, flow_reliability,
+            flow_w, flow_h, flow_count,
+            current_pts_ms, future_pts_ms, err)) {
+        last_error_ = err;
+        return false;
+    }
+    return true;
+}
+
+void NativeRenderer::synth3d_clear_lookahead() {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    if (impl_->synth3d) impl_->synth3d->clear_lookahead();
 }
 
 int NativeRenderer::synth3d_side() const {

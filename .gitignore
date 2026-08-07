@@ -21,6 +21,7 @@ runtime/avcodec-62.dll
 runtime/avfilter-11.dll
 
 # Runtime / sensitive / transient
+sylc_license.json
 crash_log.txt
 exe.out
 exe.err

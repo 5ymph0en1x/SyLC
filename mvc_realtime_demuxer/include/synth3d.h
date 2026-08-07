@@ -96,6 +96,24 @@ public:
                  uint32_t y_w, uint32_t y_h, uint32_t c_w, uint32_t c_h,
                  DXGI_FORMAT plane_fmt, float plane_scale,
                  int matrix_sel, int transfer_sel, double video_time_ms);
+    // One-frame temporal evidence for disocclusion reconstruction.  The three
+    // future planes stay in source YUV space; flow is current->future in
+    // inference-grid pixels and may be a coarser, normalized-UV-compatible
+    // texture (NVOFA grid 4).  The warp shader is contractually allowed to
+    // consume it only where its ordinary DIBR ownership test already marked a
+    // hole.  Every buffer is copied into device-owned dynamic textures before
+    // this call returns, so the caller keeps no lifetime obligation.
+    bool set_lookahead_frame(
+        ID3D11DeviceContext* ctx,
+        const void* y, uint32_t y_w, uint32_t y_h, uint32_t y_stride,
+        const void* u, uint32_t u_w, uint32_t u_h, uint32_t u_stride,
+        const void* v, uint32_t v_w, uint32_t v_h, uint32_t v_stride,
+        DXGI_FORMAT plane_fmt, float plane_scale,
+        const float* flow_x, const float* flow_y,
+        const float* flow_reliability,
+        uint32_t flow_w, uint32_t flow_h, size_t flow_count,
+        double current_pts_ms, double future_pts_ms, std::string& err);
+    void clear_lookahead();
     // 6 SRVs (Y_L,U_L,V_L,Y_R,U_R,V_R) valid after a successful process().
     ID3D11ShaderResourceView* const* output_srvs() const;
     bool outputs_valid() const;
@@ -176,13 +194,20 @@ private:
     bool ensure_prep(std::string& err);                // grid prep RT + staging ring
     bool ensure_depth(std::string& err);               // grid RG16_UNORM geometry tex
     bool ensure_matte(std::string& err);               // optional RG8 alpha/distance tex
+    bool ensure_lookahead_plane(int slot, uint32_t width, uint32_t height,
+                                DXGI_FORMAT fmt, std::string& err);
+    bool ensure_lookahead_flow(uint32_t width, uint32_t height,
+                               std::string& err);
     bool ensure_warp(uint32_t y_w, uint32_t y_h, uint32_t c_w, uint32_t c_h,
                      DXGI_FORMAT fmt, std::string& err);   // the six output textures
     void push_readback(ID3D11DeviceContext* ctx,
                        double video_time_ms);           // CopyResource into the ring
     void drain_readback(ID3D11DeviceContext* ctx);     // DO_NOT_WAIT map -> mailbox
     bool upload_depth(ID3D11DeviceContext* ctx,
-                      std::string& err);               // mailbox/test -> depthTex_
+                       std::string& err);               // mailbox/test -> depthTex_
+    bool run_gpu_ownership(ID3D11DeviceContext* ctx,
+                           const SharedDepthService::GeometryFrame& frame,
+                           std::string& err);
     bool upload_matte(ID3D11DeviceContext* ctx,
                       std::string& err);               // precomputed alpha -> matteTex_
     void set_local_error(const std::string& err);      // renderer-local GPU failure
@@ -197,7 +222,10 @@ private:
     CP<ID3D11PixelShader>     psProvenance_;           // Lab-only metadata sidecar
     CP<ID3D11SamplerState>    sampler_;                // LINEAR / CLAMP
     CP<ID3D11RasterizerState> raster_;                 // CULL_NONE (fullscreen triangle)
-    CP<ID3D11Buffer>          cb_;                     // b0: SynthCB (64 bytes)
+    CP<ID3D11Buffer>          cb_;                     // b0: SynthCB (112 bytes)
+    CP<ID3D11ComputeShader>   csOwnerUncertainty_, csOwnerDilate_;
+    CP<ID3D11ComputeShader>   csOwnerLocal_, csOwnerPropagate_, csOwnerCompose_;
+    CP<ID3D11Buffer>          ownerCb_;                // b0: grid width/height
 
     CP<ID3D11Texture2D>       prepTex_;                // grid RGBA32F, RTV+SRV
     CP<ID3D11RenderTargetView> prepRtv_;
@@ -211,8 +239,17 @@ private:
     int                       stag_write_ = 0;
     uint64_t                  seq_ctr_ = 0;
 
-    CP<ID3D11Texture2D>        depthTex_;              // grid RG16_UNORM, DYNAMIC
+    CP<ID3D11Texture2D>        depthTex_;              // grid RG16_UNORM, SRV+UAV
     CP<ID3D11ShaderResourceView> depthSrv_;
+    CP<ID3D11UnorderedAccessView> depthUav_;
+    CP<ID3D11Texture2D>          ownerSurfaceTex_, ownerRgbTex_;
+    CP<ID3D11ShaderResourceView> ownerSurfaceSrv_, ownerRgbSrv_;
+    CP<ID3D11Texture2D>          ownerUncertaintyTex_[2];
+    CP<ID3D11ShaderResourceView> ownerUncertaintySrv_[2];
+    CP<ID3D11UnorderedAccessView> ownerUncertaintyUav_[2];
+    CP<ID3D11Texture2D>          ownerStateTex_[2];
+    CP<ID3D11ShaderResourceView> ownerStateSrv_[2];
+    CP<ID3D11UnorderedAccessView> ownerStateUav_[2];
 
     // Round 5a — temporal background plate (all grid-sized):
     // transport = flow x/y + reliability from the published map; plate =
@@ -231,6 +268,27 @@ private:
 
     CP<ID3D11Texture2D>          matteTex_;            // arbitrary-grid RG8_UNORM, DYNAMIC
     CP<ID3D11ShaderResourceView> matteSrv_;
+
+    // Experimental one-frame reveal path (SYLC_SYNTH3D_LOOKAHEAD=1 in the
+    // Python presenter).  These resources deliberately live beside Synth3D,
+    // not in NativeRenderer's eight display slots, so rollback leaves the
+    // established subtitle/YUV/HUD binding ABI byte-for-byte untouched.
+    CP<ID3D11Texture2D>          lookaheadTex_[3];      // future Y/U/V, R8 or R16
+    CP<ID3D11ShaderResourceView> lookaheadSrv_[3];
+    uint32_t                     lookaheadWidth_[3] = {0, 0, 0};
+    uint32_t                     lookaheadHeight_[3] = {0, 0, 0};
+    DXGI_FORMAT                  lookaheadPlaneFmt_ = DXGI_FORMAT_UNKNOWN;
+    CP<ID3D11Texture2D>          lookaheadFlowTex_;     // RGBA32F: dx,dy,q,reserved
+    CP<ID3D11ShaderResourceView> lookaheadFlowSrv_;
+    uint32_t                     lookaheadFlowWidth_ = 0;
+    uint32_t                     lookaheadFlowHeight_ = 0;
+    std::vector<float>           lookaheadFlowScratch_;
+    bool                         lookaheadValid_ = false;
+    float                        lookaheadPlaneScale_ = 1.0f;
+    double                       lookaheadCurrentPtsMs_ = -1.0;
+    double                       lookaheadFuturePtsMs_ = -1.0;
+    uint64_t                     lookaheadFrames_ = 0;
+    uint64_t                     lookaheadRejects_ = 0;
 
     CP<ID3D11Texture2D>          warpTex_[kNumOut];
     CP<ID3D11RenderTargetView>   warpRtv_[kNumOut];
@@ -276,6 +334,7 @@ private:
     std::shared_ptr<SharedDepthService> depth_service_;
     uint64_t              client_id_ = 0;
     uint64_t              depth_sequence_ = 0;
+    bool                  gpu_ownership_active_ = false;
     // Media PTS of the source observation behind the CURRENTLY UPLOADED map
     // (-1 = none/untimed): this surface's side of the cross-shot state test.
     double                depth_video_ms_ = -1.0;

@@ -31,6 +31,69 @@ logger = logging.getLogger("SyLC.NativeWidget")
 _MODE = {'2d': 0, 'framepack': 1, 'sbs': 2, 'tab': 3, 'glasses': 2}
 
 
+# All native presentation surfaces see the same immutable decoded arrays on
+# the GUI thread. Share the persistent NVOFA session and the most recent result
+# so a simultaneous embedded preview + framepack window does not run optical
+# flow twice for one media-PTS pair.
+_LOOKAHEAD_FLOW_CACHE = {
+    'session': None, 'grid': None, 'key': None, 'result': None,
+}
+
+
+def _array_pointer(array):
+    try:
+        return int(array.__array_interface__['data'][0])
+    except Exception:
+        return id(array)
+
+
+def _lookahead_luma8(luma, width, height, plane_scale):
+    """Compact uint8 luma accepted by NVOFA, preserving 8/10-bit levels."""
+    import cv2
+    src = np.asarray(luma)
+    if src.dtype == np.uint8:
+        compact = src
+    elif src.dtype == np.uint16:
+        compact = np.clip(
+            src.astype(np.float32) * (float(plane_scale) * 255.0 / 65535.0)
+            + 0.5, 0.0, 255.0).astype(np.uint8)
+    else:
+        raise TypeError("lookahead luma must be uint8 or uint16")
+    if compact.shape != (height, width):
+        compact = cv2.resize(
+            compact, (width, height), interpolation=cv2.INTER_AREA)
+    return np.ascontiguousarray(compact, dtype=np.uint8)
+
+
+def _estimate_shared_lookahead_flow(current_y, future_y, width, height,
+                                    current_pts, future_pts, plane_scale):
+    """Return coarse current->future NVOFA flow and its measured hot cost."""
+    key = (int(width), int(height), float(current_pts), float(future_pts),
+           _array_pointer(current_y), _array_pointer(future_y))
+    cached = _LOOKAHEAD_FLOW_CACHE
+    if cached['key'] == key and cached['result'] is not None:
+        return cached['result']
+    import mvc_demuxer_cpp as native
+    if not hasattr(native, 'NvofFlow'):
+        raise RuntimeError("this native module has no NvofFlow backend")
+    grid = (int(width), int(height))
+    if cached['session'] is None or cached['grid'] != grid:
+        cached['session'] = native.NvofFlow(width, height, 'medium', 4)
+        cached['grid'] = grid
+        cached['key'] = cached['result'] = None
+    current8 = _lookahead_luma8(current_y, width, height, plane_scale)
+    future8 = _lookahead_luma8(future_y, width, height, plane_scale)
+    started = time.perf_counter()
+    fx, fy, quality = cached['session'].estimate(current8, future8)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    result = (np.ascontiguousarray(fx, dtype=np.float32),
+              np.ascontiguousarray(fy, dtype=np.float32),
+              np.ascontiguousarray(quality, dtype=np.float32), elapsed_ms)
+    cached['key'] = key
+    cached['result'] = result
+    return result
+
+
 def _pct(sorted_vals, q):
     """p-quantile of an already-sorted list (nearest-rank). 0.0 on empty."""
     if not sorted_vals:
@@ -220,6 +283,22 @@ class NativeFramepackWidget(QWidget):
         self._have_synth3d_output_eye = True
         self._synth3d_output_eye_pushed = None
 
+        # One-frame future reveal experiment. Nothing in the established path
+        # changes unless the explicit environment flag is present. The held
+        # tuple owns ndarray references, so decoder-backed storage remains live
+        # without a full-resolution CPU copy.
+        self._lookahead_requested = os.environ.get(
+            "SYLC_SYNTH3D_LOOKAHEAD") == "1"
+        self._lookahead_held = None
+        self._lookahead_native_supported = True
+        self._lookahead_native_armed = False
+        self._lookahead_failure_logged = False
+        self._lookahead_pairs = 0
+        self._lookahead_resets = 0
+        self._lookahead_flow_ms = []
+        self._lookahead_upload_ms = []
+        self._lookahead_report_at = time.monotonic()
+
         # Public attrs some call sites read on the Qt widget.
         self.has_video = False
 
@@ -272,6 +351,8 @@ class NativeFramepackWidget(QWidget):
         r = renderer if renderer is not None else self._r
         self._r = None
         self.has_video = False
+        self._lookahead_held = None
+        self._lookahead_native_armed = False
         if self._sub is not None:
             self._sub_dirty = True
         if self._hud is not None:
@@ -346,6 +427,106 @@ class NativeFramepackWidget(QWidget):
         except Exception as e:
             return self._invalidate_renderer("initialize exception", e)
 
+    def reset_synth3d_lookahead(self, reason="reset"):
+        """Drop both the CPU-held frame and any native single-use evidence."""
+        had_state = self._lookahead_held is not None or self._lookahead_native_armed
+        self._lookahead_held = None
+        self._lookahead_native_armed = False
+        # Keep the expensive NVOFA session warm, but never let an identical
+        # PTS/pointer tuple reuse flow across a seek or source-generation reset.
+        _LOOKAHEAD_FLOW_CACHE['key'] = None
+        _LOOKAHEAD_FLOW_CACHE['result'] = None
+        if self._r and self._r is not False:
+            try:
+                clear = getattr(self._r, 'synth3d_clear_lookahead', None)
+                if clear is not None:
+                    clear()
+            except Exception:
+                pass
+        if had_state:
+            self._lookahead_resets += 1
+            logger.debug(f"[SYNTH3D-LOOKAHEAD] purged: {reason}")
+
+    def _prepare_synth3d_lookahead(self, yl, ul, vl):
+        """Select the held t for display and build t+1 evidence.
+
+        Returns ``(skip, y, u, v, pts, matte, matte_key, upload)``. ``skip``
+        is true only for the first frame after arming, when the current
+        backbuffer is deliberately held for exactly one source interval.
+        """
+        pts = float(self.video_time_ms)
+        matte = self._synth3d_human_matte
+        matte_key = self._synth3d_human_matte_key
+        passthrough = (False, yl, ul, vl, pts, matte, matte_key, None)
+        active = (self._lookahead_requested and self.synth3d_enabled and
+                  self._have_synth3d and self._lookahead_native_supported)
+        if not active:
+            if self._lookahead_held is not None or self._lookahead_native_armed:
+                self.reset_synth3d_lookahead("feature inactive")
+            return passthrough
+        setter = getattr(self._r, 'synth3d_set_lookahead_frame', None)
+        try:
+            import mvc_demuxer_cpp as native
+            nvof_available = hasattr(native, 'NvofFlow')
+        except Exception:
+            nvof_available = False
+        if not callable(setter) or not nvof_available:
+            self._lookahead_native_supported = False
+            if not self._lookahead_failure_logged:
+                logger.warning(
+                    "[SYNTH3D-LOOKAHEAD] native upload/NVOFA unavailable; "
+                    "instant rollback to the normal presentation path")
+                self._lookahead_failure_logged = True
+            self.reset_synth3d_lookahead("native capability unavailable")
+            return passthrough
+        if (not np.isfinite(pts) or pts < 0.0 or yl is None or ul is None or
+                vl is None or getattr(yl, 'dtype', None) not in
+                (np.dtype(np.uint8), np.dtype(np.uint16))):
+            self.reset_synth3d_lookahead("untimed or invalid source frame")
+            return passthrough
+
+        plane_scale = float(self.plane_scale) if yl.dtype == np.uint16 else 1.0
+        incoming = (yl, ul, vl, pts, matte, matte_key, plane_scale)
+        held = self._lookahead_held
+        if held is None:
+            self._lookahead_held = incoming
+            logger.info(
+                "[SYNTH3D-LOOKAHEAD] armed: one-frame delay, persistent "
+                "NVOFA grid4, hole-only GPU resolve")
+            return (True, yl, ul, vl, pts, matte, matte_key, None)
+
+        hyl, hul, hvl, held_pts, held_matte, held_key, held_scale = held
+        gap_ms = pts - held_pts
+        same_layout = (
+            yl.dtype == hyl.dtype and ul.dtype == hul.dtype and vl.dtype == hvl.dtype and
+            yl.shape == hyl.shape and ul.shape == hul.shape and vl.shape == hvl.shape and
+            abs(plane_scale - held_scale) <= 1.0e-6)
+        if not same_layout or not (0.0 < gap_ms <= 250.0):
+            self.reset_synth3d_lookahead(
+                "format/PTS discontinuity")
+            return passthrough
+
+        grid_w = int(self.synth3d_grid_width or self.synth3d_side or 756)
+        grid_h = int(self.synth3d_grid_height or self.synth3d_side or grid_w)
+        try:
+            fx, fy, quality, flow_ms = _estimate_shared_lookahead_flow(
+                hyl, yl, grid_w, grid_h, held_pts, pts, held_scale)
+        except Exception as exc:
+            self._lookahead_native_supported = False
+            self.reset_synth3d_lookahead("NVOFA failure")
+            if not self._lookahead_failure_logged:
+                logger.warning(
+                    f"[SYNTH3D-LOOKAHEAD] NVOFA failed ({exc}); "
+                    "instant rollback to normal presentation")
+                self._lookahead_failure_logged = True
+            return passthrough
+
+        self._lookahead_held = incoming
+        self._lookahead_flow_ms.append(float(flow_ms))
+        upload = (yl, ul, vl, fx, fy, quality, held_pts, pts, held_scale)
+        return (False, hyl, hul, hvl, held_pts,
+                held_matte, held_key, upload)
+
     # --- contract: frame delivery --------------------------------------------
     def set_frame_yuv_views(self, y_l_or_tuple, u_l_or_right=None, v_l=None,
                             y_r=None, u_r=None, v_r=None):
@@ -377,6 +558,15 @@ class NativeFramepackWidget(QWidget):
 
         if not self._ensure():
             return False
+        (lookahead_skip, yl, ul, vl, display_time_ms,
+         display_matte, display_matte_key,
+         lookahead_upload) = self._prepare_synth3d_lookahead(yl, ul, vl)
+        if lookahead_skip:
+            # The existing backbuffer remains visible while t waits for t+1.
+            # Returning True tells the decoder/pacer that ownership of this
+            # immutable frame was accepted; its ndarray references live in the
+            # held tuple until the next call.
+            return True
         if self._diag:
             _t_slot = time.perf_counter()
             if self._diag_last_slot is not None:
@@ -595,14 +785,50 @@ class NativeFramepackWidget(QWidget):
                             "(old .pyd); right Dual Projector eye is unsafe")
                     else:
                         self._synth3d_output_eye_pushed = output_eye
+            if lookahead_upload is not None:
+                (future_y, future_u, future_v, flow_x, flow_y, flow_q,
+                 current_pts, future_pts, future_scale) = lookahead_upload
+                started = time.perf_counter()
+                try:
+                    armed = self._r.synth3d_set_lookahead_frame(
+                        future_y, future_u, future_v,
+                        flow_x, flow_y, flow_q,
+                        float(current_pts), float(future_pts),
+                        float(future_scale))
+                except (AttributeError, TypeError) as exc:
+                    self._lookahead_native_supported = False
+                    armed = False
+                    if not self._lookahead_failure_logged:
+                        logger.warning(
+                            f"[SYNTH3D-LOOKAHEAD] upload ABI unavailable ({exc}); "
+                            "normal spatial fill retained")
+                        self._lookahead_failure_logged = True
+                self._lookahead_upload_ms.append(
+                    (time.perf_counter() - started) * 1000.0)
+                self._lookahead_native_armed = bool(armed)
+                if armed:
+                    self._lookahead_pairs += 1
+                else:
+                    try:
+                        self._r.synth3d_clear_lookahead()
+                    except Exception:
+                        pass
+                    error = ""
+                    try:
+                        error = str(self._r.last_error())
+                    except Exception:
+                        pass
+                    logger.debug(
+                        "[SYNTH3D-LOOKAHEAD] pair rejected before Present"
+                        f"{': ' + error if error else ''}")
             # MatAnyone 2 refines ownership only; depth remains the source of
             # geometry. A stale/absent result explicitly disarms t4 so the
             # shader falls back to its normal robust warp without retaining a
             # contour from an earlier scene or seek.
             if self._have_synth3d_human_matte:
-                matte_key = self._synth3d_human_matte_key
+                matte_key = display_matte_key
                 if matte_key != self._synth3d_human_matte_uploaded:
-                    frame = self._synth3d_human_matte
+                    frame = display_matte
                     try:
                         setter = getattr(self._r, 'synth3d_set_human_matte', None)
                         if setter is None:
@@ -646,7 +872,7 @@ class NativeFramepackWidget(QWidget):
                 return self._invalidate_renderer("HUD upload/state")
             if self._have_video_time:
                 try:
-                    self._r.set_video_time_ms(float(self.video_time_ms))
+                    self._r.set_video_time_ms(float(display_time_ms))
                 except (AttributeError, TypeError):
                     # Compatibility with a pyd predating the timed frame path.
                     self._have_video_time = False
@@ -695,7 +921,23 @@ class NativeFramepackWidget(QWidget):
                 presented = self._r.present()
             if not presented:
                 return self._invalidate_renderer("Present")
+            self._lookahead_native_armed = False
             self.has_video = True
+            if (self._lookahead_requested and
+                    time.monotonic() - self._lookahead_report_at >= 5.0):
+                flow_sorted = sorted(self._lookahead_flow_ms)
+                upload_sorted = sorted(self._lookahead_upload_ms)
+                logger.info(
+                    f"[SYNTH3D-LOOKAHEAD] pairs={self._lookahead_pairs} "
+                    f"resets={self._lookahead_resets} delay_ms="
+                    f"{(lookahead_upload[7] - lookahead_upload[6]) if lookahead_upload else 0.0:.2f} "
+                    f"nvofa_ms p50={_pct(flow_sorted, 0.5):.2f} "
+                    f"p95={_pct(flow_sorted, 0.95):.2f} | gpu_upload_ms "
+                    f"p50={_pct(upload_sorted, 0.5):.2f} "
+                    f"p95={_pct(upload_sorted, 0.95):.2f}")
+                self._lookahead_flow_ms.clear()
+                self._lookahead_upload_ms.clear()
+                self._lookahead_report_at = time.monotonic()
             if self._diag:
                 self._diag_present.append((time.perf_counter() - _t_up1) * 1000.0)
                 if self._diag_win is not None and (time.perf_counter() - self._diag_win) >= 5.0:
@@ -905,6 +1147,7 @@ class NativeFramepackWidget(QWidget):
         return ((sx - hbar) / hfill, (slot_y - vbar) / vfill)
 
     def pause_rendering(self):
+        self.reset_synth3d_lookahead("render pause")
         self._rendering_paused = True
         if self._r and self._r is not False:
             try:
@@ -942,6 +1185,7 @@ class NativeFramepackWidget(QWidget):
 
     def clear_textures(self):
         self.has_video = False
+        self.reset_synth3d_lookahead("clear textures")
         self.set_synth3d_human_matte(None)
         # C2: reset the display-aspect override so the next source derives aspect from
         # planes again until the player re-sets it.
@@ -1001,6 +1245,7 @@ class NativeFramepackWidget(QWidget):
         # WHITE native surface on replay. Idempotent: a 2nd shutdown finds _r None (or False)
         # and no-ops; on app exit the decoder is stopped before this runs, so no stray frame
         # re-triggers _ensure().
+        self.reset_synth3d_lookahead("renderer shutdown")
         r = self._r
         self._r = None
         self._renderer_failures = 0

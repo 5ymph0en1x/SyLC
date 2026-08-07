@@ -196,6 +196,20 @@ public:
                                 size_t count, int mode,
                                 const uint8_t* reliability_or_null = nullptr,
                                 size_t reliability_count = 0);
+    // Arm the future-frame evidence consumed by the next synth3d present.
+    // `bytes_per_sample` is 1 (R8) or 2 (R16); flow is current->future in
+    // inference-grid pixels.  Passing a null luma through
+    // synth3d_clear_lookahead() is the explicit rollback/reset path.
+    bool synth3d_set_lookahead_frame(
+        const void* y, uint32_t y_w, uint32_t y_h, uint32_t y_stride,
+        const void* u, uint32_t u_w, uint32_t u_h, uint32_t u_stride,
+        const void* v, uint32_t v_w, uint32_t v_h, uint32_t v_stride,
+        int bytes_per_sample, float plane_scale,
+        const float* flow_x, const float* flow_y,
+        const float* flow_reliability,
+        uint32_t flow_w, uint32_t flow_h, size_t flow_count,
+        double current_pts_ms, double future_pts_ms);
+    void synth3d_clear_lookahead();
     // The live inference grid every depth-side resource is sized for (and the
     // element count per side that set_test_depth demands); 0 before any synth3d
     // pipeline has been created.

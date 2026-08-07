@@ -1,0 +1,127 @@
+{
+  "case": "quality_scope",
+  "grid": [
+    756,
+    322
+  ],
+  "requested_fps": 59.94,
+  "presented_fps": 58.69587352425546,
+  "summary": {
+    "fps": {
+      "median": 52.8,
+      "min": 33.0,
+      "max": 58.8
+    },
+    "flow_ms": {
+      "median": 1.0,
+      "min": 0.9,
+      "max": 1.1
+    },
+    "infer_ms": {
+      "median": 8.0,
+      "min": 8.0,
+      "max": 20.6
+    },
+    "stab_ms": {
+      "median": 11.2,
+      "min": 10.9,
+      "max": 11.7
+    },
+    "obs_ms": {
+      "median": 4.0,
+      "min": 4.0,
+      "max": 4.4
+    },
+    "guard_ms": {
+      "median": 0.2,
+      "min": 0.2,
+      "max": 0.3
+    },
+    "reproj_ms": {
+      "median": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "step_ms": {
+      "median": 3.9,
+      "min": 3.9,
+      "max": 4.1
+    },
+    "realign_ms": {
+      "median": 1.4,
+      "min": 1.4,
+      "max": 1.6
+    },
+    "owner_ms": {
+      "median": 5.0,
+      "min": 4.8,
+      "max": 5.1
+    },
+    "owner_local_ms": {
+      "median": 2.4,
+      "min": 2.3,
+      "max": 2.4
+    },
+    "owner_prop_ms": {
+      "median": 2.3,
+      "min": 2.2,
+      "max": 2.3
+    },
+    "pack_ms": {
+      "median": 5.8,
+      "min": 5.7,
+      "max": 6.0
+    },
+    "inwait_ms": {
+      "median": 0.9,
+      "min": 0.3,
+      "max": 1.3
+    },
+    "reswait_ms": {
+      "median": 0.0,
+      "min": 0.0,
+      "max": 12.1
+    },
+    "joinwait_ms": {
+      "median": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "cycle_ms": {
+      "median": 18.9,
+      "min": 17.0,
+      "max": 29.9
+    },
+    "pass_ms": {
+      "median": 16.7,
+      "min": 16.7,
+      "max": 16.7
+    },
+    "taplat_ms": {
+      "median": 17.8,
+      "min": 17.6,
+      "max": 17.8
+    },
+    "source_ms": {
+      "median": 16.7,
+      "min": 16.7,
+      "max": 33.4
+    },
+    "update_ms": {
+      "median": 20.0,
+      "min": 20.0,
+      "max": 21.1
+    },
+    "age_ms": {
+      "median": 7.0,
+      "min": 0.0,
+      "max": 16.0
+    }
+  },
+  "final_status": "state=running provider=TensorRT views=1 side=756 fps=52.8 flow_ms=1.1 infer_ms=8.0 stab_ms=11.7 obs_ms=4.4 guard_ms=0.3 reproj_ms=0.0 step_ms=4.1 realign_ms=1.6 owner_ms=5.1 owner_local_ms=2.4 owner_prop_ms=2.3 pack_ms=6.0 inwait_ms=0.9 reswait_ms=0.0 joinwait_ms=0.0 cycle_ms=18.9 pass_ms=16.7 taplat_ms=17.8 grants=377 submits=376 duppts=0 dempty=0 dstall=14 plateheld=0 platepost=0 platecut=0 plate_req=0 plate_arm=0 plate_live=0 la_stale=0 la_seen=0 gate=0 source_ms=16.7 update_ms=20.0 age_ms=34 clients=1 cuts=0 cut_bnd=0 cut_src=0 cut_depth=0 depthres=0.000 depthbase=0.000 mvslots=0 motion=0.000 flow=0.00 alpha=0.007 conf=0.994 stable=0.995 history=1.15 scene=0.000 crop=0:0:1920:1080 crop_conf=0.00 crop_ready=1 grid=756x322 instance=1 err=- render=v521c+lab lab=active lab_mean=0.000 lab_p95=0.000 lab_asym=0.000 lab_px=0.0 lab_edge_px=0.0 lab_edge_p95=0.322 comfort_hit_pct=0.0 comfort_loss_mean_px=0.00 comfort_loss_p95_px=0.00 pair=sparse-source pair_grid=192x108 comfort=off comfort_soft_pct=0.0000 comfort_hard_pct=0.0000",
+  "capture": {
+    "path": "tools_dev\\quality60_cpu_static.npz",
+    "left_sha256": "98e1260d246587b1a58809c09b138b2f3dcd6b28a53af9399dc991da7b4dea7f",
+    "right_sha256": "17164521070662e5aa1fb17494e07012a40997bdfffe46b02e7945c64bb5612c"
+  }
+}

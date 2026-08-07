@@ -1463,7 +1463,11 @@ void build_geometry_map(const std::vector<uint16_t>& depth_q16,
                         int width, int height,
                         std::vector<uint16_t>& geometry_rgba16,
                         std::vector<float>& scratch,
-                        int max_threads) {
+                        int max_threads,
+                        double* local_ms,
+                        double* propagation_ms) {
+    if (local_ms) *local_ms = 0.0;
+    if (propagation_ms) *propagation_ms = 0.0;
     const size_t n = static_cast<size_t>(width) * height;
     geometry_rgba16.assign(n * 4, uint16_t(0));
     if (width <= 0 || height <= 0 || depth_q16.size() != n ||
@@ -1472,6 +1476,7 @@ void build_geometry_map(const std::vector<uint16_t>& depth_q16,
         (!boundary.empty() && boundary.size() != n)) {
         return;
     }
+    const auto local_start = Clock::now();
     const bool have_rgb = rgb_chw.size() == 3 * n;
     scratch.assign(n, 0.0f);
     auto smooth01 = [](float edge0, float edge1, float value) {
@@ -1658,6 +1663,11 @@ void build_geometry_map(const std::vector<uint16_t>& depth_q16,
         }
     });
 
+    if (local_ms) {
+        *local_ms = std::chrono::duration<double, std::milli>(
+            Clock::now() - local_start).count();
+    }
+    const auto propagation_start = Clock::now();
     // Short color-geodesic ownership propagation. A square inference grid can
     // stretch an eight-source-pixel foreshortened arm to 10-17 grid texels;
     // one fixed-radius search cannot cross it. Six one-texel hops, following
@@ -1729,6 +1739,10 @@ void build_geometry_map(const std::vector<uint16_t>& depth_q16,
             }
         }
         frontier.swap(next_frontier);
+    }
+    if (propagation_ms) {
+        *propagation_ms = std::chrono::duration<double, std::milli>(
+            Clock::now() - propagation_start).count();
     }
 }
 
@@ -1981,7 +1995,7 @@ bool SharedDepthService::submit(
     return true;
 }
 
-std::shared_ptr<const SharedDepthService::GeometryMap> SharedDepthService::snapshot(
+std::shared_ptr<const SharedDepthService::GeometryFrame> SharedDepthService::snapshot(
         uint64_t after_sequence, uint64_t& sequence,
         double& source_video_ms) const {
     std::lock_guard<std::mutex> lk(output_mtx_);
@@ -2190,12 +2204,15 @@ std::string SharedDepthService::status() const {
         for (const MotionHints& hint : hints_)
             if (hint.pts_ms >= 0.0) ++mv_slots;
     }
-    char buf[1280] = {};
+    char buf[1536] = {};
     std::snprintf(
         buf, sizeof(buf),
         "state=%s provider=%s views=%d side=%d fps=%.1f "
         "flow_ms=%.1f infer_ms=%.1f "
-        "stab_ms=%.1f inwait_ms=%.1f reswait_ms=%.1f joinwait_ms=%.1f "
+        "stab_ms=%.1f obs_ms=%.1f guard_ms=%.1f reproj_ms=%.1f "
+        "step_ms=%.1f realign_ms=%.1f owner_ms=%.1f "
+        "owner_local_ms=%.1f owner_prop_ms=%.1f pack_ms=%.1f owner_gpu=%d "
+        "inwait_ms=%.1f reswait_ms=%.1f joinwait_ms=%.1f "
         "cycle_ms=%.1f pass_ms=%.1f taplat_ms=%.1f "
         "grants=%llu submits=%llu duppts=%llu "
         "dempty=%llu dstall=%llu "
@@ -2216,6 +2233,16 @@ std::string SharedDepthService::status() const {
         static_cast<double>(flow_ms_.load(std::memory_order_acquire)),
         static_cast<double>(infer_ms_.load(std::memory_order_acquire)),
         static_cast<double>(stab_ms_.load(std::memory_order_acquire)),
+        static_cast<double>(obs_ms_.load(std::memory_order_acquire)),
+        static_cast<double>(guard_ms_.load(std::memory_order_acquire)),
+        static_cast<double>(reproj_ms_.load(std::memory_order_acquire)),
+        static_cast<double>(step_ms_.load(std::memory_order_acquire)),
+        static_cast<double>(realign_ms_.load(std::memory_order_acquire)),
+        static_cast<double>(owner_ms_.load(std::memory_order_acquire)),
+        static_cast<double>(owner_local_ms_.load(std::memory_order_acquire)),
+        static_cast<double>(owner_prop_ms_.load(std::memory_order_acquire)),
+        static_cast<double>(pack_ms_.load(std::memory_order_acquire)),
+        gpu_owner_.load(std::memory_order_acquire) ? 1 : 0,
         static_cast<double>(inwait_ms_.load(std::memory_order_acquire)),
         static_cast<double>(reswait_ms_.load(std::memory_order_acquire)),
         static_cast<double>(joinwait_ms_.load(std::memory_order_acquire)),
@@ -2390,6 +2417,15 @@ void SharedDepthService::worker_main() {
     double flow_ms_accum = 0.0;
     double infer_ms_accum = 0.0;
     double stab_ms_accum = 0.0;
+    double obs_ms_accum = 0.0;
+    double guard_ms_accum = 0.0;
+    double reproj_ms_accum = 0.0;
+    double step_ms_accum = 0.0;
+    double realign_ms_accum = 0.0;
+    double owner_ms_accum = 0.0;
+    double owner_local_ms_accum = 0.0;
+    double owner_prop_ms_accum = 0.0;
+    double pack_ms_accum = 0.0;
     // Blocked-time accumulators (see the atomics in the header). Declared here
     // so finish_map's [&] capture reaches them exactly like the stage timers.
     double inwait_ms_accum = 0.0;
@@ -2512,6 +2548,7 @@ void SharedDepthService::worker_main() {
         double motion_sum = done.motion_sum;
         float mean_flow = done.mean_flow;
 
+        const auto obs_start = Clock::now();
         normalize_da3_confidence(raw_confidence, confidence);
         synth3d_surface::compute_boundary(
             raw, luma, width, height, surface_boundary, surface_scratch,
@@ -2519,6 +2556,8 @@ void SharedDepthService::worker_main() {
         synth3d_surface::refine_observation(
             raw, luma, confidence, surface_boundary,
             width, height, surface_scratch, flow_threads);
+        obs_ms_accum += std::chrono::duration<double, std::milli>(
+            Clock::now() - obs_start).count();
 
         // Round 7 — fusion biface. Le transport publié (reproject, plaque),
         // la fiabilité et le masque de mouvement sortent de la fusion des
@@ -2583,6 +2622,7 @@ void SharedDepthService::worker_main() {
         }
         const bool source_cut_step = source_cut || cut_ahead;
 
+        const auto guard_start = Clock::now();
         if (done.have_prev) {
             // Motion at a silhouette is often registered one or two pixels on
             // only one side. Expand it along the guard band so the complete
@@ -2606,6 +2646,8 @@ void SharedDepthService::worker_main() {
                 trail_erode && publish_flow_x.size() == n &&
                     publish_flow_y.size() == n);
         }
+        guard_ms_accum += std::chrono::duration<double, std::milli>(
+            Clock::now() - guard_start).count();
         const auto stab_start = Clock::now();
         float update_dt_ms = DepthStabilizer::kReferenceDtMs;
         if (have_update_time)
@@ -2629,11 +2671,15 @@ void SharedDepthService::worker_main() {
         // the pipelined order the flow task can run while the previous map
         // is still unstepped. On a look-ahead-confirmed cut the transport is
         // cross-shot by construction — skipped, step() snaps right below.
+        const auto reproj_start = Clock::now();
         if (!cut_ahead &&
             publish_flow_x.size() == n && publish_flow_y.size() == n)
             stabilizer.reproject(
                 publish_flow_x.data(), publish_flow_y.data(),
                 flow_reliability.data(), width, height);
+        reproj_ms_accum += std::chrono::duration<double, std::milli>(
+            Clock::now() - reproj_start).count();
+        const auto step_start = Clock::now();
         // LOOK-AHEAD ADVISORY (two-filter scout, spec 2026-08-03): a motion
         // storm was OBSERVED in the decoded future within ~2.5 frames of the
         // presented position. The oracle proved storms have no content ramp
@@ -2720,6 +2766,8 @@ void SharedDepthService::worker_main() {
                               std::memory_order_release);
         stab_ms_accum += std::chrono::duration<double, std::milli>(
             Clock::now() - stab_start).count();
+        step_ms_accum += std::chrono::duration<double, std::milli>(
+            Clock::now() - step_start).count();
         if (cut && input_views > 1 && !source_cut_step) {
             // The depth residual found a cut that the source histogram missed.
             // Re-run this rare transition with a clean temporal window so the
@@ -2759,6 +2807,8 @@ void SharedDepthService::worker_main() {
                 raw.data(), q16.data(), nullptr, 0.0f, confidence.data(),
                 surface_boundary.data());
             stab_ms_accum += std::chrono::duration<double, std::milli>(
+                Clock::now() - retry_stab_start).count();
+            step_ms_accum += std::chrono::duration<double, std::milli>(
                 Clock::now() - retry_stab_start).count();
             // reset() unprimes the stabilizer, so this step() always takes the
             // priming path and returns cut=false -- yet the EMA and tone range
@@ -2840,55 +2890,109 @@ void SharedDepthService::worker_main() {
                 return on;
             }();
             if (realign_on) {
+                const auto realign_start = Clock::now();
                 synth3d_surface::realign_contours(
                     q16, luma, width, height, realign_scratch, flow_threads);
+                realign_ms_accum += std::chrono::duration<double, std::milli>(
+                    Clock::now() - realign_start).count();
             }
-            synth3d_surface::build_geometry_map(
-                q16, input, luma, confidence, surface_boundary,
-                width, height, ownership_geometry,
-                surface_scratch, flow_threads);
-            GeometryMap geometry(kGeometryChannels * n);
+            const bool gpu_ownership =
+                gpu_ownership_enabled_.load(std::memory_order_acquire);
+            auto published = std::make_shared<GeometryFrame>();
+            published->gpu_ownership = gpu_ownership;
+            gpu_owner_.store(gpu_ownership, std::memory_order_release);
             const bool has_flow = publish_flow_x.size() == n &&
                                   publish_flow_y.size() == n;
-            // Pure per-pixel repack (reads ownership + transport, writes the
-            // published channels once each): no accumulation and no cross-
-            // pixel reads, so chunking is bitwise identical to the sequential
-            // loop at any worker count -- the parallel_chunks.h guarantee.
-            // This was the last serial per-pixel pass left inside the
-            // geometry segment of the stab_ms window (realign and
-            // build_geometry_map above it already take flow_threads).
-            parallel_chunks(static_cast<int>(n), flow_threads,
-                            [&](int, int i_begin, int i_end) {
-            for (size_t i = static_cast<size_t>(i_begin);
-                 i < static_cast<size_t>(i_end); ++i) {
-                const float raw_depth = ownership_geometry[4 * i + 0] / 65535.0f;
-                const float owned_depth = ownership_geometry[4 * i + 1] / 65535.0f;
-                const float safety = ownership_geometry[4 * i + 2] / 65535.0f;
-                const float repair = ownership_geometry[4 * i + 3] / 65535.0f;
-                const size_t out = kGeometryChannels * i;
-                geometry[out + 0] = static_cast<uint16_t>(
-                    clamp01(raw_depth + repair * (owned_depth - raw_depth)) *
-                    65535.0f + 0.5f);
-                geometry[out + 1] = static_cast<uint16_t>(
-                    clamp01(safety + 0.72f * repair) * 65535.0f + 0.5f);
-                // Transport block (round 5a): map-to-map flow + reliability
-                // for the GPU background plate. A skipped-flow (static) cycle
-                // publishes the identity transport at full reliability.
-                const float fx = has_flow ? publish_flow_x[i] : 0.0f;
-                const float fy = has_flow ? publish_flow_y[i] : 0.0f;
-                const float rel = has_flow ? flow_reliability[i] : 1.0f;
-                geometry[out + 2] = static_cast<uint16_t>(
-                    clamp01(fx / 128.0f + 0.5f) * 65535.0f + 0.5f);
-                geometry[out + 3] = static_cast<uint16_t>(
-                    clamp01(fy / 128.0f + 0.5f) * 65535.0f + 0.5f);
-                geometry[out + 4] = static_cast<uint16_t>(
-                    clamp01(rel) * 65535.0f + 0.5f);
-                geometry[out + 5] = 0;
+            const auto pack_start = Clock::now();
+            double pack_elapsed_ms = 0.0;
+            if (gpu_ownership) {
+                // The renderer consumes these filterable UNORM planes without
+                // a GPU->CPU round trip. Keeping transport separate preserves
+                // the existing plate path while ownership/safety is completed
+                // by DirectCompute on the renderer's own D3D11 device.
+                published->surface_rgba16.resize(4 * n);
+                published->rgb_rgba16.resize(4 * n);
+                published->transport_rgba16.resize(4 * n);
+                parallel_chunks(static_cast<int>(n), flow_threads,
+                                [&](int, int i_begin, int i_end) {
+                for (size_t i = static_cast<size_t>(i_begin);
+                     i < static_cast<size_t>(i_end); ++i) {
+                    const size_t out = 4 * i;
+                    published->surface_rgba16[out + 0] = q16[i];
+                    published->surface_rgba16[out + 1] = static_cast<uint16_t>(
+                        clamp01(luma[i]) * 65535.0f + 0.5f);
+                    published->surface_rgba16[out + 2] = static_cast<uint16_t>(
+                        clamp01(confidence[i]) * 65535.0f + 0.5f);
+                    published->surface_rgba16[out + 3] = static_cast<uint16_t>(
+                        clamp01(surface_boundary[i]) * 65535.0f + 0.5f);
+                    published->rgb_rgba16[out + 0] = static_cast<uint16_t>(
+                        clamp01(input[i] * 0.229f + 0.485f) * 65535.0f + 0.5f);
+                    published->rgb_rgba16[out + 1] = static_cast<uint16_t>(
+                        clamp01(input[n + i] * 0.224f + 0.456f) * 65535.0f + 0.5f);
+                    published->rgb_rgba16[out + 2] = static_cast<uint16_t>(
+                        clamp01(input[2 * n + i] * 0.225f + 0.406f) * 65535.0f + 0.5f);
+                    published->rgb_rgba16[out + 3] = 0;
+                    const float fx = has_flow ? publish_flow_x[i] : 0.0f;
+                    const float fy = has_flow ? publish_flow_y[i] : 0.0f;
+                    const float rel = has_flow ? flow_reliability[i] : 1.0f;
+                    published->transport_rgba16[out + 0] = static_cast<uint16_t>(
+                        clamp01(fx / 128.0f + 0.5f) * 65535.0f + 0.5f);
+                    published->transport_rgba16[out + 1] = static_cast<uint16_t>(
+                        clamp01(fy / 128.0f + 0.5f) * 65535.0f + 0.5f);
+                    published->transport_rgba16[out + 2] = static_cast<uint16_t>(
+                        clamp01(rel) * 65535.0f + 0.5f);
+                    published->transport_rgba16[out + 3] = 0;
+                }
+                });
+                pack_elapsed_ms = std::chrono::duration<double, std::milli>(
+                    Clock::now() - pack_start).count();
+            } else {
+                const auto owner_start = Clock::now();
+                double owner_local_ms = 0.0;
+                double owner_prop_ms = 0.0;
+                synth3d_surface::build_geometry_map(
+                    q16, input, luma, confidence, surface_boundary,
+                    width, height, ownership_geometry,
+                    surface_scratch, flow_threads,
+                    &owner_local_ms, &owner_prop_ms);
+                owner_ms_accum += std::chrono::duration<double, std::milli>(
+                    Clock::now() - owner_start).count();
+                owner_local_ms_accum += owner_local_ms;
+                owner_prop_ms_accum += owner_prop_ms;
+                published->geometry.resize(kGeometryChannels * n);
+                const auto cpu_pack_start = Clock::now();
+                parallel_chunks(static_cast<int>(n), flow_threads,
+                                [&](int, int i_begin, int i_end) {
+                for (size_t i = static_cast<size_t>(i_begin);
+                     i < static_cast<size_t>(i_end); ++i) {
+                    const float raw_depth = ownership_geometry[4 * i + 0] / 65535.0f;
+                    const float owned_depth = ownership_geometry[4 * i + 1] / 65535.0f;
+                    const float safety = ownership_geometry[4 * i + 2] / 65535.0f;
+                    const float repair = ownership_geometry[4 * i + 3] / 65535.0f;
+                    const size_t out = kGeometryChannels * i;
+                    published->geometry[out + 0] = static_cast<uint16_t>(
+                        clamp01(raw_depth + repair * (owned_depth - raw_depth)) *
+                        65535.0f + 0.5f);
+                    published->geometry[out + 1] = static_cast<uint16_t>(
+                        clamp01(safety + 0.72f * repair) * 65535.0f + 0.5f);
+                    const float fx = has_flow ? publish_flow_x[i] : 0.0f;
+                    const float fy = has_flow ? publish_flow_y[i] : 0.0f;
+                    const float rel = has_flow ? flow_reliability[i] : 1.0f;
+                    published->geometry[out + 2] = static_cast<uint16_t>(
+                        clamp01(fx / 128.0f + 0.5f) * 65535.0f + 0.5f);
+                    published->geometry[out + 3] = static_cast<uint16_t>(
+                        clamp01(fy / 128.0f + 0.5f) * 65535.0f + 0.5f);
+                    published->geometry[out + 4] = static_cast<uint16_t>(
+                        clamp01(rel) * 65535.0f + 0.5f);
+                    published->geometry[out + 5] = 0;
+                }
+                });
+                pack_elapsed_ms = std::chrono::duration<double, std::milli>(
+                    Clock::now() - cpu_pack_start).count();
             }
-            });
+            pack_ms_accum += pack_elapsed_ms;
             stab_ms_accum += std::chrono::duration<double, std::milli>(
                 Clock::now() - geometry_start).count();
-            auto published = std::make_shared<GeometryMap>(std::move(geometry));
             std::lock_guard<std::mutex> lk(output_mtx_);
             latest_ = std::move(published);
             ++output_sequence_;
@@ -2913,6 +3017,26 @@ void SharedDepthService::worker_main() {
                             std::memory_order_release);
             stab_ms_.store(static_cast<float>(stab_ms_accum / fps_count),
                           std::memory_order_release);
+            obs_ms_.store(static_cast<float>(obs_ms_accum / fps_count),
+                          std::memory_order_release);
+            guard_ms_.store(static_cast<float>(guard_ms_accum / fps_count),
+                            std::memory_order_release);
+            reproj_ms_.store(static_cast<float>(reproj_ms_accum / fps_count),
+                             std::memory_order_release);
+            step_ms_.store(static_cast<float>(step_ms_accum / fps_count),
+                           std::memory_order_release);
+            realign_ms_.store(static_cast<float>(realign_ms_accum / fps_count),
+                              std::memory_order_release);
+            owner_ms_.store(static_cast<float>(owner_ms_accum / fps_count),
+                            std::memory_order_release);
+            owner_local_ms_.store(
+                static_cast<float>(owner_local_ms_accum / fps_count),
+                std::memory_order_release);
+            owner_prop_ms_.store(
+                static_cast<float>(owner_prop_ms_accum / fps_count),
+                std::memory_order_release);
+            pack_ms_.store(static_cast<float>(pack_ms_accum / fps_count),
+                           std::memory_order_release);
             inwait_ms_.store(static_cast<float>(inwait_ms_accum / fps_count),
                              std::memory_order_release);
             reswait_ms_.store(static_cast<float>(reswait_ms_accum / fps_count),
@@ -2953,6 +3077,15 @@ void SharedDepthService::worker_main() {
             flow_ms_accum = 0.0;
             infer_ms_accum = 0.0;
             stab_ms_accum = 0.0;
+            obs_ms_accum = 0.0;
+            guard_ms_accum = 0.0;
+            reproj_ms_accum = 0.0;
+            step_ms_accum = 0.0;
+            realign_ms_accum = 0.0;
+            owner_ms_accum = 0.0;
+            owner_local_ms_accum = 0.0;
+            owner_prop_ms_accum = 0.0;
+            pack_ms_accum = 0.0;
             inwait_ms_accum = 0.0;
             reswait_ms_accum = 0.0;
             joinwait_ms_accum = 0.0;

@@ -1963,6 +1963,18 @@ class PremiumControlsOverlay(QWidget):
             letter-spacing: 1.2px;
             background: transparent;
         }
+        QWidget#sylcMenuStatus {
+            background-color: rgba(255, 255, 255, 7);
+            border: 1px solid rgba(255, 255, 255, 18);
+            border-radius: 7px;
+        }
+        QLabel#sylcMenuStatusText {
+            color: rgba(151, 158, 177, 170);
+            font-family: "Segoe UI";
+            font-size: 8pt;
+            background: transparent;
+            border: none;
+        }
         QToolTip {
             color: #F4F6FA;
             background-color: #20242F;
@@ -2335,6 +2347,22 @@ class PremiumControlsOverlay(QWidget):
     # selection is appended to rather than the final text.
     _SYNTH3D_DEPTH_PRESET_TITLE = "Depth preset"
     _SYNTH3D_GEOMETRY_TITLE = "Stereo geometry"
+    # A live status line can contain a dozen renderer measurements.  A plain
+    # QAction uses that text in QMenu.sizeHint(), which used to stretch this
+    # panel across almost the whole display.  Keep the control surface at a
+    # deliberate reading width; the status is hosted by a wrapping widget.
+    _SYNTH3D_MENU_WIDTH = 420
+    _SYNTH3D_MENU_STYLE = """
+        /* The status gains several wrapped lines; slightly denser command
+           rows keep the complete panel usable above a bottom toolbar. */
+        QMenu#sylcExportMenu::item {
+            min-height: 25px;
+            padding: 5px 34px 5px 42px;
+        }
+        QMenu#sylcExportMenu::separator {
+            margin: 5px 10px;
+        }
+    """
 
     def _build_synth3d_menu(self):
         """Build the "2D->3D (AI)" QMenu attached to synth3d_button.
@@ -2375,11 +2403,14 @@ class PremiumControlsOverlay(QWidget):
         the menu's aboutToShow (same idiom as _update_export_menu_state); this
         overlay stays media/state-blind.
         """
+        menu_width = self._SYNTH3D_MENU_WIDTH
         menu = QMenu(self.synth3d_button)
-        self._prepare_export_menu(menu, 340)
+        self._prepare_export_menu(menu, menu_width)
+        menu.setStyleSheet(self._EXPORT_MENU_STYLE + self._SYNTH3D_MENU_STYLE)
+        menu.setFixedWidth(menu_width)
         header = self._add_export_menu_header(
             menu, "2D->3D (AI)",
-            "Depth Anything V3 - real-time synthesis", 340)
+            "Depth Anything V3 - real-time synthesis", menu_width)
 
         # --- provision -------------------------------------------------------
         # Always present, always enabled: this is how a user inspects what is
@@ -2395,7 +2426,7 @@ class PremiumControlsOverlay(QWidget):
 
         # --- synthesis -------------------------------------------------------
         menu.addSeparator()
-        self._add_export_menu_section(menu, "SYNTHESIS", 340)
+        self._add_export_menu_section(menu, "SYNTHESIS", menu_width)
 
         # The header already says AI; saying it again here would be the only
         # word in the panel that carries no information.
@@ -2488,7 +2519,7 @@ class PremiumControlsOverlay(QWidget):
 
         # --- inspect ---------------------------------------------------------
         menu.addSeparator()
-        self._add_export_menu_section(menu, "INSPECT", 340)
+        self._add_export_menu_section(menu, "INSPECT", menu_width)
 
         depth_view_action = QAction("Depth view", menu)
         depth_view_action.setCheckable(True)
@@ -2501,7 +2532,29 @@ class PremiumControlsOverlay(QWidget):
         menu.addAction(depth_view_action)
         menu.addAction(diagnostics_action)
 
-        status_action = QAction("Engine: off", menu)
+        # Do not put the diagnostics in QAction.text(): QMenu measures actions
+        # as a single unbreakable row and therefore grew to the full length of
+        # the telemetry string.  A word-wrapped label keeps every indication
+        # visible inside the compact panel.  The tooltip mirrors the raw text,
+        # which is useful when the menu is near the bottom of a short screen.
+        status_action = QWidgetAction(menu)
+        status_holder = QWidget(menu)
+        status_holder.setObjectName("sylcMenuStatus")
+        status_holder.setFixedWidth(menu_width - 18)
+        status_holder.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        status_layout = QVBoxLayout(status_holder)
+        status_layout.setContentsMargins(12, 7, 12, 7)
+        status_layout.setSpacing(0)
+        status_label = QLabel("Engine: off", status_holder)
+        status_label.setObjectName("sylcMenuStatusText")
+        status_label.setTextFormat(Qt.TextFormat.PlainText)
+        status_label.setWordWrap(True)
+        status_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        status_label.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        status_layout.addWidget(status_label)
+        status_action.setDefaultWidget(status_holder)
         status_action.setEnabled(False)
         menu.addAction(status_action)
 
@@ -2522,6 +2575,7 @@ class PremiumControlsOverlay(QWidget):
         self.synth3d_depth_preset_actions = depth_preset_actions
         self.synth3d_download_models_action = download_models_action
         self.synth3d_status_action = status_action
+        self.synth3d_status_label = status_label
         self.synth3d_depth_preset_header = depth_preset_header
         self.synth3d_preset_header = preset_header
 
@@ -2538,9 +2592,15 @@ class PremiumControlsOverlay(QWidget):
         self.synth3d_button.setMenu(menu)
 
     def set_synth3d_status(self, text):
-        """Set the single compact diagnostics line at the foot of the AI menu."""
-        if hasattr(self, 'synth3d_status_action'):
-            self.synth3d_status_action.setText(str(text))
+        """Set the compact, wrapping diagnostics block at the foot of the menu."""
+        label = getattr(self, 'synth3d_status_label', None)
+        if label is not None:
+            status = str(text)
+            label.setText(status)
+            label.setToolTip(status)
+            action = getattr(self, 'synth3d_status_action', None)
+            if action is not None:
+                action.setToolTip(status)
 
     def set_synth3d_models_summary(self, text, ready=True):
         """Make the gateway row report its own state: "Depth models — Small

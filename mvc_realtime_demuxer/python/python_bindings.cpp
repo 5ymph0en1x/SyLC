@@ -3,6 +3,8 @@
 #include <pybind11/functional.h>
 #include <pybind11/numpy.h>
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstring>
 #include <vector>
 #include "mvc_demuxer.h"
@@ -22,6 +24,9 @@
 #include "shared_depth_service.h"  // synth3d_flow::estimate_flow test surface
 #ifdef SYLC_NATIVE_RENDERER
 #include "stereo_lab.h"
+#ifdef SYLC_NVOF_CUDA
+#include "nvof_flow.h"
+#endif
 #endif
 
 namespace py = pybind11;
@@ -1148,6 +1153,84 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
               "remains bypassed. "
              "Renderers share one asynchronous ORT service, so playback never waits "
              "for the model. False on error (see last_error()).")
+        .def("synth3d_set_lookahead_frame",
+             [](sylc::NativeRenderer& r,
+                py::array y, py::array u, py::array v,
+                py::array_t<float,
+                    py::array::c_style | py::array::forcecast> flow_x,
+                py::array_t<float,
+                    py::array::c_style | py::array::forcecast> flow_y,
+                py::array_t<float,
+                    py::array::c_style | py::array::forcecast> flow_q,
+                double current_pts_ms, double future_pts_ms,
+                float plane_scale) {
+                 if (y.ndim() != 2 || u.ndim() != 2 || v.ndim() != 2 ||
+                     flow_x.ndim() != 2 || flow_y.ndim() != 2 ||
+                     flow_q.ndim() != 2) {
+                     throw std::runtime_error(
+                         "lookahead YUV and flow channels must be 2-D arrays");
+                 }
+                 const bool is8 = y.dtype().is(py::dtype::of<uint8_t>());
+                 const bool is16 = y.dtype().is(py::dtype::of<uint16_t>());
+                 if ((!is8 && !is16) || !u.dtype().is(y.dtype()) ||
+                     !v.dtype().is(y.dtype())) {
+                     throw std::runtime_error(
+                         "lookahead Y/U/V must share uint8 or uint16 dtype");
+                 }
+                 const py::ssize_t bytes = is16 ? 2 : 1;
+                 auto plane_ok = [bytes](const py::array& a) {
+                     return a.shape(0) > 0 && a.shape(1) > 0 &&
+                            a.strides(1) == bytes &&
+                            a.strides(0) >= a.shape(1) * bytes;
+                 };
+                 if (!plane_ok(y) || !plane_ok(u) || !plane_ok(v) ||
+                     u.shape(0) != v.shape(0) || u.shape(1) != v.shape(1)) {
+                     throw std::runtime_error(
+                         "lookahead planes must have element-contiguous rows; U/V shapes must match");
+                 }
+                 if (flow_y.shape(0) != flow_x.shape(0) ||
+                     flow_y.shape(1) != flow_x.shape(1) ||
+                     flow_q.shape(0) != flow_x.shape(0) ||
+                     flow_q.shape(1) != flow_x.shape(1) ||
+                     flow_x.shape(0) <= 0 || flow_x.shape(1) <= 0) {
+                     throw std::runtime_error(
+                         "lookahead flow x/y/reliability shapes must match");
+                 }
+                 const uint32_t flow_h = static_cast<uint32_t>(flow_x.shape(0));
+                 const uint32_t flow_w = static_cast<uint32_t>(flow_x.shape(1));
+                 const size_t flow_count = static_cast<size_t>(flow_w) * flow_h;
+                 bool ok = false;
+                 {
+                     py::gil_scoped_release nogil;
+                     ok = r.synth3d_set_lookahead_frame(
+                         y.data(), static_cast<uint32_t>(y.shape(1)),
+                         static_cast<uint32_t>(y.shape(0)),
+                         static_cast<uint32_t>(y.strides(0)),
+                         u.data(), static_cast<uint32_t>(u.shape(1)),
+                         static_cast<uint32_t>(u.shape(0)),
+                         static_cast<uint32_t>(u.strides(0)),
+                         v.data(), static_cast<uint32_t>(v.shape(1)),
+                         static_cast<uint32_t>(v.shape(0)),
+                         static_cast<uint32_t>(v.strides(0)),
+                         static_cast<int>(bytes), plane_scale,
+                         flow_x.data(), flow_y.data(), flow_q.data(),
+                         flow_w, flow_h, flow_count,
+                         current_pts_ms, future_pts_ms);
+                 }
+                 return ok;
+             },
+             py::arg("future_y"), py::arg("future_u"), py::arg("future_v"),
+             py::arg("flow_x"), py::arg("flow_y"),
+             py::arg("flow_reliability"),
+             py::arg("current_pts_ms"), py::arg("future_pts_ms"),
+             py::arg("plane_scale") = 1.0f,
+             "Upload one future YUV frame plus current->future NVOFA flow. "
+             "The next synth3d present may use it only inside DIBR holes; "
+             "the evidence is copied and consumed once.")
+        .def("synth3d_clear_lookahead",
+             &sylc::NativeRenderer::synth3d_clear_lookahead,
+             py::call_guard<py::gil_scoped_release>(),
+             "Discard pending future-frame evidence (seek/cut/format reset).")
         .def("synth3d_status", &sylc::NativeRenderer::synth3d_status,
              py::call_guard<py::gil_scoped_release>(),
              "One line with state/provider/fps, map age, shared-client and cut counts, "
@@ -1460,6 +1543,71 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
              "Debug (round 5a): the temporal background plate as (H, W, 4) uint16 "
              "(Y, U, V, confidence in plane space). Raises until temporal_fill ran.");
 
+    // --- synth3d: optional NVIDIA Optical Flow Accelerator ---------------------
+#ifdef SYLC_NVOF_CUDA
+    py::class_<sylc::NvofFlow>(m, "NvofFlow")
+        .def(py::init([](int width, int height, const std::string& perf,
+                         int grid) {
+            auto flow = std::make_unique<sylc::NvofFlow>();
+            std::string error;
+            if (!flow->initialize(width, height, perf, grid, error))
+                throw std::runtime_error("NvofFlow init: " + error);
+            return flow;
+        }), py::arg("width"), py::arg("height"),
+            py::arg("perf") = "medium", py::arg("grid") = 4)
+        .def("estimate",
+             [](sylc::NvofFlow& self,
+                py::array_t<uint8_t,
+                    py::array::c_style | py::array::forcecast> input,
+                py::array_t<uint8_t,
+                    py::array::c_style | py::array::forcecast> reference) {
+                 if (input.ndim() != 2 || reference.ndim() != 2 ||
+                     input.shape(1) != self.width() ||
+                     input.shape(0) != self.height() ||
+                     reference.shape(1) != self.width() ||
+                     reference.shape(0) != self.height())
+                     throw std::runtime_error(
+                         "input/reference must match the NvofFlow HxW grid");
+                 std::vector<float> fx, fy, reliability;
+                 std::string error;
+                 bool ok = false;
+                 {
+                     py::gil_scoped_release nogil;
+                     ok = self.estimate(
+                         input.data(), static_cast<int>(input.strides(0)),
+                         reference.data(),
+                         static_cast<int>(reference.strides(0)),
+                         fx, fy, reliability, error);
+                 }
+                 if (!ok) throw std::runtime_error(
+                     "NvofFlow estimate: " + error);
+                 py::array_t<float> x({self.output_height(),
+                                       self.output_width()});
+                 py::array_t<float> y({self.output_height(),
+                                       self.output_width()});
+                 py::array_t<float> q({self.output_height(),
+                                       self.output_width()});
+                 std::memcpy(x.mutable_data(), fx.data(),
+                             fx.size() * sizeof(float));
+                 std::memcpy(y.mutable_data(), fy.data(),
+                             fy.size() * sizeof(float));
+                 std::memcpy(q.mutable_data(), reliability.data(),
+                             reliability.size() * sizeof(float));
+                 return py::make_tuple(x, y, q);
+             }, py::arg("input"), py::arg("reference"),
+             "Execute NVOFA on two grayscale8 frames. Returns raw flow x/y "
+             "(S10.5 converted to pixels) and inverse-cost reliability.")
+        .def_property_readonly("width", &sylc::NvofFlow::width)
+        .def_property_readonly("height", &sylc::NvofFlow::height)
+        .def_property_readonly("output_width", &sylc::NvofFlow::output_width)
+        .def_property_readonly("output_height", &sylc::NvofFlow::output_height)
+        .def_property_readonly("grid", &sylc::NvofFlow::grid)
+        .def_property_readonly("backend", &sylc::NvofFlow::backend);
+    m.attr("NVOF_CUDA_AVAILABLE") = true;
+#else
+    m.attr("NVOF_CUDA_AVAILABLE") = false;
+#endif
+
     // --- synth3d (2D->3D): DepthEngine test-only binding ------------------------
     // Test-only entry point (used by tests/synth3d/test_depth_engine.py) that
     // proves DLL loading, the provider ladder and I/O binding end-to-end,
@@ -1526,6 +1674,154 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
           "(ORT provider ladder TensorRT/DirectML/CPU). CPU-side resize+normalize. "
           "side must match the grid the model was exported for (756 default, 518 for "
           "the faster presets); a fixed-shape mismatch fails init with a named error.");
+
+    // Profiling-only companion to depth_infer_test.  The legacy helper creates
+    // and destroys an ORT session for every call, so timing it mostly measures
+    // DLL/session/cache setup rather than the hot per-map inference path.  This
+    // entry point keeps one DepthEngine alive across warm-up and measured runs,
+    // requests confidence exactly like SharedDepthService, and returns every
+    // sample so tools_dev/profile_synth3d.py can report robust percentiles.
+    m.def("_depth_infer_benchmark",
+          [](const std::wstring& model, const std::wstring& ort_dir,
+             py::array_t<uint8_t, py::array::c_style | py::array::forcecast> rgb,
+             int side, int grid_width, int grid_height,
+             int warmup, int iterations) {
+              if (rgb.ndim() != 3 || rgb.shape(2) != 3)
+                  throw std::runtime_error("rgb must be HxWx3 uint8");
+              if (side <= 0)
+                  throw std::runtime_error("side must be a positive inference grid");
+              if ((grid_width > 0) != (grid_height > 0))
+                  throw std::runtime_error(
+                      "grid_width and grid_height must be provided together");
+              if (warmup < 0 || iterations <= 0 || iterations > 10000)
+                  throw std::runtime_error(
+                      "warmup must be >= 0 and iterations must be in 1..10000");
+
+              using BenchClock = std::chrono::steady_clock;
+              const int W = grid_width > 0 ? grid_width : side;
+              const int H = grid_height > 0 ? grid_height : side;
+              const size_t frame = static_cast<size_t>(W) * H;
+              const auto prep_start = BenchClock::now();
+              std::vector<float> chw(3 * frame);
+              static const float kMean[3] = {0.485f, 0.456f, 0.406f};
+              static const float kStd[3] = {0.229f, 0.224f, 0.225f};
+              auto pixels = rgb.unchecked<3>();
+              const double sy = double(rgb.shape(0)) / H;
+              const double sx = double(rgb.shape(1)) / W;
+              for (int y = 0; y < H; ++y) {
+                  const int py_ = std::min<int>(
+                      int(y * sy), static_cast<int>(rgb.shape(0)) - 1);
+                  for (int x = 0; x < W; ++x) {
+                      const int px_ = std::min<int>(
+                          int(x * sx), static_cast<int>(rgb.shape(1)) - 1);
+                      for (int c = 0; c < 3; ++c) {
+                          chw[static_cast<size_t>(c) * frame +
+                              static_cast<size_t>(y) * W + x] =
+                              (pixels(py_, px_, c) / 255.0f - kMean[c]) /
+                              kStd[c];
+                      }
+                  }
+              }
+              const double reference_cpu_preprocess_ms =
+                  std::chrono::duration<double, std::milli>(
+                      BenchClock::now() - prep_start).count();
+
+              DepthEngine engine;
+              DepthConfig cfg;
+              cfg.model_path = model;
+              cfg.ort_dir = ort_dir;
+              cfg.side = side;
+              cfg.width = W;
+              cfg.height = H;
+              cfg.invert_output = true;
+              std::string err;
+              const auto init_start = BenchClock::now();
+              bool init_ok = false;
+              {
+                  py::gil_scoped_release nogil;
+                  init_ok = engine.init(cfg, err);
+              }
+              const double init_ms = std::chrono::duration<double, std::milli>(
+                  BenchClock::now() - init_start).count();
+              if (!init_ok) throw std::runtime_error("init: " + err);
+
+              const int input_views = (std::max)(1, engine.input_views());
+              std::vector<float> model_input(
+                  static_cast<size_t>(input_views) * chw.size());
+              for (int view = 0; view < input_views; ++view) {
+                  std::copy(chw.begin(), chw.end(),
+                            model_input.begin() +
+                                static_cast<size_t>(view) * chw.size());
+              }
+              std::vector<float> out(frame), confidence(frame);
+              std::vector<double> warmup_ms;
+              std::vector<double> samples_ms;
+              warmup_ms.reserve(static_cast<size_t>(warmup));
+              samples_ms.reserve(static_cast<size_t>(iterations));
+              bool infer_ok = true;
+              {
+                  py::gil_scoped_release nogil;
+                  for (int i = 0; i < warmup && infer_ok; ++i) {
+                      const auto t0 = BenchClock::now();
+                      infer_ok = engine.infer(
+                          model_input.data(), out.data(), err,
+                          confidence.data());
+                      warmup_ms.push_back(
+                          std::chrono::duration<double, std::milli>(
+                              BenchClock::now() - t0).count());
+                  }
+                  for (int i = 0; i < iterations && infer_ok; ++i) {
+                      const auto t0 = BenchClock::now();
+                      infer_ok = engine.infer(
+                          model_input.data(), out.data(), err,
+                          confidence.data());
+                      samples_ms.push_back(
+                          std::chrono::duration<double, std::milli>(
+                              BenchClock::now() - t0).count());
+                  }
+              }
+              const std::string provider = engine.provider();
+              engine.shutdown();
+              if (!infer_ok) throw std::runtime_error("infer: " + err);
+
+              std::vector<double> sorted = samples_ms;
+              std::sort(sorted.begin(), sorted.end());
+              double total = 0.0;
+              for (double sample : samples_ms) total += sample;
+              const double mean = total / samples_ms.size();
+              auto percentile = [&](double p) {
+                  const size_t index = (std::min)(
+                      sorted.size() - 1,
+                      static_cast<size_t>(
+                          std::ceil(p * static_cast<double>(sorted.size()))) - 1);
+                  return sorted[index];
+              };
+
+              py::dict result;
+              result["provider"] = provider;
+              result["grid_width"] = W;
+              result["grid_height"] = H;
+              result["input_views"] = input_views;
+              result["init_ms"] = init_ms;
+              result["reference_cpu_preprocess_ms"] =
+                  reference_cpu_preprocess_ms;
+              result["warmup_ms"] = warmup_ms;
+              result["samples_ms"] = samples_ms;
+              result["min_ms"] = sorted.front();
+              result["p50_ms"] = percentile(0.50);
+              result["p95_ms"] = percentile(0.95);
+              result["max_ms"] = sorted.back();
+              result["mean_ms"] = mean;
+              result["fps"] = mean > 0.0 ? 1000.0 / mean : 0.0;
+              return result;
+          },
+          py::arg("model_path"), py::arg("ort_dir"), py::arg("rgb"),
+          py::arg("side") = kDefaultDepthSide,
+          py::arg("grid_width") = 0, py::arg("grid_height") = 0,
+          py::arg("warmup") = 3, py::arg("iterations") = 30,
+          "Profile one persistent production DepthEngine session. Returns "
+          "initialization, warm-up and per-inference timings; confidence is "
+          "requested exactly like SharedDepthService.");
 
     m.def("_synth3d_detect_letterbox_test",
           [](py::array_t<uint8_t,

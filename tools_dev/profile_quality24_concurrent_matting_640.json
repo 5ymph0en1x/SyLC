@@ -1,0 +1,122 @@
+{
+  "case": "quality_scope",
+  "grid": [
+    756,
+    322
+  ],
+  "requested_fps": 23.976,
+  "presented_fps": 23.845233193222914,
+  "summary": {
+    "fps": {
+      "median": 24.0,
+      "min": 13.9,
+      "max": 24.0
+    },
+    "flow_ms": {
+      "median": 6.3,
+      "min": 5.7,
+      "max": 7.5
+    },
+    "infer_ms": {
+      "median": 11.6,
+      "min": 9.0,
+      "max": 37.5
+    },
+    "stab_ms": {
+      "median": 9.6,
+      "min": 8.1,
+      "max": 11.3
+    },
+    "obs_ms": {
+      "median": 4.0,
+      "min": 3.3,
+      "max": 4.7
+    },
+    "guard_ms": {
+      "median": 0.3,
+      "min": 0.3,
+      "max": 0.4
+    },
+    "reproj_ms": {
+      "median": 1.4,
+      "min": 1.2,
+      "max": 1.6
+    },
+    "step_ms": {
+      "median": 4.7,
+      "min": 3.9,
+      "max": 5.5
+    },
+    "realign_ms": {
+      "median": 1.6,
+      "min": 1.3,
+      "max": 1.9
+    },
+    "owner_ms": {
+      "median": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "owner_local_ms": {
+      "median": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "owner_prop_ms": {
+      "median": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "pack_ms": {
+      "median": 1.9,
+      "min": 1.6,
+      "max": 2.3
+    },
+    "inwait_ms": {
+      "median": 23.2,
+      "min": 20.8,
+      "max": 26.5
+    },
+    "reswait_ms": {
+      "median": 0.0,
+      "min": 0.0,
+      "max": 26.9
+    },
+    "joinwait_ms": {
+      "median": 1.2,
+      "min": 1.1,
+      "max": 1.4
+    },
+    "cycle_ms": {
+      "median": 41.7,
+      "min": 41.6,
+      "max": 68.5
+    },
+    "pass_ms": {
+      "median": 41.7,
+      "min": 41.7,
+      "max": 41.7
+    },
+    "taplat_ms": {
+      "median": 42.6,
+      "min": 42.4,
+      "max": 42.9
+    },
+    "source_ms": {
+      "median": 41.7,
+      "min": 41.7,
+      "max": 41.7
+    },
+    "update_ms": {
+      "median": 41.4,
+      "min": 33.7,
+      "max": 47.4
+    },
+    "age_ms": {
+      "median": 25.0,
+      "min": 18.0,
+      "max": 28.0
+    }
+  },
+  "final_status": "state=running provider=TensorRT views=1 side=756 fps=24.0 flow_ms=5.9 infer_ms=11.6 stab_ms=8.4 obs_ms=3.3 guard_ms=0.3 reproj_ms=1.5 step_ms=4.0 realign_ms=1.3 owner_ms=0.0 owner_local_ms=0.0 owner_prop_ms=0.0 pack_ms=1.6 owner_gpu=1 inwait_ms=25.3 reswait_ms=0.0 joinwait_ms=1.1 cycle_ms=41.6 pass_ms=41.7 taplat_ms=42.4 grants=757 submits=756 duppts=0 dempty=0 dstall=2 plateheld=0 platepost=0 platecut=0 plate_req=0 plate_arm=0 plate_live=0 la_stale=0 la_seen=0 gate=0 source_ms=41.7 update_ms=42.3 age_ms=24 clients=1 cuts=69 cut_bnd=0 cut_src=0 cut_depth=69 depthres=0.108 depthbase=0.201 mvslots=0 motion=0.065 flow=2.82 alpha=0.189 conf=0.993 stable=0.000 history=1.00 scene=0.001 crop=0:0:1920:1080 crop_conf=0.00 crop_ready=1 grid=756x322 instance=1 err=- render=v521c+lab lab=active lab_mean=0.000 lab_p95=0.000 lab_asym=0.000 lab_px=0.0 lab_edge_px=0.0 lab_edge_p95=0.000 comfort_hit_pct=0.0 comfort_loss_mean_px=0.00 comfort_loss_p95_px=0.00 pair=sparse-source pair_grid=192x108 comfort=off comfort_soft_pct=0.0000 comfort_hard_pct=0.0000"
+}

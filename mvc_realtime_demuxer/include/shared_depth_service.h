@@ -192,7 +192,9 @@ void build_geometry_map(const std::vector<uint16_t>& depth_q16,
                         int width, int height,
                         std::vector<uint16_t>& geometry_rgba16,
                         std::vector<float>& scratch,
-                        int max_threads = 1);
+                        int max_threads = 1,
+                        double* local_ms = nullptr,
+                        double* propagation_ms = nullptr);
 }  // namespace synth3d_surface
 
 class SharedDepthService {
@@ -207,6 +209,18 @@ public:
     // cycle publishes the identity transport at full reliability.
     using GeometryMap = std::vector<uint16_t>;
     static constexpr size_t kGeometryChannels = 6;
+
+    // Immutable worker publication. The CPU path fills `geometry` with the
+    // historical six-channel final map. The GPU ownership path instead fills
+    // two RGBA16 input planes plus RGBA16 transport; the renderer completes
+    // ownership/safety directly into its device-local RG16 warp texture.
+    struct GeometryFrame {
+        bool gpu_ownership = false;
+        GeometryMap geometry;
+        GeometryMap surface_rgba16; // depth, luma, confidence, boundary
+        GeometryMap rgb_rgba16;     // linear RGB, reserved alpha
+        GeometryMap transport_rgba16;
+    };
 
     // Both dimensions are part of the cache key. `height <= 0` preserves the
     // historical square call and resolves to width x width.
@@ -286,10 +300,10 @@ public:
     // published map 1-2 frames behind the presented image, so the consumer
     // must be able to ask "does this map belong to the shot on screen?"
     // rather than approximate it with racing wall-clock deadlines.
-    std::shared_ptr<const GeometryMap> snapshot(
+    std::shared_ptr<const GeometryFrame> snapshot(
         uint64_t after_sequence, uint64_t& sequence,
         double& source_video_ms) const;
-    std::shared_ptr<const GeometryMap> snapshot(
+    std::shared_ptr<const GeometryFrame> snapshot(
         uint64_t after_sequence, uint64_t& sequence) const {
         double ignored_video_ms = -1.0;
         return snapshot(after_sequence, sequence, ignored_video_ms);
@@ -301,6 +315,12 @@ public:
     int client_count() const;
     uint64_t instance_id() const { return instance_id_; }
     std::string status() const;
+    // Renderer capability handshake. The worker publishes compute inputs only
+    // after the attached D3D11 path has created every required shader/view.
+    // False keeps the historical CPU map and is a safe driver fallback.
+    void set_gpu_ownership_enabled(bool enabled) {
+        gpu_ownership_enabled_.store(enabled, std::memory_order_release);
+    }
 
     // Narrow diagnostics used by native regression tests and support logs.
     static void debug_registry_stats(
@@ -526,7 +546,7 @@ private:
     std::chrono::steady_clock::time_point leader_seen_{};
 
     mutable std::mutex output_mtx_;
-    std::shared_ptr<const GeometryMap> latest_;
+    std::shared_ptr<const GeometryFrame> latest_;
     uint64_t output_sequence_ = 0;
     std::chrono::steady_clock::time_point output_time_{};
     // Media PTS of the source observation the published map was computed
@@ -575,7 +595,22 @@ private:
     // Per-cycle worker stage costs, averaged over the same 2s window as fps_.
     std::atomic<float> flow_ms_{0.0f};   // flow estimation + reprojection + prep
     std::atomic<float> infer_ms_{0.0f};  // engine.infer()
-    std::atomic<float> stab_ms_{0.0f};   // stabilizer.step()
+    // Historical aggregate kept for dashboards. It covers temporal state
+    // evolution plus contour/ownership construction and final packing.
+    std::atomic<float> stab_ms_{0.0f};
+    // Fine-grained work diagnostics. These are observational only: no
+    // behaviour or scheduling decision may depend on them.
+    std::atomic<float> obs_ms_{0.0f};     // confidence + boundary + refine
+    std::atomic<float> guard_ms_{0.0f};   // boundary-motion conditioning
+    std::atomic<float> reproj_ms_{0.0f};  // stabilizer.reproject()
+    std::atomic<float> step_ms_{0.0f};    // temporal controls + step/retry
+    std::atomic<float> realign_ms_{0.0f}; // realign_contours()
+    std::atomic<float> owner_ms_{0.0f};   // build_geometry_map()
+    std::atomic<float> owner_local_ms_{0.0f}; // edge/local ownership analysis
+    std::atomic<float> owner_prop_ms_{0.0f};  // six-hop geodesic propagation
+    std::atomic<float> pack_ms_{0.0f};    // RG16 + transport publication pack
+    std::atomic<bool> gpu_owner_{false};  // worker publishes DirectCompute inputs
+    std::atomic<bool> gpu_ownership_enabled_{false};
     std::atomic<float> source_dt_ms_{120.0f}; // source VIDEO-PTS interval
     std::atomic<float> update_dt_ms_{120.0f}; // COMPUTE map-update interval
     // --- wait instrumentation (diagnostic only; no behaviour depends on it) --

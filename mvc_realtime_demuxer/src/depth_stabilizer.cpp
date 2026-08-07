@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 DepthStabilizer::DepthStabilizer(size_t n)
     : ema_(n),
@@ -12,9 +13,9 @@ DepthStabilizer::DepthStabilizer(size_t n)
       snap_pending_(n, 0),
       history_values_(kHistorySlots * n, 0.0f),
       history_weights_(kHistorySlots * n, 0.0f),
-      // Full-ring scratch: reproject() samples every slot inside ONE
-      // parallel region (a single fork-join), so each slot needs its own
-      // destination until the copy-back after the join.
+      // Pixel-major full-ring scratch: all five temporal values for one pixel
+      // are adjacent. Both reproject() and step() consume history per pixel,
+      // so this avoids ten independent full-grid memory streams.
       history_slot_tmp_(kHistorySlots * n, 0.0f),
       history_weight_tmp_(kHistorySlots * n, 0.0f),
       stability_(n, 0.0f),
@@ -50,10 +51,10 @@ void DepthStabilizer::set_source_dt_ms(float dt_ms) {
 void DepthStabilizer::commit_history(const float* values,
                                      const float* confidence) {
     const size_t n = ema_.size();
-    const size_t base = history_head_ * n;
     for (size_t i = 0; i < n; ++i) {
-        history_values_[base + i] = values[i];
-        history_weights_[base + i] = confidence
+        const size_t hi = i * kHistorySlots + history_head_;
+        history_values_[hi] = values[i];
+        history_weights_[hi] = confidence
             ? std::max(0.0f, std::min(1.0f, confidence[i])) : 1.0f;
     }
     history_head_ = (history_head_ + 1) % kHistorySlots;
@@ -101,58 +102,123 @@ void DepthStabilizer::reproject(const float* flow_x, const float* flow_y,
                         values[y1 * width + x1] * fx;
         return a * (1.0f - fy) + b * fy;
     };
-    // One parallel region for every transport pass (ema, each history slot,
-    // stability): all reads are from the untouched source arrays, all writes
-    // go to per-pass scratch, so rows are independent and the outputs are
-    // bitwise identical at any thread count. The copy-backs/swaps happen
-    // after the single join.
-    parallel_chunks(static_cast<int>(height), worker_threads,
-                    [&](int, int y_begin, int y_end) {
-    for (size_t y = static_cast<size_t>(y_begin);
-         y < static_cast<size_t>(y_end); ++y) {
-        for (size_t x = 0; x < width; ++x) {
-            const size_t i = y * width + x;
-            const float trust = reliability
-                ? std::max(0.0f, std::min(1.0f, reliability[i])) : 1.0f;
-            const float source_x = static_cast<float>(x) - flow_x[i];
-            const float source_y = static_cast<float>(y) - flow_y[i];
-            const float transported = sample(ema_.data(), source_x, source_y);
-            // Unreliable/occluded destinations retain their local history;
-            // step() will replace them quickly through the motion mask.
-            tmp_[i] = ema_[i] * (1.0f - trust) + transported * trust;
-
-            // Every stored observation follows the same transport, but an
-            // unreliable/occluded destination is invalidated rather than
-            // blended with stale local history. This is the layer-separation
-            // rule that prevents a foreground neck sample from surviving on
-            // a newly exposed wall pixel.
-            for (size_t slot = 0; slot < history_count_; ++slot) {
-                const size_t si = slot * n + i;
-                history_slot_tmp_[si] = sample(
-                    history_values_.data() + slot * n, source_x, source_y);
-                history_weight_tmp_[si] = sample(
-                    history_weights_.data() + slot * n, source_x, source_y) *
-                    trust;
-            }
-
-            stability_tmp_[i] = sample(
-                stability_.data(), source_x, source_y) * trust;
+    static const bool fused_reproject = []() {
+        char* env = nullptr;
+        size_t len = 0;
+        bool on = true;
+        if (_dupenv_s(&env, &len, "SYLC_SYNTH3D_REPROJECT_FUSED") == 0 && env) {
+            on = env[0] != '0';
+            free(env);
         }
+        return on;
+    }();
+
+    // One parallel region for every transported plane. In the fused path the
+    // clamped source coordinate, four indices and bilinear weights are formed
+    // ONCE per destination and reused for EMA, history values/weights and
+    // stability. The historical path remains available for A/B rollback.
+    if (fused_reproject) {
+        parallel_chunks(static_cast<int>(height), worker_threads,
+                        [&](int, int y_begin, int y_end) {
+        for (size_t y = static_cast<size_t>(y_begin);
+             y < static_cast<size_t>(y_end); ++y) {
+            for (size_t x = 0; x < width; ++x) {
+                const size_t i = y * width + x;
+                const float trust = reliability
+                    ? std::max(0.0f, std::min(1.0f, reliability[i])) : 1.0f;
+                const float sx = std::max(0.0f, std::min(
+                    static_cast<float>(width - 1),
+                    static_cast<float>(x) - flow_x[i]));
+                const float sy = std::max(0.0f, std::min(
+                    static_cast<float>(height - 1),
+                    static_cast<float>(y) - flow_y[i]));
+                const size_t x0 = static_cast<size_t>(sx);
+                const size_t y0 = static_cast<size_t>(sy);
+                const size_t x1 = std::min(width - 1, x0 + 1);
+                const size_t y1 = std::min(height - 1, y0 + 1);
+                const float fx = sx - static_cast<float>(x0);
+                const float fy = sy - static_cast<float>(y0);
+                const size_t i00 = y0 * width + x0;
+                const size_t i10 = y0 * width + x1;
+                const size_t i01 = y1 * width + x0;
+                const size_t i11 = y1 * width + x1;
+                auto sample_indices = [&](const float* values) {
+                    const float a = values[i00] * (1.0f - fx) +
+                                    values[i10] * fx;
+                    const float b = values[i01] * (1.0f - fx) +
+                                    values[i11] * fx;
+                    return a * (1.0f - fy) + b * fy;
+                };
+                const float transported = sample_indices(ema_.data());
+                tmp_[i] = ema_[i] * (1.0f - trust) + transported * trust;
+                for (size_t slot = 0; slot < history_count_; ++slot) {
+                    const size_t si = i * kHistorySlots + slot;
+                    auto sample_slot = [&](const std::vector<float>& values) {
+                        const float a =
+                            values[i00 * kHistorySlots + slot] * (1.0f - fx) +
+                            values[i10 * kHistorySlots + slot] * fx;
+                        const float b =
+                            values[i01 * kHistorySlots + slot] * (1.0f - fx) +
+                            values[i11 * kHistorySlots + slot] * fx;
+                        return a * (1.0f - fy) + b * fy;
+                    };
+                    history_slot_tmp_[si] = sample_slot(history_values_);
+                    history_weight_tmp_[si] =
+                        sample_slot(history_weights_) * trust;
+                }
+                stability_tmp_[i] = sample_indices(stability_.data()) * trust;
+            }
+        }
+        });
+    } else {
+        parallel_chunks(static_cast<int>(height), worker_threads,
+                        [&](int, int y_begin, int y_end) {
+        for (size_t y = static_cast<size_t>(y_begin);
+             y < static_cast<size_t>(y_end); ++y) {
+            for (size_t x = 0; x < width; ++x) {
+                const size_t i = y * width + x;
+                const float trust = reliability
+                    ? std::max(0.0f, std::min(1.0f, reliability[i])) : 1.0f;
+                const float source_x = static_cast<float>(x) - flow_x[i];
+                const float source_y = static_cast<float>(y) - flow_y[i];
+                const float transported = sample(ema_.data(), source_x, source_y);
+                tmp_[i] = ema_[i] * (1.0f - trust) + transported * trust;
+                for (size_t slot = 0; slot < history_count_; ++slot) {
+                    const size_t si = i * kHistorySlots + slot;
+                    auto sample_slot = [&](const std::vector<float>& values) {
+                        float sx = std::max(0.0f, std::min(
+                            static_cast<float>(width - 1), source_x));
+                        float sy = std::max(0.0f, std::min(
+                            static_cast<float>(height - 1), source_y));
+                        const size_t x0 = static_cast<size_t>(sx);
+                        const size_t y0 = static_cast<size_t>(sy);
+                        const size_t x1 = std::min(width - 1, x0 + 1);
+                        const size_t y1 = std::min(height - 1, y0 + 1);
+                        const float fx = sx - static_cast<float>(x0);
+                        const float fy = sy - static_cast<float>(y0);
+                        const float aa =
+                            values[(y0 * width + x0) * kHistorySlots + slot] *
+                                (1.0f - fx) +
+                            values[(y0 * width + x1) * kHistorySlots + slot] * fx;
+                        const float bb =
+                            values[(y1 * width + x0) * kHistorySlots + slot] *
+                                (1.0f - fx) +
+                            values[(y1 * width + x1) * kHistorySlots + slot] * fx;
+                        return aa * (1.0f - fy) + bb * fy;
+                    };
+                    history_slot_tmp_[si] = sample_slot(history_values_);
+                    history_weight_tmp_[si] =
+                        sample_slot(history_weights_) * trust;
+                }
+                stability_tmp_[i] = sample(
+                    stability_.data(), source_x, source_y) * trust;
+            }
+        }
+        });
     }
-    });
     ema_.swap(tmp_);
-    for (size_t slot = 0; slot < history_count_; ++slot) {
-        std::copy(history_slot_tmp_.begin() +
-                      static_cast<ptrdiff_t>(slot * n),
-                  history_slot_tmp_.begin() +
-                      static_cast<ptrdiff_t>((slot + 1) * n),
-                  history_values_.begin() + static_cast<ptrdiff_t>(slot * n));
-        std::copy(history_weight_tmp_.begin() +
-                      static_cast<ptrdiff_t>(slot * n),
-                  history_weight_tmp_.begin() +
-                      static_cast<ptrdiff_t>((slot + 1) * n),
-                  history_weights_.begin() + static_cast<ptrdiff_t>(slot * n));
-    }
+    history_values_.swap(history_slot_tmp_);
+    history_weights_.swap(history_weight_tmp_);
     stability_.swap(stability_tmp_);
     // The flow transport just moved the established geometry; any pending
     // outlier signs referred to positions that no longer correspond to the
@@ -241,15 +307,11 @@ bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
     last_depth_cut_ = false;
     last_scene_cut_ = false;
     last_depth_residual_ = 0.0f;
-    if (confidence) {
-        double confidence_sum = 0.0;
-        for (size_t i = 0; i < n; ++i)
-            confidence_sum += std::max(
-                0.0f, std::min(1.0f, confidence[i]));
-        last_confidence_ = static_cast<float>(confidence_sum / n);
-    } else {
-        last_confidence_ = 1.0f;
-    }
+    // Accumulate the diagnostic confidence in a pass that already visits the
+    // full grid below.  This used to be its own O(n) traversal before both the
+    // priming loop and the confidence-weighted affine fit.
+    double confidence_sum = 0.0;
+    if (!confidence) last_confidence_ = 1.0f;
 
     if (!primed_) {
         std::copy(raw, raw + n, ema_.begin());
@@ -260,8 +322,11 @@ bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
         for (size_t i = 0; i < n; ++i) {
             const float conf = confidence
                 ? std::max(0.0f, std::min(1.0f, confidence[i])) : 1.0f;
+            confidence_sum += conf;
             stability_[i] = 0.50f * conf;
         }
+        if (confidence)
+            last_confidence_ = static_cast<float>(confidence_sum / n);
         commit_history(raw, confidence);
         double stability_sum = 0.0;
         for (float value : stability_) stability_sum += value;
@@ -274,6 +339,8 @@ bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
             // entire shot. A small floor keeps the fit well-conditioned.
             double sw = 0.0, sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
             for (size_t i = 0; i < n; ++i) {
+                confidence_sum += std::max(
+                    0.0, std::min(1.0, static_cast<double>(confidence[i])));
                 const double w = std::max(
                     static_cast<double>(confidence_floor),
                     std::min(1.0, static_cast<double>(confidence[i])));
@@ -286,6 +353,7 @@ bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
                 a = static_cast<float>((sw * sxy - sx * sy) / denom);
                 b = static_cast<float>((sy - static_cast<double>(a) * sx) / sw);
             }
+            last_confidence_ = static_cast<float>(confidence_sum / n);
         } else {
             fit_scale_shift(ema_.data(), raw, n, a, b);
         }
@@ -451,7 +519,6 @@ bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
             // It is initially the newest candidate (age 0); the ring pointer is
             // committed only after every pixel has read the same history view.
             const size_t current_slot = history_head_;
-            const size_t current_base = current_slot * n;
             const size_t available_history =
                 std::min(kHistorySlots, history_count_ + 1);
             // Data-parallel blend: the insertion write and every read the
@@ -476,8 +543,9 @@ bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
             uint64_t local_snaps = 0;
             for (size_t i = static_cast<size_t>(i_begin);
                  i < static_cast<size_t>(i_end); ++i) {
-                history_values_[current_base + i] = a * raw[i] + b;
-                history_weights_[current_base + i] = confidence
+                const size_t current_hi = i * kHistorySlots + current_slot;
+                history_values_[current_hi] = a * raw[i] + b;
+                history_weights_[current_hi] = confidence
                     ? std::max(0.0f, std::min(1.0f, confidence[i])) : 1.0f;
                 float al = alpha;
                 float mv = 0.0f;
@@ -555,7 +623,7 @@ bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
                         const size_t slot =
                             (current_slot + kHistorySlots - age) %
                             kHistorySlots;
-                        const size_t hi = slot * n + i;
+                        const size_t hi = i * kHistorySlots + slot;
                         // Dilated history remains influential but never
                         // outweighs all newer evidence on its own.
                         const float recency =

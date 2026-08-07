@@ -1,0 +1,71 @@
+{
+  "video": "H:\\Newsleecher\\Oblivion.2013.MULTi.TRUEFRENCH.1080p.BluRay.x264-ROUGH\\Oblivion.2013.MULTi.TRUEFRENCH.1080p.BluRay.x264-ROUGH.mkv",
+  "source_fps": 23.976023976023978,
+  "presented_fps": 23.95391601912338,
+  "frames": 480,
+  "outputs": 164,
+  "dropped": 314,
+  "reported_output_fps": 12.948365165186694,
+  "short_side": 512,
+  "transport": "yuv420",
+  "stages": {
+    "inference_ms": {
+      "median": 70.77210000352352,
+      "p95": 109.07412500091596,
+      "mean": 73.71283397431118,
+      "min": 54.589799998211674,
+      "max": 133.15010000223992
+    },
+    "model_ms": {
+      "median": 64.33488082885742,
+      "p95": 102.7146224975586,
+      "mean": 67.07323003426576,
+      "min": 49.15097427368164,
+      "max": 122.73766326904297
+    },
+    "upload_ms": {
+      "median": 1.7535840272903442,
+      "p95": 4.781480073928833,
+      "mean": 2.1229302623333077,
+      "min": 0.9351040124893188,
+      "max": 6.559711933135986
+    },
+    "readback_ms": {
+      "median": 0.4209500002616551,
+      "p95": 2.249324996228097,
+      "mean": 0.6184025644007562,
+      "min": 0.2182000025641173,
+      "max": 2.6853000017581508
+    },
+    "prep_ms": {
+      "median": 2.398899996478576,
+      "p95": 3.820400002950919,
+      "mean": 2.4949589740758826,
+      "min": 1.4650999946752563,
+      "max": 4.736800001410302
+    }
+  },
+  "contour_lock_ms": {
+    "median": 19.327200003317557,
+    "p95": 31.22525999497158,
+    "mean": 18.299712786893743,
+    "min": 4.779000002599787,
+    "max": 43.67310000088764
+  },
+  "contour_accepted": 230,
+  "contour_attempts": 305,
+  "contour_status": {
+    "enabled": true,
+    "kind": "rejected",
+    "confidence": 0.0,
+    "local_reject_pct": 100.0,
+    "sparse_pct": 0.0,
+    "lock_ms": 6.989399997110013,
+    "age_ms": 125.125,
+    "max_age_ms": 520.0,
+    "error": "unreliable contour registration",
+    "rejected": 75,
+    "track_side": 288,
+    "mode": "parallel"
+  }
+}

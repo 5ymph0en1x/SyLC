@@ -1227,6 +1227,10 @@ class Synth3DCoordinationMixin:
         for w in self._display_widgets():
             r = getattr(w, '_r', None)
             try:
+                reset_lookahead = getattr(
+                    w, 'reset_synth3d_lookahead', None)
+                if reset_lookahead is not None:
+                    reset_lookahead("media seek")
                 if r is not None:
                     r.synth3d_notify_seek()
             except (AttributeError, TypeError):

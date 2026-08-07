@@ -311,7 +311,6 @@ float reciprocal_guard(float2 destination_uv,
     float y_other = other_luma.SampleLevel(linSmp, other_uv, 0);
     float photo_error = abs(y_current - y_other) * max(plane_scale, 1.0);
     float photo_guard = smoothstep(2.0 / 255.0, 18.0 / 255.0, photo_error);
-
     canonical_source_x = 0.5 * (current.base_x + other.base_x);
     float pair_structure = max(
         fine_structure_score(float2(current.base_x, destination_uv.y)),
@@ -480,6 +479,8 @@ float cyclopean_source_sample(Texture2D<float> source, float2 uv) {
 
 float provenance_locked_chroma(float raw, Texture2D<float> source,
                                Texture2D<float> raw_luma,
+                               Texture2D<float> other_luma,
+                               Texture2D<uint> other_provenance,
                                Provenance p, float2 destination_uv) {
     // The c reference intentionally solves its 4:2:0 warp independently. At
     // a depth contour that can assign colour to a different layer than luma,
@@ -499,8 +500,31 @@ float provenance_locked_chroma(float raw, Texture2D<float> source,
     // chroma owner would create the very colour/luma split we are removing.
     float owner_evidence = 1.0 - smoothstep(
         2.0 / 255.0, 18.0 / 255.0, abs(output_y - owner_y));
+    // Surface ownership is binocular even though disocclusion content is not.
+    // The conjugate eye only CERTIFIES this lock; it never moves the current
+    // eye's already validated source coordinate.  This removes threshold
+    // crossings that used to recolour just one eye at a 4:2:0 phase edge.
+    float other_x = 2.0 * p.base_x - destination_uv.x;
+    if (other_x <= 0.0 || other_x >= 1.0) return raw;
+    float2 other_uv = float2(other_x, destination_uv.y);
+    Provenance other = decode_provenance(
+        point_load_u32(other_provenance, other_uv));
+    float source_error_px = abs(other.base_x - p.base_x) /
+                            max(inv_w, 1e-8);
+    float reciprocal_support = 1.0 - smoothstep(
+        0.85, 3.40, source_error_px);
+    float other_visible = 1.0 - smoothstep(0.02, 0.14, other.fill);
+    float other_output_y = other_luma.SampleLevel(
+        linSmp, other_uv, 0) * plane_scale;
+    float other_owner_y = point_load_f32(
+        SourceY, float2(other.base_x, destination_uv.y)) * plane_scale;
+    float other_owner_evidence = 1.0 - smoothstep(
+        2.0 / 255.0, 18.0 / 255.0,
+        abs(other_output_y - other_owner_y));
+    float paired_evidence = min(owner_evidence, other_owner_evidence) *
+                            reciprocal_support * other_visible;
     float lock = smoothstep(0.65, 1.75, separation_px) * visible *
-                 smoothstep(0.08, 0.52, contour) * owner_evidence;
+                 smoothstep(0.08, 0.52, contour) * paired_evidence;
     if (lock <= 0.001) return raw;
     float owned = cyclopean_source_sample(
         source, float2(p.base_x, destination_uv.y));
@@ -600,13 +624,17 @@ LabChromaOut PS_LabChroma(VSOut i) {
     float source_r = canonical_source_owner(
         i.uv, ProvenanceR, ProvenanceL);
     float raw_ul = provenance_locked_chroma(
-        point_load_f32(RawUL, i.uv), SourceU, RawYL, pl, i.uv);
+        point_load_f32(RawUL, i.uv), SourceU, RawYL, RawYR,
+        ProvenanceR, pl, i.uv);
     float raw_vl = provenance_locked_chroma(
-        point_load_f32(RawVL, i.uv), SourceV, RawYL, pl, i.uv);
+        point_load_f32(RawVL, i.uv), SourceV, RawYL, RawYR,
+        ProvenanceR, pl, i.uv);
     float raw_ur = provenance_locked_chroma(
-        point_load_f32(RawUR, i.uv), SourceU, RawYR, pr, i.uv);
+        point_load_f32(RawUR, i.uv), SourceU, RawYR, RawYL,
+        ProvenanceL, pr, i.uv);
     float raw_vr = provenance_locked_chroma(
-        point_load_f32(RawVR, i.uv), SourceV, RawYR, pr, i.uv);
+        point_load_f32(RawVR, i.uv), SourceV, RawYR, RawYL,
+        ProvenanceL, pr, i.uv);
     o.UL = corrected_sample(
         raw_ul, SourceU, pl, i.uv, guard.x, source_l);
     o.VL = corrected_sample(

@@ -9,6 +9,7 @@ never allowed to wait for matting.
 from __future__ import annotations
 
 import collections
+import concurrent.futures
 from dataclasses import dataclass, replace
 import json
 import logging
@@ -195,7 +196,15 @@ class MatteAdvector:
         self._max_transport_ms = max(80.0, min(700.0, max_age))
         self._dense_enabled = os.environ.get(
             "SYLC_SYNTH3D_CONTOUR_LOCK", "1") != "0"
+        mode = os.environ.get(
+            "SYLC_SYNTH3D_CONTOUR_LOCK_MODE", "parallel").strip().lower()
+        self._lock_mode = (mode if mode in (
+            "parallel", "bidirectional") else "parallel")
         self._dis = None
+        self._dis_reverse = None
+        self._flow_pool = (concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="MatteContourReverse")
+            if self._lock_mode == "parallel" else None)
         self._last_lock_ms = 0.0
         self._last_confidence = 0.0
         self._last_local_reject_pct = 0.0
@@ -302,6 +311,7 @@ class MatteAdvector:
             "error": self._last_error,
             "rejected": self._rejected,
             "track_side": self._track_side,
+            "mode": self._lock_mode,
         }
 
     def _frame_near(self, pts_ms: float):
@@ -319,6 +329,13 @@ class MatteAdvector:
             self._dis.setUseSpatialPropagation(True)
         return self._dis
 
+    def _ensure_reverse_dis(self):
+        if self._dis_reverse is None:
+            self._dis_reverse = cv2.DISOpticalFlow_create(
+                cv2.DISOPTICAL_FLOW_PRESET_ULTRAFAST)
+            self._dis_reverse.setUseSpatialPropagation(True)
+        return self._dis_reverse
+
     @staticmethod
     def _masked_percentile(values: np.ndarray, mask: np.ndarray, q: float,
                            fallback: float) -> float:
@@ -330,7 +347,18 @@ class MatteAdvector:
             return float(fallback)
         if sampled.size > 4096:
             sampled = sampled[::int(math.ceil(sampled.size / 4096.0))]
-        return float(np.percentile(sampled, q))
+        # NumPy's generic percentile path performs dtype/axis/unique-index
+        # bookkeeping that costs more than the sampled statistic itself here.
+        # Reproduce its default linear percentile with one direct partition.
+        position = (sampled.size - 1) * (float(q) * 0.01)
+        lower = int(math.floor(position))
+        upper = int(math.ceil(position))
+        partitioned = np.partition(sampled, (lower, upper))
+        if lower == upper:
+            return float(partitioned[lower])
+        fraction = position - lower
+        return float(partitioned[lower] +
+                     (partitioned[upper] - partitioned[lower]) * fraction)
 
     @staticmethod
     def _advect_sparse_contour_alpha(
@@ -473,8 +501,18 @@ class MatteAdvector:
         dis = self._ensure_dis()
         # Backward flow answers exactly the inverse-warp question required by
         # remap: for each current pixel, where was it in the matte frame?
-        backward = dis.calc(current, base, None)
-        forward = dis.calc(base, current, None)
+        if self._lock_mode == "parallel":
+            # The two fields are independent. Keep the current->base field on
+            # the presentation thread and overlap the inverse field on one
+            # persistent worker with its own DIS instance (OpenCV objects are
+            # stateful). This preserves the historical flow arrays bit for bit.
+            reverse_dis = self._ensure_reverse_dis()
+            forward_future = self._flow_pool.submit(
+                reverse_dis.calc, base, current, None)
+            backward = dis.calc(current, base, None)
+            forward = forward_future.result()
+        else:
+            backward = dis.calc(current, base, None)
         th, tw = current.shape
         # Broadcasting avoids allocating two full meshgrids on every frame.
         map_x = backward[..., 0] + np.arange(tw, dtype=np.float32)[None, :]
@@ -485,11 +523,6 @@ class MatteAdvector:
         base_at_current = cv2.remap(
             base, map_x, map_y, cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        forward_at_base = cv2.remap(
-            forward, map_x, map_y, cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        fb_error = np.hypot(backward[..., 0] + forward_at_base[..., 0],
-                            backward[..., 1] + forward_at_base[..., 1])
         photo_error = cv2.absdiff(current, base_at_current).astype(
             np.float32) * (1.0 / 255.0)
 
@@ -513,9 +546,18 @@ class MatteAdvector:
             photo_error, valid_global, 65.0, 1.0)
         photo_edge = self._masked_percentile(
             photo_error, valid_boundary, 75.0, photo_global)
+        if self._lock_mode == "bidirectional":
+            forward = dis.calc(base, current, None)
+        forward_at_base = cv2.remap(
+            forward, map_x, map_y, cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        fb_error = np.hypot(
+            backward[..., 0] + forward_at_base[..., 0],
+            backward[..., 1] + forward_at_base[..., 1])
         fb_edge = self._masked_percentile(
             fb_error, valid_boundary, 75.0, 99.0)
-        coverage = float(np.mean(inside[boundary])) if np.any(boundary) else 0.0
+        coverage = (float(np.mean(inside[boundary]))
+                    if np.any(boundary) else 0.0)
         # Network latency makes a 300-420 ms source age normal on the measured
         # 4K path.  Decay from 120 ms onward, then enforce the hard horizon
         # above: old masks need progressively stronger image evidence, without
@@ -729,21 +771,23 @@ class MatAnyone2Service:
         self._fps_pinned = bool(fps_pinned)
         self._short_side_pinned = bool(short_side_pinned)
         # Matting needs accurate contours more than native raster resolution.
-        # Reality gate (06/08): live 1710x720 measurements showed 62–118 ms at
-        # 720p (typically 9–12 delivered fps for 23.976 content, with 42% of
-        # latest-only submissions replaced).  640p removes 21% of model pixels
-        # while the native distance field restores full-resolution contour
-        # placement. The explicit SHORT_SIDE/AUTO_CAP envs remain exact opt-outs.
+        # Reality gate (07/08): on RTX 4090 and real 1920x808 content, compiled
+        # 512p preserves 99.32% binary IoU against 640p while reducing the
+        # steady CUDA wall time. The native distance field and current-frame
+        # contour lock restore full-resolution placement. Explicit
+        # SHORT_SIDE/AUTO_CAP envs remain exact opt-outs.
         try:
-            auto_cap = int(os.environ.get("SYLC_MATANYONE2_AUTO_CAP", "640"))
+            auto_cap = int(os.environ.get("SYLC_MATANYONE2_AUTO_CAP", "512"))
         except ValueError:
-            auto_cap = 640
+            auto_cap = 512
         self.auto_cap = max(256, min(2160, auto_cap))
         if not self._short_side_pinned:
             self.short_side = min(self.short_side, self.auto_cap)
-        transport = os.environ.get("SYLC_MATANYONE2_TRANSPORT", "yuv420")
+        transport = os.environ.get(
+            "SYLC_MATANYONE2_TRANSPORT", "yuv420")
         transport = transport.strip().lower()
-        self.transport = transport if transport in ("yuv420", "rgb8", "jpeg") \
+        self.transport = transport if transport in (
+            "yuv420-capped", "yuv420", "rgb8", "jpeg") \
             else "yuv420"
         self.max_pts_delta_ms = max(100.0, float(max_pts_delta_ms))
         self.warmup = max(0, min(10, int(warmup)))
@@ -843,7 +887,28 @@ class MatAnyone2Service:
             if not self._submission_due_locked(schedule_pts):
                 return False
             try:
-                copied = tuple(np.ascontiguousarray(np.asarray(p)).copy() for p in planes)
+                source = tuple(np.asarray(p) for p in planes)
+                if self.transport == "yuv420-capped":
+                    y, u, v = source
+                    out_w, out_h = _matte_dimensions(
+                        y.shape[1], y.shape[0], self.short_side)
+                    if (out_w, out_h) != (y.shape[1], y.shape[0]):
+                        y = cv2.resize(y, (out_w, out_h),
+                                       interpolation=cv2.INTER_AREA)
+                        u = cv2.resize(u, (out_w // 2, out_h // 2),
+                                       interpolation=cv2.INTER_AREA)
+                        v = cv2.resize(v, (out_w // 2, out_h // 2),
+                                       interpolation=cv2.INTER_AREA)
+                        # cv2 owns the three new allocations after the decoder
+                        # returns, so no redundant copy is required.
+                        copied = tuple(np.ascontiguousarray(p)
+                                       for p in (y, u, v))
+                    else:
+                        copied = tuple(np.ascontiguousarray(p).copy()
+                                       for p in (y, u, v))
+                else:
+                    copied = tuple(np.ascontiguousarray(p).copy()
+                                   for p in source)
                 peak = (int(sample_peak) if sample_peak is not None
                         else _sample_peak(copied[0]))
             except Exception as exc:
@@ -1036,7 +1101,7 @@ class MatAnyone2Service:
                 if control is not None:
                     self._send_header(control)
                     continue
-                if self.transport == "yuv420":
+                if self.transport in ("yuv420", "yuv420-capped"):
                     y, u, v = (np.ascontiguousarray(np.asarray(p))
                                for p in planes)
                     if (y.ndim != 2 or u.shape != (y.shape[0] // 2,

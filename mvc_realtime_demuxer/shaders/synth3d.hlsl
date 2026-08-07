@@ -26,6 +26,15 @@ Texture2D<float4> Plate : register(t5);
 // Map-to-map transport for the accum pass: RG = flow in grid pixels
 // quantized (v/128)+0.5, B = flow reliability, A = reserved.
 Texture2D<float4> Transport : register(t6);
+// Experimental one-frame reveal evidence. Future YUV uses the same source
+// format/plane_scale as SrcY/U/V. LookaheadFlow is sampled at the visible
+// background donor: RG=current->future motion in inference-grid pixels,
+// B=NVOFA reliability, A reserved. These bindings are null and the cbuffer
+// gate is zero unless SYLC_SYNTH3D_LOOKAHEAD=1 armed the current PTS.
+Texture2D<float> FutureY : register(t7);
+Texture2D<float> FutureU : register(t8);
+Texture2D<float> FutureV : register(t9);
+Texture2D<float4> LookaheadFlow : register(t10);
 SamplerState linSmp : register(s0);
 
 cbuffer SynthCB : register(b0) {
@@ -47,6 +56,16 @@ cbuffer SynthCB : register(b0) {
     float plate_ceiling; // c4.y  nearness ceiling for plate refresh
     float far_snap_on;   // c4.z  v4 sub-texel background reclaim (1=on)
     float _pad4;         // c4.w
+    // c5 is consumed by the downstream Stereo Lab through C++ parameters;
+    // keeping its native layout explicit makes c6 unambiguous here.
+    float comfort_soft_disp; // c5.x
+    float comfort_hard_disp; // c5.y
+    int comfort_enabled;     // c5.z
+    float _pad5;             // c5.w
+    int lookahead_fill;      // c6.x  future evidence valid for this exact PTS
+    float lookahead_min_conf;// c6.y  conservative acceptance knee
+    float lookahead_strength;// c6.z  maximum reveal blend
+    float _pad6;             // c6.w
 };
 
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -594,8 +613,8 @@ WarpInfo warp_info(float2 uvd, float eyeSign) {
     return o;
 }
 
-// Sidecar metadata for Stereo Lab. The v5.2.1c luma/chroma shaders remain the
-// image-forming reference and never write these targets. This independent pass
+// Sidecar metadata for Stereo Lab. With lookahead_fill=0 the luma/chroma path
+// remains the byte-exact v5.2.1c image-forming reference. This independent pass
 // evaluates the SAME inverse warp and exports only its source ownership, so
 // reconnecting the Lab cannot change one raw c pixel.
 //
@@ -651,6 +670,42 @@ float2 estimate_matte_background_chroma(float2 uv, float dir, float2 fallback) {
     return weights > 0.08 ? sum / weights : fallback;
 }
 
+// Ask t+1 for a pixel only after the ordinary inverse warp has already found
+// a disocclusion. Motion is measured on the visible background donor because
+// no current-frame flow exists inside the hole itself; extending that local
+// motion to the adjacent destination is the same contract as the CPU A/B
+// reference. The photo-consistency guard makes a still-visible foreground a
+// rejection, not a temporal smear. Return RGB=raw future YUV, A=blend trust.
+float4 lookahead_candidate(WarpInfo w, float3 donor_yuv) {
+    if (lookahead_fill == 0 || w.fill <= 0.001)
+        return 0.0;
+    float4 flow = LookaheadFlow.SampleLevel(
+        linSmp, saturate(w.background_uv), 0);
+    float2 motion_uv = flow.xy * depth_texel;
+    float2 future_uv = w.destination_uv + motion_uv;
+    float inside = (future_uv.x >= 0.0 && future_uv.x <= 1.0 &&
+                    future_uv.y >= 0.0 && future_uv.y <= 1.0 &&
+                    in_active_content(future_uv)) ? 1.0 : 0.0;
+    // Gross vectors are almost always a cost outlier/cut. Fast pans validated
+    // on Oblivion remain far below this 16%-of-frame ceiling.
+    float plausible_motion = 1.0 - smoothstep(
+        0.12, 0.16, length(motion_uv));
+    float3 candidate = float3(
+        FutureY.SampleLevel(linSmp, saturate(future_uv), 0),
+        FutureU.SampleLevel(linSmp, saturate(future_uv), 0),
+        FutureV.SampleLevel(linSmp, saturate(future_uv), 0));
+    float luma_delta = abs(candidate.x - donor_yuv.x) * plane_scale;
+    float chroma_delta = length(candidate.yz - donor_yuv.yz) * plane_scale;
+    // exp(-delta/0.12), expressed as exp2 for Shader Model 5. The same sigma
+    // and 0.24 knee produced 43.8% safe hole coverage on the moving real-film
+    // benchmark; below the knee the established spatial/plate fill is exact.
+    float colour_conf = exp2(-12.02 * (luma_delta + 0.45 * chroma_delta));
+    float confidence = saturate(flow.z) * colour_conf * inside * plausible_motion;
+    float trust = smoothstep(
+        lookahead_min_conf, 0.80, confidence) * lookahead_strength;
+    return float4(candidate, saturate(trust));
+}
+
 float reconstruct_luma(WarpInfo w) {
     float primary = SrcY.SampleLevel(linSmp, w.base_uv, 0);
     float background = primary;
@@ -671,6 +726,14 @@ float reconstruct_luma(WarpInfo w) {
         if (trust > 0.001)
             background = lerp(background,
                               plate_sample(w.destination_uv).r, trust);
+    }
+    if (w.fill > 0.001) {
+        float3 donor = float3(
+            SrcY.SampleLevel(linSmp, w.background_uv, 0),
+            SrcU.SampleLevel(linSmp, w.background_uv, 0),
+            SrcV.SampleLevel(linSmp, w.background_uv, 0));
+        float4 reveal = lookahead_candidate(w, donor);
+        background = lerp(background, reveal.x, reveal.a);
     }
     float historical = lerp(primary, background, w.fill);
     if (matte_mode < 2 || w.matte_boundary <= 0.001) return historical;
@@ -725,6 +788,14 @@ float2 reconstruct_chroma(WarpInfo w) {
         if (trust > 0.001)
             background = lerp(background,
                               plate_sample(w.destination_uv).gb, trust);
+    }
+    if (w.fill > 0.001) {
+        float3 donor = float3(
+            SrcY.SampleLevel(linSmp, w.background_uv, 0),
+            SrcU.SampleLevel(linSmp, w.background_uv, 0),
+            SrcV.SampleLevel(linSmp, w.background_uv, 0));
+        float4 reveal = lookahead_candidate(w, donor);
+        background = lerp(background, reveal.yz, reveal.a);
     }
     float2 historical = lerp(primary, background, w.fill);
     if (matte_mode < 2 || w.matte_boundary <= 0.001) return historical;

@@ -558,10 +558,11 @@ if(BUILD_NATIVE_RENDERER)
         set(${output_var} "${_output}" PARENT_SCOPE)
     endfunction()
 
-    set(_native_vert "${CMAKE_CURRENT_SOURCE_DIR}/../native_renderer/shaders/yuv_framepack.vert.hlsl")
-    set(_native_frag "${CMAKE_CURRENT_SOURCE_DIR}/../native_renderer/shaders/yuv_framepack.frag.hlsl")
+    set(_native_vert "${CMAKE_CURRENT_SOURCE_DIR}/../src/sylc/native_renderer/shaders/yuv_framepack.vert.hlsl")
+    set(_native_frag "${CMAKE_CURRENT_SOURCE_DIR}/../src/sylc/native_renderer/shaders/yuv_framepack.frag.hlsl")
     set(_sbs_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/shaders/yuv_to_nv12_sbs.hlsl")
     set(_synth_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/shaders/synth3d.hlsl")
+    set(_synth_owner_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/shaders/synth3d_ownership.hlsl")
     set(_stereo_lab_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/shaders/stereo_lab.hlsl")
 
     sylc_compile_hlsl(SYLC_NATIVE_VS_CSO native_vs "${_native_vert}" main vs_5_0)
@@ -577,6 +578,11 @@ if(BUILD_NATIVE_RENDERER)
     sylc_compile_hlsl(SYLC_SYNTH3D_PS_DEPTH_VIEW_CHROMA_CSO synth3d_ps_depth_view_chroma "${_synth_hlsl}" PS_DepthViewChroma ps_5_0)
     sylc_compile_hlsl(SYLC_SYNTH3D_PS_PLATE_ACCUM_CSO synth3d_ps_plate_accum "${_synth_hlsl}" PS_PlateAccum ps_5_0)
     sylc_compile_hlsl(SYLC_SYNTH3D_PS_PROVENANCE_CSO synth3d_ps_provenance "${_synth_hlsl}" PS_WarpProvenance ps_5_0)
+    sylc_compile_hlsl(SYLC_SYNTH3D_CS_OWNER_UNCERTAINTY_CSO synth3d_cs_owner_uncertainty "${_synth_owner_hlsl}" CS_OwnerUncertainty cs_5_0)
+    sylc_compile_hlsl(SYLC_SYNTH3D_CS_OWNER_DILATE_CSO synth3d_cs_owner_dilate "${_synth_owner_hlsl}" CS_OwnerDilate cs_5_0)
+    sylc_compile_hlsl(SYLC_SYNTH3D_CS_OWNER_LOCAL_CSO synth3d_cs_owner_local "${_synth_owner_hlsl}" CS_OwnerLocal cs_5_0)
+    sylc_compile_hlsl(SYLC_SYNTH3D_CS_OWNER_PROPAGATE_CSO synth3d_cs_owner_propagate "${_synth_owner_hlsl}" CS_OwnerPropagate cs_5_0)
+    sylc_compile_hlsl(SYLC_SYNTH3D_CS_OWNER_COMPOSE_CSO synth3d_cs_owner_compose "${_synth_owner_hlsl}" CS_OwnerCompose cs_5_0)
     sylc_compile_hlsl(SYLC_STEREO_LAB_PS_LUMA_CSO stereo_lab_ps_luma "${_stereo_lab_hlsl}" PS_LabLuma ps_5_0)
     sylc_compile_hlsl(SYLC_STEREO_LAB_PS_CHROMA_CSO stereo_lab_ps_chroma "${_stereo_lab_hlsl}" PS_LabChroma ps_5_0)
     sylc_compile_hlsl(SYLC_STEREO_LAB_PS_METRICS_CSO stereo_lab_ps_metrics "${_stereo_lab_hlsl}" PS_LabMetrics ps_5_0)
@@ -591,6 +597,11 @@ if(BUILD_NATIVE_RENDERER)
         "${SYLC_SYNTH3D_PS_DEPTH_VIEW_CHROMA_CSO}"
         "${SYLC_SYNTH3D_PS_PLATE_ACCUM_CSO}"
         "${SYLC_SYNTH3D_PS_PROVENANCE_CSO}"
+        "${SYLC_SYNTH3D_CS_OWNER_UNCERTAINTY_CSO}"
+        "${SYLC_SYNTH3D_CS_OWNER_DILATE_CSO}"
+        "${SYLC_SYNTH3D_CS_OWNER_LOCAL_CSO}"
+        "${SYLC_SYNTH3D_CS_OWNER_PROPAGATE_CSO}"
+        "${SYLC_SYNTH3D_CS_OWNER_COMPOSE_CSO}"
         "${SYLC_STEREO_LAB_PS_LUMA_CSO}"
         "${SYLC_STEREO_LAB_PS_CHROMA_CSO}"
         "${SYLC_STEREO_LAB_PS_METRICS_CSO}"
@@ -640,6 +651,21 @@ if(BUILD_NATIVE_RENDERER)
     # nothing NVIDIA-licensed is compiled/linked in. See third_party/nv-codec-headers/LICENSE.
     target_include_directories(mvc_demuxer_cpp PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nv-codec-headers)
+
+    # Optional NVIDIA Optical Flow Accelerator probe/backend.  It uses the
+    # driver API only (no cudart) and dynamically loads nvofapi64.dll, so a
+    # build/run without CUDA or NVIDIA keeps the existing CPU flow unchanged.
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        target_sources(mvc_demuxer_cpp PRIVATE src/nvof_flow.cpp)
+        target_include_directories(mvc_demuxer_cpp PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/NVIDIAOpticalFlowSDK)
+        target_link_libraries(mvc_demuxer_cpp PRIVATE CUDA::cuda_driver)
+        target_compile_definitions(mvc_demuxer_cpp PRIVATE SYLC_NVOF_CUDA)
+        message(STATUS "NVIDIA Optical Flow CUDA backend: ENABLED")
+    else()
+        message(STATUS "NVIDIA Optical Flow CUDA backend: disabled (CUDA toolkit not found)")
+    endif()
     message(STATUS "Native D3D11 renderer: ENABLED (FXC=${SYLC_FXC_EXECUTABLE})")
 else()
     message(STATUS "Native D3D11 renderer: disabled")

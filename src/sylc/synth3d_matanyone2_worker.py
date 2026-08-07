@@ -65,6 +65,9 @@ class Runtime:
         self.device = torch.device("cuda")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        # Media geometry is stable for the lifetime of an inference core.
+        # Let cuDNN retain the fastest convolution algorithms for that shape.
+        torch.backends.cudnn.benchmark = True
         torch.set_float32_matmul_precision("high")
 
         checkpoint = Path(args.checkpoint)
@@ -74,6 +77,19 @@ class Runtime:
         self.model = get_matanyone2_model(str(checkpoint), self.device)
         with torch.no_grad():
             self.model.cfg.max_internal_size = int(args.short_side)
+        self.compiled = False
+        # Opt-in: on the measured 4090 this saved only ~1–2% steady-state at
+        # 512p while adding roughly two seconds to the already expensive first
+        # seeded frame. Keep the capability for future Torch/model revisions.
+        if os.environ.get("SYLC_MATANYONE2_COMPILE", "0") != "0":
+            try:
+                self.model = torch.compile(
+                    self.model, mode="reduce-overhead", fullgraph=False)
+                self.compiled = True
+            except Exception as exc:
+                # Compilation is an acceleration, never a startup dependency.
+                print(f"[MATANYONE2] torch.compile fallback: {exc!r}",
+                      file=sys.stderr, flush=True)
 
         self.seed_model = lraspp_mobilenet_v3_large(weights=None, num_classes=21)
         seed_state = torch.load(seed_checkpoint, map_location="cpu", weights_only=True)
@@ -211,7 +227,7 @@ class Runtime:
         return self._run_model(image, scene_cut, upload_begin, upload_end)
 
     def process_yuv420(self, y, u, v, out_height, out_width,
-                       sample_peak, pts_ms):
+                       sample_peak, pts_ms, packed=None):
         """Upload planar decoded video and perform BT.709 conversion on CUDA."""
         torch, F, np = self.torch, self.F, self.np
         peak = float(sample_peak)
@@ -221,16 +237,29 @@ class Runtime:
         upload_begin = torch.cuda.Event(enable_timing=True)
         upload_end = torch.cuda.Event(enable_timing=True)
         upload_begin.record()
-        def plane_tensor(plane):
-            return torch.from_numpy(np.ascontiguousarray(plane)).to(
-                self.device, non_blocking=False).float().div_(peak)[None, None]
+        if packed is not None:
+            # The wire payload is one contiguous Y+U+V allocation. Upload it
+            # once, then expose device-side views; three independent .to()
+            # calls used to add allocations and copy-launch latency.
+            values = torch.from_numpy(packed).to(
+                self.device, non_blocking=False).float().div_(peak)
+            y_count = y.size
+            uv_count = u.size
+            yy_src = values[:y_count].reshape(y.shape)[None, None]
+            uu_src = values[y_count:y_count + uv_count].reshape(u.shape)[None, None]
+            vv_src = values[y_count + uv_count:].reshape(v.shape)[None, None]
+        else:
+            def plane_tensor(plane):
+                return torch.from_numpy(np.ascontiguousarray(plane)).to(
+                    self.device, non_blocking=False).float().div_(peak)[None, None]
+            yy_src, uu_src, vv_src = (plane_tensor(p) for p in (y, u, v))
 
         target = (int(out_height), int(out_width))
-        yy = F.interpolate(plane_tensor(y), target, mode="bilinear",
+        yy = F.interpolate(yy_src, target, mode="bilinear",
                            align_corners=False, antialias=True)
-        uu = F.interpolate(plane_tensor(u), target, mode="bilinear",
+        uu = F.interpolate(uu_src, target, mode="bilinear",
                            align_corners=False, antialias=True)
-        vv = F.interpolate(plane_tensor(v), target, mode="bilinear",
+        vv = F.interpolate(vv_src, target, mode="bilinear",
                            align_corners=False, antialias=True)
         c = torch.relu(yy - 16.0 / 255.0) * 1.164383
         d = uu - 128.0 / 255.0
@@ -292,7 +321,9 @@ def main():
                         width <= 0 or height <= 0 or
                         len(payload) != samples * np.dtype(dtype).itemsize):
                     raise ValueError("invalid planar YUV420 frame dimensions")
-                packed = np.frombuffer(payload, dtype=dtype).copy()
+                # ``payload`` remains alive until this frame finishes, so its
+                # immutable backing store safely owns these zero-copy views.
+                packed = np.frombuffer(payload, dtype=dtype)
                 luma_count = source_width * source_height
                 chroma_count = luma_count // 4
                 y = packed[:luma_count].reshape(source_height, source_width)
@@ -325,7 +356,7 @@ def main():
             if yuv_planes is not None:
                 (alpha, seeded, cut, upload_ms, model_ms,
                  readback_ms) = runtime.process_yuv420(
-                    *yuv_planes, float(message["pts_ms"]))
+                    *yuv_planes, float(message["pts_ms"]), packed=packed)
             else:
                 (alpha, seeded, cut, upload_ms, model_ms,
                  readback_ms) = runtime.process_rgb(
