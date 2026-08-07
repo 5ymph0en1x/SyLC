@@ -2,14 +2,14 @@
 
 # SyLC 3D Player
 
-<p align="center"><img src="splash.png" alt="SyLC 3D Player Logo" width="250" /></p>
-<p align="center"><img src="GUI.jpg" alt="SyLC 3D Player Interface" width="1000" /></p>
+<p align="center"><img src="assets/splash.png" alt="SyLC 3D Player Logo" width="250" /></p>
+<p align="center"><img src="assets/GUI.jpg" alt="SyLC 3D Player Interface" width="1000" /></p>
 
 ### A free, open-source player for the 3D format the industry left behind.
 
 *Stereoscopic 3D Blu-ray (MVC) playback, decoded from scratch, rendered in native HDR — given to the community, no strings attached.*
 
-![Version](https://img.shields.io/badge/version-5.2.1-1f6feb?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-5.3.0-1f6feb?style=for-the-badge)
 ![Platform](https://img.shields.io/badge/Windows-x64-0078D6?style=for-the-badge&logo=windows&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.14-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/license-free%20%26%20open--source-2ea44f?style=for-the-badge)
@@ -110,7 +110,7 @@ confirmed cut.
 Everything above is instrumented and readable at runtime — the 2D→3D menu
 footer reports the provider, the active preset and grid, the delivered depth
 rate and the age of the current map, and the log carries the full per-stage
-breakdown. That instrumentation is not decoration: all three fixes in 5.2.1
+breakdown. That instrumentation is not decoration: the fixes promoted in 5.3.0
 were found by reading it, and two of them turned out to be the opposite of what
 the symptom suggested.
 
@@ -154,7 +154,9 @@ This is the kind of work that doesn't show up in a feature list — but it's the
   prebuilt engines for it or compiles them locally, then proves a real engine
   builds and infers correctly on your machine before the player will use it.
   No Python toolchain, and never required.
-  **5.2.1 makes the conversion keep up with the film.** The converter now
+  **5.3.0 makes the conversion coherent as well as real-time.** The converter
+  now combines the restored v5.2.1c image-forming reference with Stereo Lab's
+  cyclopean source ownership and sparse advective MatAnyone2 contours. It also
   reaches the source cadence on ordinary 1080p H.264 films instead of
   hovering around 19-20 depth maps per second (see the war story below), it
   no longer tears the first frame of every new shot, and a click in the
@@ -191,7 +193,7 @@ This is the kind of work that doesn't show up in a feature list — but it's the
 
 | Flavor | Asset | Notes |
 |---|---|---|
-| **Portable folder** | `SyLC_3D_Player_v5.2.0_win-x64.zip` | Unzip anywhere and run `SyLC_3D_Player.exe` — no extraction step, no installer. |
+| **Portable folder** | `SyLC_3D_Player_v5.3.0_win-x64.zip` | Unzip anywhere and run `SyLC_3D_Player.exe` — no extraction step, no installer. |
 
 Everything needed to play video — decoder, demuxer, audio, codecs, Python
 runtime — is bundled.
@@ -208,7 +210,7 @@ The Windows module requires **AVX2**. edge264 contains baseline, x86-64-v2 and
 x86-64-v3 implementations and dispatches to the best supported one at runtime. Its
 SIMD hot loop therefore runs natively on Zen 2/Z2 A and other supported AVX2 CPUs:
 real silicon, no translation layer.
-*(The ARM64/NEON port lives in the codebase, but **5.2.0 ships Windows x64 only**.)*
+*(The ARM64/NEON port lives in the codebase, but **5.3.0 ships Windows x64 only**.)*
 
 ---
 
@@ -229,7 +231,7 @@ Ryzen Z2 A / low-power Zen 2 qualification and tuning:
 ## Get started
 
 1. Download the asset for your platform from **Releases**.
-2. Unzip `SyLC_3D_Player_v5.2.0_win-x64.zip` anywhere and run `SyLC_3D_Player.exe`.
+2. Unzip `SyLC_3D_Player_v5.3.0_win-x64.zip` anywhere and run `SyLC_3D_Player.exe`.
 3. For **2D→3D AI conversion**: open the **2D→3D menu → Depth models…** and pick
    a pack. Start with **Small** (960 MB) — every preset works on it. Skip this
    if you only play 3D content; nothing else needs it.
@@ -249,19 +251,19 @@ The short version (x64):
 :: edge264 decoder (MSYS2 / MinGW64) — portable runtime-dispatched build
 cd edge264
 build_sylc_edge264.bat
-copy /Y edge264_candidate.dll ..\edge264.dll
+copy /Y edge264_candidate.dll ..\runtime\edge264.dll
 cd ..
 
 :: standalone no-console build (Nuitka + MSVC 2022)
-build_exe_v520.bat
+scripts\build\build_exe_v530.bat
 ```
 
-`build_exe_v520.bat` is the current release script — and the only one used to
-build v5.2.0: a one-folder standalone build that bundles `onnxruntime.dll`,
+`scripts/build/build_exe_v530.bat` is the current release script for v5.3.0: a one-folder
+standalone build that bundles `onnxruntime.dll`,
 `DirectML.dll` and `models/MANIFEST.json` — the inference runtime and the
 download manifest, but no model weights.
 
-The older `build_exe_onefile.bat` is **not part of the v5.2.0 release**. It is
+The older `scripts/build/build_exe_onefile.bat` is **not part of the v5.3.0 release**. It is
 still stamped 5.0.0 and bundles none of the three files above, so a binary built
 from it reports `models/MANIFEST.json is missing from this install` and cannot
 do AI conversion at all. That is why the release ships one asset, the portable

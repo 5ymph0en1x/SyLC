@@ -67,6 +67,11 @@ void DepthStabilizer::reset() {
     last_scene_change_ = 0.0f;
     last_confidence_ = 1.0f;
     last_cut_ = false;
+    last_depth_cut_ = false;
+    last_scene_cut_ = false;
+    last_depth_residual_ = 0.0f;
+    residual_baseline_ = 0.0f;
+    residual_baseline_primed_ = false;
     tone_primed_ = false;
     convergence_primed_ = false;
     auto_convergence_ = 0.5f;
@@ -233,6 +238,9 @@ bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
     last_motion_ = 0.0f;
     last_effective_alpha_ = 0.0f;
     last_history_support_ = 1.0f;
+    last_depth_cut_ = false;
+    last_scene_cut_ = false;
+    last_depth_residual_ = 0.0f;
     if (confidence) {
         double confidence_sum = 0.0;
         for (size_t i = 0; i < n; ++i)
@@ -342,6 +350,7 @@ bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
             // either side to normalize a residual against, and nothing
             // changed. No cut; blend normally below.
             cut = false;
+            last_depth_residual_ = 0.0f;
         } else if (ema_flat && !raw_flat) {
             // Degenerate (constant) reference meeting a structured frame.
             // The OLS fit of a structured `raw` onto a *constant* `ema`
@@ -353,20 +362,52 @@ bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
             // reference carries no information to reject real incoming
             // structure, so treat it as a cut.
             cut = true;
+            last_depth_residual_ = -1.0f;
         } else {
             // Normalize by whichever side actually has spread to compare
             // against (dimensionally consistent: model units / model units)
             // instead of an absolute-residual fallback.
             const double denom = std::max(stddev_ema, stddev_raw);
             const double normalized = mean_residual / denom;
+            last_depth_residual_ = static_cast<float>(normalized);
             cut = normalized > static_cast<double>(cut_threshold);
+            // Adaptive gate (see cut_baseline_gain in the header): on content
+            // whose ambient residual rides high, an absolute crossing only
+            // counts as a cut if it is also an outlier against the recent
+            // baseline.
+            if (cut && cut_baseline_gain > 0.0f && residual_baseline_primed_ &&
+                normalized <= static_cast<double>(cut_baseline_gain) *
+                              static_cast<double>(residual_baseline_))
+                cut = false;
+            if (!cut) {
+                // Track the ambient level in VIDEO time (same discipline as
+                // the tone range: identical half-life whether one second
+                // arrives as 8 maps or 19). Cut frames are excluded -- the
+                // baseline describes the regime BETWEEN cuts, and the
+                // post-snap residual collapse re-enters it naturally.
+                constexpr float kResidualBaselineAlpha = 0.05f;
+                if (!residual_baseline_primed_) {
+                    residual_baseline_ = static_cast<float>(normalized);
+                    residual_baseline_primed_ = true;
+                } else {
+                    const float alpha_eff = unit_time
+                        ? kResidualBaselineAlpha
+                        : 1.0f - std::pow(1.0f - kResidualBaselineAlpha,
+                                          video_ts);
+                    residual_baseline_ += alpha_eff *
+                        (static_cast<float>(normalized) - residual_baseline_);
+                }
+            }
         }
+
+        last_depth_cut_ = cut;
 
         // The source-image signal is independent of the model's arbitrary
         // scale/shift. Requiring either detector (rather than both) prevents a
         // hard edit from being blended merely because two shots happen to have
         // similar depth statistics.
-        cut = cut || last_scene_change_ >= scene_cut_threshold;
+        last_scene_cut_ = last_scene_change_ >= scene_cut_threshold;
+        cut = cut || last_scene_cut_;
 
         if (cut) {
             std::copy(raw, raw + n, ema_.begin());
@@ -679,21 +720,65 @@ bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
 
     // Confidence-aware percentile targets. Low-confidence regions still keep
     // their depth but cannot stretch the stereo budget for the whole picture.
+    //
+    // The three percentiles (tone lo/hi here, auto-convergence a few blocks
+    // down) all select from the same multiset. A k-th order statistic is a
+    // value, not a reduction: any correct algorithm returns the same value, so
+    // counting selection is bitwise nth_element's answer at any worker count
+    // -- unlike the affine/Welford reductions above, which stay serial because
+    // float association order is part of THEIR result. Counting does ~3 passes
+    // of work where introselect does ~1, so it only wins once enough workers
+    // share it: below the measured crossover the sequential path costs less.
+    // Both paths produce the identical value (pinned by the bench selftest and
+    // by the cross-path bit-exact sweep), so the branch is invisible in the
+    // output.
+    constexpr int kSelectParallelThreshold = 4;
+    const bool parallel_sel = worker_threads >= kSelectParallelThreshold;
     tmp_.clear();
     if (confidence) {
-        tmp_.reserve(n);
-        for (size_t i = 0; i < n; ++i)
-            if (confidence[i] >= 0.30f) tmp_.push_back(ema_[i]);
+        if (parallel_sel) {
+            // Order-preserving parallel filter: identical sequence at any
+            // worker count (see parallel_select.h).
+            sylc_select::filter_ge(ema_.data(), confidence,
+                                   static_cast<int>(n), 0.30f, worker_threads,
+                                   tmp_, select_scratch_);
+        } else {
+            tmp_.reserve(n);
+            for (size_t i = 0; i < n; ++i)
+                if (confidence[i] >= 0.30f) tmp_.push_back(ema_[i]);
+        }
     }
     if (tmp_.size() < std::max<size_t>(64, n / 20))
         tmp_.assign(ema_.begin(), ema_.end());
     const size_t tone_n = tmp_.size();
     const size_t lo_i = static_cast<size_t>(0.02 * static_cast<double>(tone_n - 1));
     const size_t hi_i = static_cast<size_t>(0.98 * static_cast<double>(tone_n - 1));
-    std::nth_element(tmp_.begin(), tmp_.begin() + static_cast<ptrdiff_t>(lo_i), tmp_.end());
-    const float target_lo = tmp_[lo_i];
-    std::nth_element(tmp_.begin(), tmp_.begin() + static_cast<ptrdiff_t>(hi_i), tmp_.end());
-    const float target_hi = tmp_[hi_i];
+    const float conv_p = std::max(0.0f, std::min(
+        1.0f, auto_convergence_percentile));
+    const size_t conv_i = static_cast<size_t>(
+        static_cast<double>(conv_p) * static_cast<double>(tone_n - 1));
+    float sel_vals[3];
+    if (parallel_sel) {
+        const size_t sel_ranks[3] = {lo_i, hi_i, conv_i};
+        sylc_select::select_ranks(tmp_.data(), static_cast<int>(tone_n),
+                                  worker_threads, sel_ranks, 3, sel_vals,
+                                  select_scratch_);
+    } else {
+        std::nth_element(tmp_.begin(),
+                         tmp_.begin() + static_cast<ptrdiff_t>(lo_i),
+                         tmp_.end());
+        sel_vals[0] = tmp_[lo_i];
+        std::nth_element(tmp_.begin(),
+                         tmp_.begin() + static_cast<ptrdiff_t>(hi_i),
+                         tmp_.end());
+        sel_vals[1] = tmp_[hi_i];
+        std::nth_element(tmp_.begin(),
+                         tmp_.begin() + static_cast<ptrdiff_t>(conv_i),
+                         tmp_.end());
+        sel_vals[2] = tmp_[conv_i];
+    }
+    const float target_lo = sel_vals[0];
+    const float target_hi = sel_vals[1];
 
     if (!tone_primed_ || cut) {
         tone_lo_ = target_lo;
@@ -743,21 +828,14 @@ bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
         return t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
     };
 
-    // Auto-convergence suggestion. tmp_ still holds the confidence-filtered
-    // sample the tone percentiles selected from (nth_element only reorders).
-    // The transform is monotonic, so normalize_tone(percentile(sample)) IS the
-    // percentile of the normalized map.
+    // Auto-convergence suggestion, selected above in the same fused pass as
+    // the tone percentiles (same confidence-filtered sample). The transform is
+    // monotonic, so normalize_tone(percentile(sample)) IS the percentile of
+    // the normalized map.
     {
         float target = 0.5f;
         if (range >= 1e-6f && tone_n > 0) {
-            const float p = std::max(0.0f, std::min(
-                1.0f, auto_convergence_percentile));
-            const size_t conv_i = static_cast<size_t>(
-                static_cast<double>(p) * static_cast<double>(tone_n - 1));
-            std::nth_element(tmp_.begin(),
-                             tmp_.begin() + static_cast<ptrdiff_t>(conv_i),
-                             tmp_.end());
-            target = normalize_tone(tmp_[conv_i]);
+            target = normalize_tone(sel_vals[2]);
         }
         if (!convergence_primed_ || cut) {
             auto_convergence_ = target;
@@ -780,9 +858,20 @@ bool DepthStabilizer::step(const float* raw, uint16_t* out_q16,
     if (range < 1e-6f) {
         std::fill(out_q16, out_q16 + n, static_cast<uint16_t>(32768));
     } else {
-        for (size_t i = 0; i < n; ++i)
-            out_q16[i] = static_cast<uint16_t>(
-                normalize_tone(ema_[i]) * 65535.0f + 0.5f);
+        // Pure per-pixel write: no accumulation, no cross-pixel dependency, and
+        // normalize_tone() reads only values that are already final. Each pixel
+        // therefore takes the same operations in the same order whatever thread
+        // runs it, so this is BITWISE identical to the sequential loop at any
+        // worker_threads -- the guarantee the header makes for per-pixel
+        // outputs, unlike the diagnostic reductions above.
+        // It is not free work either: normalize_tone divides once per pixel.
+        parallel_chunks(static_cast<int>(n), worker_threads,
+                        [&](int, int i_begin, int i_end) {
+            for (size_t i = static_cast<size_t>(i_begin);
+                 i < static_cast<size_t>(i_end); ++i)
+                out_q16[i] = static_cast<uint16_t>(
+                    normalize_tone(ema_[i]) * 65535.0f + 0.5f);
+        });
     }
 
     return cut;

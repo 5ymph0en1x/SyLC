@@ -562,6 +562,7 @@ if(BUILD_NATIVE_RENDERER)
     set(_native_frag "${CMAKE_CURRENT_SOURCE_DIR}/../native_renderer/shaders/yuv_framepack.frag.hlsl")
     set(_sbs_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/shaders/yuv_to_nv12_sbs.hlsl")
     set(_synth_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/shaders/synth3d.hlsl")
+    set(_stereo_lab_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/shaders/stereo_lab.hlsl")
 
     sylc_compile_hlsl(SYLC_NATIVE_VS_CSO native_vs "${_native_vert}" main vs_5_0)
     sylc_compile_hlsl(SYLC_NATIVE_PS_CSO native_ps "${_native_frag}" main ps_5_0)
@@ -575,6 +576,11 @@ if(BUILD_NATIVE_RENDERER)
     sylc_compile_hlsl(SYLC_SYNTH3D_PS_DEPTH_VIEW_LUMA_CSO synth3d_ps_depth_view_luma "${_synth_hlsl}" PS_DepthViewLuma ps_5_0)
     sylc_compile_hlsl(SYLC_SYNTH3D_PS_DEPTH_VIEW_CHROMA_CSO synth3d_ps_depth_view_chroma "${_synth_hlsl}" PS_DepthViewChroma ps_5_0)
     sylc_compile_hlsl(SYLC_SYNTH3D_PS_PLATE_ACCUM_CSO synth3d_ps_plate_accum "${_synth_hlsl}" PS_PlateAccum ps_5_0)
+    sylc_compile_hlsl(SYLC_SYNTH3D_PS_PROVENANCE_CSO synth3d_ps_provenance "${_synth_hlsl}" PS_WarpProvenance ps_5_0)
+    sylc_compile_hlsl(SYLC_STEREO_LAB_PS_LUMA_CSO stereo_lab_ps_luma "${_stereo_lab_hlsl}" PS_LabLuma ps_5_0)
+    sylc_compile_hlsl(SYLC_STEREO_LAB_PS_CHROMA_CSO stereo_lab_ps_chroma "${_stereo_lab_hlsl}" PS_LabChroma ps_5_0)
+    sylc_compile_hlsl(SYLC_STEREO_LAB_PS_METRICS_CSO stereo_lab_ps_metrics "${_stereo_lab_hlsl}" PS_LabMetrics ps_5_0)
+    sylc_compile_hlsl(SYLC_STEREO_LAB_PS_PAIR_FIELD_CSO stereo_lab_ps_pair_field "${_stereo_lab_hlsl}" PS_PairField ps_5_0)
 
     set(SYLC_SHADER_OUTPUTS
         "${SYLC_NATIVE_VS_CSO}" "${SYLC_NATIVE_PS_CSO}"
@@ -583,7 +589,12 @@ if(BUILD_NATIVE_RENDERER)
         "${SYLC_SYNTH3D_PS_WARP_LUMA_CSO}" "${SYLC_SYNTH3D_PS_WARP_CHROMA_CSO}"
         "${SYLC_SYNTH3D_PS_DEPTH_VIEW_LUMA_CSO}"
         "${SYLC_SYNTH3D_PS_DEPTH_VIEW_CHROMA_CSO}"
-        "${SYLC_SYNTH3D_PS_PLATE_ACCUM_CSO}")
+        "${SYLC_SYNTH3D_PS_PLATE_ACCUM_CSO}"
+        "${SYLC_SYNTH3D_PS_PROVENANCE_CSO}"
+        "${SYLC_STEREO_LAB_PS_LUMA_CSO}"
+        "${SYLC_STEREO_LAB_PS_CHROMA_CSO}"
+        "${SYLC_STEREO_LAB_PS_METRICS_CSO}"
+        "${SYLC_STEREO_LAB_PS_PAIR_FIELD_CSO}")
     add_custom_target(sylc_shader_bytecode DEPENDS ${SYLC_SHADER_OUTPUTS})
 
     set(_sylc_shader_rc "${CMAKE_CURRENT_BINARY_DIR}/generated_shaders/shader_resources.rc")
@@ -617,6 +628,9 @@ if(BUILD_NATIVE_RENDERER)
     # (DepthEngine + DepthStabilizer), depth upload and
     # the DIBR warp / depth-view passes. Shader bytecode is embedded above.
     target_sources(mvc_demuxer_cpp PRIVATE src/synth3d.cpp)
+    # Stereo Lab: additive post-warp coherence guard. It consumes Synth3D's
+    # immutable raw planes/provenance and owns separate corrected outputs.
+    target_sources(mvc_demuxer_cpp PRIVATE src/stereo_lab.cpp)
     target_include_directories(mvc_demuxer_cpp PRIVATE third_party/onnxruntime/include)
     target_compile_definitions(mvc_demuxer_cpp PRIVATE SYLC_NATIVE_RENDERER)
     # Runtime needs only D3D11/DXGI; shader compilation is a build dependency.

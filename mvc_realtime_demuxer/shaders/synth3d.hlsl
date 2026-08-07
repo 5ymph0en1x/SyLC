@@ -1,5 +1,5 @@
 // synth3d.hlsl — depth prep, DIBR warp, depth view. Entry points:
-//   VS_Full / PS_DepthPrep / PS_WarpLuma / PS_WarpChroma
+//   VS_Full / PS_DepthPrep / PS_WarpLuma / PS_WarpChroma / PS_WarpProvenance
 //   PS_DepthViewLuma / PS_DepthViewChroma
 //
 // Source of truth. CMake tracks this file, compiles every entry point with FXC,
@@ -45,7 +45,8 @@ cbuffer SynthCB : register(b0) {
     int matte_mode;      // c3.w  0=off, 1=guard, 2=alpha-aware contour
     int temporal_fill;   // c4.x  round 5a background plate on/off
     float plate_ceiling; // c4.y  nearness ceiling for plate refresh
-    float2 _pad4;        // c4.zw
+    float far_snap_on;   // c4.z  v4 sub-texel background reclaim (1=on)
+    float _pad4;         // c4.w
 };
 
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -249,7 +250,54 @@ float guided_nearness(float2 uv) {
     // crack; it needs spatial consensus and therefore remains in robust n0/A.
     float near_or_consensus = smoothstep(-0.035, 0.005, B - n0);
     float snap = depth_edge * guide_edge * near_or_consensus;
-    return lerp(A, B, snap);
+    float result = lerp(A, B, snap);
+
+    // v4 (04/08) — sub-texel background reclaim. The CPU contour re-anchor
+    // (realign_contours) fixes the map at GRID scale; what remains is the
+    // pixel band inside the edge texel's footprint: background pixels
+    // carrying the foreground's depth (the residual fringe on cap brims and
+    // profiles). No local color model can arbitrate — the edge texel's own
+    // CENTER luma is already background-like — so the CPU cure transposes
+    // one scale down: representatives anchored BEYOND the contested texel
+    // (±2 texels, epipolar direction, clean at grid scale by the CPU pass),
+    // and the pixel's own full-resolution luma votes between them. Guards:
+    // a real layer separation between the reps, reclaim pulls toward FAR
+    // only, full-res ridges (hair/wire) and the human matte veto it.
+    // SYLC_SYNTH3D_FAR_SNAP=0 disables (cb flag).
+    float gate = depth_edge * guide_edge;
+    if (far_snap_on > 0.5 && gate > 0.05) {
+        float2 lc = saturate(center - float2(2.0 * depth_texel.x, 0.0));
+        float2 rc = saturate(center + float2(2.0 * depth_texel.x, 0.0));
+        float nl = effective_nearness(Geometry.SampleLevel(linSmp, lc, 0));
+        float nr = effective_nearness(Geometry.SampleLevel(linSmp, rc, 0));
+        if (abs(nl - nr) >= 0.10) {
+            // Layer coherence — the CPU pass's anchored-median principle in
+            // its cheapest sufficient form: the far side must present TWO
+            // agreeing taps at +2 and +3 texels. A 1-2 texel model crack
+            // (possibly luma-aligned with a facial feature) never can; a
+            // genuine background layer always does.
+            float dir = nl < nr ? -1.0 : 1.0;
+            float n2 = min(nl, nr);
+            float2 c3 = saturate(
+                center + float2(dir * 3.0 * depth_texel.x, 0.0));
+            float n3 = effective_nearness(
+                Geometry.SampleLevel(linSmp, c3, 0));
+            if (abs(n2 - n3) < 0.10) {
+                float y_far = source_luma(depth_to_source_uv(c3));
+                float y_near = source_luma(depth_to_source_uv(
+                    dir < 0.0 ? rc : lc));
+                float vote = smoothstep(0.02, 0.08,
+                                        abs(y0 - y_near) - abs(y0 - y_far));
+                float human_guard = 1.0 -
+                    smoothstep(0.20, 0.60, matte_a0);
+                float reclaim = gate * vote * human_guard *
+                                (1.0 - fine_structure_score(uv)) *
+                                smoothstep(0.02, 0.06, result - n2);
+                result = lerp(result, n2, reclaim);
+            }
+        }
+    }
+    return result;
 }
 
 // ---- round 5a: temporal background plate ----------------------------------
@@ -546,6 +594,27 @@ WarpInfo warp_info(float2 uvd, float eyeSign) {
     return o;
 }
 
+// Sidecar metadata for Stereo Lab. The v5.2.1c luma/chroma shaders remain the
+// image-forming reference and never write these targets. This independent pass
+// evaluates the SAME inverse warp and exports only its source ownership, so
+// reconnecting the Lab cannot change one raw c pixel.
+//
+// R32_UINT layout:
+//   0..15  inverse-map base x (UNORM16)
+//  16..23  signed background delta in luma pixels, biased by 128
+//  24..30  fill confidence (UNORM7)
+//       31 background direction (0=left, 1=right)
+uint pack_warp_provenance(WarpInfo w) {
+    uint base_q = (uint)round(saturate(w.base_uv.x) * 65535.0);
+    float delta_px = (w.background_uv.x - w.base_uv.x) /
+                     max(inv_w, 1e-8);
+    int delta_i = (int)round(clamp(delta_px, -127.0, 127.0));
+    uint delta_q = (uint)(delta_i + 128);
+    uint fill_q = (uint)round(saturate(w.fill) * 127.0);
+    uint dir_q = w.background_dir >= 0.0 ? 1u : 0u;
+    return base_q | (delta_q << 16) | (fill_q << 24) | (dir_q << 31);
+}
+
 float matte_background_direction(float2 uv, float fallback_dir) {
     float step_x = max(matte_texel.x, inv_w);
     float left = human_alpha(saturate(uv - float2(2.0 * step_x, 0.0)));
@@ -700,6 +769,18 @@ Eyes2 PS_WarpLuma(VSOut i) {
     }
     return o;
 }
+
+struct Provenance2 {
+    uint L : SV_Target0;
+    uint R : SV_Target1;
+};
+Provenance2 PS_WarpProvenance(VSOut i) {
+    Provenance2 o;
+    o.L = pack_warp_provenance(warp_info(i.uv, +1.0));
+    o.R = pack_warp_provenance(warp_info(i.uv, -1.0));
+    return o;
+}
+
 struct Eyes4 { float UL : SV_Target0; float VL : SV_Target1;
                float UR : SV_Target2; float VR : SV_Target3; };
 Eyes4 PS_WarpChroma(VSOut i) {

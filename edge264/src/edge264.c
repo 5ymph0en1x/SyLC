@@ -512,6 +512,98 @@ int edge264_is_frame_ready(Edge264Decoder *dec) {
 }
 
 
+// SyLC motion export (2026-08-04). The per-frame macroblock buffers are
+// retained for colocated prediction, so the whole motion field of an output
+// frame is already in memory: this is a read-only walk, no decode-path
+// change. Layout: rows of pic_width_in_mbs real macroblocks separated by
+// one guard macroblock (stride = pic_width_in_mbs + 1, see alloc_frame).
+static int16_t sylc_median16(const int16_t *v, int stride) {
+	int16_t s[16];
+	for (int i = 0; i < 16; i++)
+		s[i] = v[i * stride];
+	for (int i = 1; i < 16; i++) {
+		int16_t key = s[i];
+		int j = i - 1;
+		while (j >= 0 && s[j] > key) {
+			s[j + 1] = s[j];
+			j--;
+		}
+		s[j + 1] = key;
+	}
+	return (int16_t)(((int)s[7] + s[8]) >> 1);
+}
+
+int edge264_export_motion(Edge264Decoder *dec, void *return_arg,
+                          int16_t *mv_out, uint8_t *valid_out,
+                          int *mbs_w, int *mbs_h, int max_mbs) {
+	if (dec == NULL || mv_out == NULL || valid_out == NULL ||
+	    mbs_w == NULL || mbs_h == NULL || return_arg == NULL)
+		return EINVAL;
+	if (dec->n_threads)
+		pthread_mutex_lock(&dec->lock);
+	int res = ENOMSG;
+	unsigned bits = (unsigned)(uintptr_t)return_arg;
+	int pic = __builtin_ctz(bits); // base view = lowest borrowed picture
+	int width_mbs = dec->sps.pic_width_in_mbs;
+	int height_mbs = dec->sps.pic_height_in_mbs;
+	const Edge264Macroblock *mbs = dec->mb_buffers[pic];
+	if (pic >= 0 && pic < 32 && mbs != NULL &&
+	    width_mbs > 0 && height_mbs > 0 &&
+	    width_mbs * height_mbs <= max_mbs) {
+		int cur_poc = dec->FieldOrderCnt[0][pic];
+		for (int my = 0; my < height_mbs; my++) {
+			const Edge264Macroblock *row = mbs + (size_t)my * (width_mbs + 1);
+			for (int mx = 0; mx < width_mbs; mx++) {
+				const Edge264Macroblock *m = row + mx;
+				size_t o = (size_t)my * width_mbs + mx;
+				valid_out[o] = 0;
+				mv_out[2 * o] = 0;
+				mv_out[2 * o + 1] = 0;
+				// List choice: L0 when its first 8x8 is referenced, else
+				// L1. Intra/PCM leave refIdx at -1 -> no candidate.
+				int lx = -1;
+				if (m->refIdx[0] >= 0)
+					lx = 0;
+				else if (m->refIdx[4] >= 0)
+					lx = 1;
+				if (lx < 0 || !m->mbIsInterFlag)
+					continue;
+				int ref = m->refPic[lx * 4];
+				if (ref < 0 || ref >= 32)
+					continue;
+				int ref_poc = dec->FieldOrderCnt[0][ref];
+				int dist = cur_poc - ref_poc; // POC step 2 per display frame
+				if (dist == 0)
+					continue;
+				// Median over the 16 4x4 vectors of the list: robust to
+				// partitioning, no dependence on the internal 4x4 order.
+				int mvx = sylc_median16(m->mvs + lx * 32, 2);
+				int mvy = sylc_median16(m->mvs + lx * 32 + 1, 2);
+				// Codec vectors point current->reference; the production
+				// flow is the content displacement prev->cur, per display
+				// frame: flow = -mv * 2 / (cur_poc - ref_poc). Handles past
+				// AND future references with one formula.
+				int fx = (int)(-mvx * 2) / dist;
+				int fy = (int)(-mvy * 2) / dist;
+				if (fx > 32767) fx = 32767;
+				if (fx < -32768) fx = -32768;
+				if (fy > 32767) fy = 32767;
+				if (fy < -32768) fy = -32768;
+				mv_out[2 * o] = (int16_t)fx;
+				mv_out[2 * o + 1] = (int16_t)fy;
+				valid_out[o] = 1;
+			}
+		}
+		*mbs_w = width_mbs;
+		*mbs_h = height_mbs;
+		res = 0;
+	}
+	if (dec->n_threads)
+		pthread_mutex_unlock(&dec->lock);
+	return res;
+}
+
+
 
 const int8_t cabac_context_init[4][1024][2] __attribute__((aligned(16))) = {{
 	{  20, -15}, {   2,  54}, {   3,  74}, {  20, -15}, {   2,  54}, {   3,  74},

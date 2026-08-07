@@ -94,6 +94,10 @@ public:
     // or GUI cadence.
     void set_video_time_ms(double video_time_ms);
 
+    // Select which synthesized trio a one-eye stereo_mode=0 surface exposes.
+    // 0=left (default), 1=right (Dual Projector's right-hand window).
+    void set_synth3d_output_eye(int eye);
+
     // Per-sample scale multiplied into every Y/U/V texel BEFORE the YUV->RGB math
     // (stored in the cbuffer). 1.0 = 8-bit R8 (identity); 65535/1023 ~= 64.06 maps a
     // 10-bit value stored low in an R16_UNORM texel back to [0,1]. Takes effect on
@@ -161,7 +165,11 @@ public:
                       int grid_width = 0, int grid_height = 0,
                       float crop_top = 0.0f, float crop_bottom = 0.0f,
                       bool auto_convergence = false,
-                      bool temporal_fill = false);
+                      bool temporal_fill = false,
+                      bool stereo_lab = true,
+                      bool comfort_enabled = false,
+                      float comfort_soft_pct = 0.0f,
+                      float comfort_hard_pct = 0.0f);
     std::string synth3d_status() const;
     // Debug/tests. set_test_depth(nullptr, 0) returns to the engine; otherwise q16
     // points at a synth3d_grid_width()*synth3d_grid_height() map that bypasses inference
@@ -185,7 +193,9 @@ public:
     // disables the prototype with no change to depth or renderer state.
     bool synth3d_set_test_matte(const uint8_t* alpha_or_null,
                                 uint32_t width, uint32_t height,
-                                size_t count, int mode);
+                                size_t count, int mode,
+                                const uint8_t* reliability_or_null = nullptr,
+                                size_t reliability_count = 0);
     // The live inference grid every depth-side resource is sized for (and the
     // element count per side that set_test_depth demands); 0 before any synth3d
     // pipeline has been created.
@@ -199,7 +209,16 @@ public:
     // Look-ahead advisory (two-filter scout): presented-relative delays in ms
     // to the next observed cut / motion-storm onset (<0 = none). False when
     // synth3d is not running. Lock-free beyond the renderer mutex.
-    bool synth3d_set_lookahead(double cut_in_ms, double storm_in_ms);
+    bool synth3d_set_lookahead(double cut_in_ms, double storm_in_ms,
+                               double cut_pts_ms = -1.0);
+    // Codec motion hints for one decoded frame (phase 1, 04/08): forwarded
+    // to the depth service as fuse_bidirectional's third candidate. False
+    // when synth3d is not running.
+    bool synth3d_set_motion_hints(double pts_ms, double frame_ms,
+                                  int blocks_w, int blocks_h,
+                                  int source_width, int source_height,
+                                  std::vector<int16_t>&& mv_xy,
+                                  std::vector<uint8_t>&& valid);
     bool synth3d_read_plate(std::vector<uint8_t>& out, uint32_t& w,
                             uint32_t& h, std::string& err);
     // Seek: re-prime the temporal depth filter on the next inference rather than let it
@@ -310,6 +329,7 @@ private:
     uint32_t    src_w_  = 0;                   // decoded left-Y size (for 2D aspect)
     uint32_t    src_h_  = 0;
     int         stereo_mode_ = 0;
+    int         synth3d_output_eye_ = 0;
     float       plane_scale_ = 1.0f;           // cbuffer plane_scale (guarded by impl_->mtx)
     double      video_time_ms_ = -1.0;          // current source-frame PTS (mtx-guarded)
     int         yuv_matrix_sel_ = 0;           // cbuffer yuv_matrix_sel (mtx-guarded), 0=legacy BT.601

@@ -207,11 +207,25 @@ bool loadEdge264(std::string* diagnostic) {
 
 void copyPlane(const uint8_t* source, int source_stride,
                int width, int height, std::vector<uint8_t>& destination) {
-    destination.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
+    const size_t row_bytes = static_cast<size_t>(width);
+    const size_t total = row_bytes * static_cast<size_t>(height);
+    destination.resize(total);
+
+    // edge264 hands back unpadded planes for the resolutions SyLC plays
+    // (measured: 1920x1080 arrives with stride_Y == width), so the whole plane
+    // is one contiguous block. Copying it in a single call instead of one
+    // memcpy per row lets the CRT use its wide streaming path and keeps the
+    // hardware prefetcher running across row boundaries. The per-row loop
+    // remains for genuinely padded planes.
+    if (source_stride == width) {
+        std::memcpy(destination.data(), source, total);
+        return;
+    }
+
     for (int row = 0; row < height; ++row) {
-        std::memcpy(destination.data() + static_cast<size_t>(row) * width,
+        std::memcpy(destination.data() + static_cast<size_t>(row) * row_bytes,
                     source + static_cast<size_t>(row) * source_stride,
-                    static_cast<size_t>(width));
+                    row_bytes);
     }
 }
 

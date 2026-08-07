@@ -1,0 +1,62 @@
+MP4Box (GPAC) — provenance (SyLC MV-HEVC export mux, Task EX-1)
+================================================================
+
+WHAT
+  GPAC MP4Box CLI — the muxer chosen (EX-1 tranche) to wrap the x265 MV-HEVC
+  elementary stream into a QuickTime .mov. MP4Box is the ONLY tested tool that
+  emits the Apple/reference-canonical layered structure hvc1 + hvcC + lhvC with
+  colr nclx AND a stream our own LavfHevcSource reads back (dogfood PASS).
+  ffmpeg (bundled) CANNOT write the lhvC box: `-tag:v hvc1` drops the dependent
+  layer's parameter sets -> "PPS id out of range" on read-back; `-tag:v hev1`
+  works but is non-canonical (in-band PS, hev1 tag, no lhvC).
+
+VERSION (verbatim from `mp4box.exe -version`)
+  MP4Box - GPAC version 26.02-rev0-g118e60a9-master
+  (c) 2000-2024 Telecom Paris distributed under LGPL v2.1+ - https://gpac.io
+
+SOURCE (official GPAC stable Windows x64 installer)
+  URL:
+    https://download.tsi.telecom-paristech.fr/gpac/release/26.02/gpac-26.02-rev0-g118e60a9-master-x64.exe
+  installer sha256:
+    6a68c2e3099cc9ae51cc512865b46ac911f00e2fcea1c0e0acda16e3e8d670a9
+  Linked from the official downloads page https://gpac.io/downloads/ .
+  Extracted (NSIS self-extracting) with 7-Zip; NOT run as an installer.
+
+INSTALLED FILES (this directory = full gpac runtime layout, verified to mux
+standalone with a system-only PATH — no install, no registry)
+  mp4box.exe   sha256 0387b8838f2f1eb5c4f3c5d504620f04f51180dd0981ec51c42d19c1612ccc43
+  + 24 DLLs (libgpac.dll + its load-time deps: avcodec/avformat/avutil/avfilter/
+    avdevice/swscale/swresample/postproc-* , libcurl-x64, libssl/cryptoMD,
+    OpenSVCDecoder, openhevc, libx264, SDL2, plus gm_* output plugins).
+  Total ~146 MB. The bulk is the FFmpeg DLLs (avcodec-60 alone = 71 MB) which
+  libgpac.dll imports at LOAD TIME (objdump-confirmed) and therefore cannot be
+  removed even though muxing does not decode. Trimming the runtime plugins saves
+  only ~4 MB. If footprint matters, the ffmpeg `-tag:v hev1` fallback (below)
+  costs 0 extra bytes but is not Apple-canonical.
+
+  mp4box.exe direct imports: libgpac.dll + VCRUNTIME140.dll + UCRT (system).
+  VCRUNTIME140.dll confirmed present in C:\Windows\System32 on this machine.
+
+WHY MP4Box AND NOT ffmpeg (EX-1 mux tranche — empirical)
+  Muxing out_synth.hevc (48-frame synthetic MV-HEVC SBS from x265):
+    ffmpeg -f mp4 -tag:v hvc1 : hvc1, colr nclx, view_ids=0,1, but NO lhvC ->
+                                LavfHevcSource read-back FAILS (PPS id out of range).
+    ffmpeg -f mp4 -tag:v hev1 : hev1, colr nclx, view_ids=0,1, in-band PS ->
+                                dogfood PASS, but non-canonical (no lhvC/hvc1).
+    MP4Box                    : hvc1 + hvcC + lhvC + colr nclx, view_ids=0,1,
+                                "HEVC L-HEVC Import results" -> dogfood PASS.
+  Only MP4Box reproduces the reference file's structure
+  (docs\hevc_4k24P_main_multiview_1.mp4 = hvc1+hvcC+lhvC).
+
+EXACT COMMAND (shipped)
+  mp4box.exe -add "<in>.hevc:fps=<FPS>:colr=nclx,<prim>,<transfer>,<matrix>,<off|on>" -new "<out>.mov"
+  e.g. (bt709 limited, 24 fps):
+  mp4box.exe -add "out.hevc:fps=24:colr=nclx,bt709,bt709,bt709,off" -new out.mov
+  ("off" = full_range_flag 0 = limited/TV; "on" = full range.)
+  Audio: remux separately (ffmpeg) then `mp4box -add out.mov -add audio.m4a -new final.mov`
+  OR add the audio track in the same MP4Box call — deferred to EX-2/EX-4.
+
+LICENSE
+  GPAC is LGPL v2.1+ (see LICENSE, verbatim License.txt from the installer).
+
+ACQUIRED: 2026-07-22 (Task EX-1)

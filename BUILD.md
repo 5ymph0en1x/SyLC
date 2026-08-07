@@ -1,5 +1,8 @@
 # SyLC 3D Player — build manifest
 
+Repository and runtime directory ownership is documented in
+[`docs/PROJECT_LAYOUT.md`](docs/PROJECT_LAYOUT.md).
+
 Minimal, dependency-traced file set for running and building SyLC 3D Player.
 Target: **Python 3.14**, Windows x64. Verified: the full import graph resolves
 from this folder alone, and every bundled binary's non-system DLL dependencies
@@ -59,7 +62,7 @@ From an MSYS2/MinGW64-enabled checkout:
 ```bat
 cd edge264
 build_sylc_edge264.bat
-copy /Y edge264_candidate.dll ..\edge264.dll
+copy /Y edge264_candidate.dll ..\runtime\edge264.dll
 ```
 
 The response files deliberately avoid `-march=native`. This makes one DLL portable
@@ -80,7 +83,7 @@ cmake -S mvc_realtime_demuxer -B build_py314 -G "Visual Studio 17 2022" -A x64 ^
 cmake --build build_py314 --config Release
 ```
 Output: `build_py314/python/Release/mvc_demuxer_cpp.cp314-win_amd64.pyd` → copy to
-the project root.
+`runtime/`.
 
 - `PYBIND11_FINDPYTHON=ON` + explicit `Python_EXECUTABLE`/`Python_ROOT_DIR` are
   required so pybind11 builds against the intended 3.14 interpreter rather than the
@@ -106,9 +109,9 @@ files each depth preset can open:
   itself). Both are dynamic-loaded at runtime (`LoadLibraryExW` + `GetProcAddress`
   in `mvc_realtime_demuxer/src/depth_engine.cpp`) -- `mvc_realtime_demuxer/CMakeLists.txt` only compiles
   against the vendored C API headers (`third_party/onnxruntime/include`) and links
-  no `onnxruntime.lib`. The two DLLs just need to sit next to
-  `mvc_demuxer_cpp….pyd` (project root during development; alongside
-  `SyLC_3D_Player.exe` in a standalone build).
+  no `onnxruntime.lib`. The two DLLs live with
+  `mvc_demuxer_cpp….pyd` under `runtime/` during development and in the
+  standalone build's `runtime/` directory.
 - **Models are per PRESET, not global.** Since round 4 there is no single
   "preferred model" and no single fallback: each of the three depth presets is
   one `(name, candidate models, inference grid)` entry in
@@ -195,7 +198,7 @@ files each depth preset can open:
   `models/MANIFEST.json`. `tests/models/test_manifest_matches_player.py` pins
   the manifest equal to the player's own preset tables.
 
-**Packaging whitelist:** `build_exe_v521.bat` bundles **no model weights at
+**Packaging whitelist:** `scripts/build/build_exe_v530.bat` bundles **no model weights at
 all** — only `onnxruntime.dll`, `DirectML.dll` and `models/MANIFEST.json`: the
 inference runtime and the download manifest. The twenty graphs are fetched at
 runtime (see "How to get the models" above). It also never uses
@@ -221,6 +224,86 @@ licence chain is not verified Apache-2.0 end to end — evaluated locally, never
 bundled, never referenced by the player. See its own `README.md`. The rule:
 only an artifact with a clean Apache-2.0 chain may live in `models/`;
 everything else goes there or is not downloaded at all.
+
+### Decode benchmark and bit-exactness gate
+
+`tools_dev/bench_decode.py` times the native MVC decode path with the access
+units preloaded, so the measured region is decode only -- no container I/O, no
+GUI, no presentation. Every run also CRCs each decoded frame, both views, all
+planes: a build that is faster and *different* is a regression, not an
+optimization. Use it to qualify any change to edge264, the demuxer or the
+worker policy.
+
+```bat
+.venv\Scripts\python.exe tools_dev\bench_decode.py <media.mkv> --sweep 0,2,3,4,6,8,12
+.venv\Scripts\python.exe tools_dev\bench_decode.py <media.mkv> --dll .perf_backup\edge264.dll.bak
+```
+
+Two rules learned the hard way:
+
+- Compare runs with the **same** `--no-verify` setting. The CRC pass runs
+  between the timed segments and evicts cache, which shifts timings by ~10%.
+- A shorter frame count in one configuration is a tail-flush difference, not a
+  pixel difference. The report distinguishes them (`ok (599f)` vs `DIFF @n`).
+
+`tools_dev/bench_frame_python.py` measures what the per-frame *Python* layer
+costs against the 41.7 ms frame budget. Measured 2026-08-06: 0.010 ms of
+actual Python (0.024% of a frame). That number is why no Python-side
+vectorization or JIT work is scheduled -- there is nothing left there to win.
+
+`tools_dev/bench_stabilizer.cpp` times `DepthStabilizer::step()`/`reproject()`
+standalone (no app, no GPU, no models) across a worker sweep, and enforces the
+stabilizer's exactness contract three ways: a selection selftest against
+`std::nth_element` on adversarial inputs, a bit-exact sweep verdict that
+crosses the serial (<4 workers) and counting-selection (>=4) paths on the same
+frames, and a per-grid FNV hash of the final map so two *builds* can be
+compared, not just two thread counts. Build line is in the file header.
+Measured 2026-08-06 (5950X, MinGW -O3, medians): step() Quality 756x756
+19.8 ms @1 -> 6.7 ms @16; Scope 756x322 8.1 ms @1 -> 3.4 ms @16. The
+remaining serial floor is the affine/Welford reductions, which stay serial
+because float association order is part of their result; the tone/convergence
+percentiles left that floor in 5.3.0 because a k-th order statistic is a
+value, not a reduction -- any correct algorithm returns the same bits.
+
+The depth-cut detector behind `cut_depth`/`depthres` carries an adaptive
+outlier gate (2026-08-06): a cut needs `depthres` above the absolute 0.35
+threshold AND above `cut_baseline_gain` (3x) times the ambient baseline the
+`[2D3D]` line reports as `depthbase=` (video-time EMA of non-cut residuals).
+Motivation, measured live: ambient `depthres` rode at 0.16-0.22 on a busy
+film and crossed 0.35 about once per second -- 331 false depth cuts in 433 s,
+each one a hard temporal reset (visible pumping). The bench's reference map
+hashes are unchanged by the gate at the reference 60-iteration sequence: on
+content without spurious crossings it alters nothing.
+`SYLC_SYNTH3D_DEPTHCUT_ADAPT=0` restores the fixed threshold exactly.
+
+### Reading `pass_ms` and `taplat_ms` in the `[2D3D]` line
+
+`inwait_ms/reswait_ms/joinwait_ms/cycle_ms` close the worker's cycle to the
+millisecond -- which is exactly why they cannot say *why* `inwait_ms` grows.
+These two name the segment on the client side of the mailbox:
+
+- **`pass_ms`** -- wall-clock period of the render pass that feeds the service.
+- **`taplat_ms`** -- capture-to-submit latency of one tap: how long a GPU
+  readback takes to reach the mailbox. One render pass is the designed cost
+  (the drain is non-blocking and picks up the previous pass's copy).
+
+Read them together with `cycle_ms` and `source_ms` (media-PTS spacing, *not*
+wall clock):
+
+| `pass_ms` | `taplat_ms` | reading |
+|---|---|---|
+| ≈ `cycle_ms` | ≈ one pass | the renderer sets the cadence; the depth engine is following it, and the fix is upstream of the service |
+| ≈ `source_ms` | ≈ one pass | renderer and source are both on time; the loss is inside the grant→submit path |
+| ≈ `source_ms` | ≫ one pass | copies land late; each miss costs a whole source interval (the failure `SYLC_SYNTH3D_FLUSH` was added to prevent) |
+
+Measured 2026-08-06 before these fields existed, on 1080p MVC + TensorRT, two
+instances of the same session with identical grid, provider and client count:
+stage timings were identical to the tenth of a millisecond (infer 28.1/28.4,
+stab 18.6/18.6, flow 6.0/6.0) and `source_ms` was 42.0 in both, yet `cycle_ms`
+was 43.5 vs 52.9 and delivered 23.1 vs 18.9 maps/s. The whole 9.4 ms delta sat
+in `inwait_ms`. Compute, GPU (`reswait_ms` = 0.00), readback (`dstall` 0.06 -
+0.15 %) and source were all eliminated; `duppts` accounted for only 1.6 ms of
+it. `pass_ms` and `taplat_ms` exist to close that remaining gap.
 
 ### Adaptive aspect benchmark
 
@@ -485,7 +568,7 @@ compiled engine is cached on disk and subsequent launches are fast. It lives
 entirely in
 `ort_tensorrt/`, a flat directory of DLLs next to the project root during
 development (alongside `SyLC_3D_Player.exe` in a standalone build), and is
-selected instead of the root `onnxruntime.dll`/`DirectML.dll` pair by the
+selected instead of the `runtime/onnxruntime.dll`/`runtime/DirectML.dll` pair by the
 player at process start -- never both in the same process (see the round-3
 Global Constraints). If `ort_tensorrt/` is absent, behavior is byte-for-byte
 identical to today's DirectML-only path.
@@ -822,12 +905,12 @@ pattern (process-global, so it also covers nested loads). Confirmed: FIRST
 engine compile (`da3_small_756.onnx`) 232.7s, cached warm start 3.3s -- see
 task-4-report.md for the full diagnosis and the bench numbers.
 
-**Never packaged (verified):** `build_exe_v521.bat` bundles files by exact,
-hardcoded name only (`--include-data-files=onnxruntime.dll=...`,
-`--include-data-files=DirectML.dll=...`, etc.) -- there is no
+**Never packaged (verified):** `scripts/build/build_exe_v530.bat` bundles files by exact,
+hardcoded name only (`--include-data-files=runtime/onnxruntime.dll=...`,
+`--include-data-files=runtime/DirectML.dll=...`, etc.) -- there is no
 `--include-data-dir` sweeping `ort_tensorrt/`, `models/`, or the project
 root, and no pattern in the file matches `ort_tensorrt` at all (confirmed by
-`grep -i ort_tensorrt build_exe_v521.bat` -> no output). Nuitka's own
+`findstr /i ort_tensorrt scripts\build\build_exe_v530.bat` -> no output). Nuitka's own
 dependency-following auto-bundling only picks up DLLs that are actual
 `ctypes`/import dependencies of already-included Python modules; nothing in
 the shipped source imports from `ort_tensorrt/` (the player selects its
@@ -836,14 +919,14 @@ session), so Nuitka's scanner has no path into it either. Extending the
 whitelist to include it is a decision for a future gate, not automatic.
 
 ## Standalone build (no-console exe)
-Built with **Nuitka --standalone** via `build_exe.bat` (bundles edge264 /
+Built with **Nuitka --standalone** via `scripts/build/build_exe_v530.bat` (bundles edge264 /
 mpv-2 / ffprobe + av*/sw* as data files; ebml, matroska and the
 `.pyd` are auto-bundled by Nuitka's dependency scan). The `build_nuitka/` output is
-git-ignored — rebuild via `build_exe.bat`.
+git-ignored — rebuild via `scripts\build\build_exe_v530.bat`.
 
-**`build_exe_onefile.bat` is not part of the v5.2.1 release.** It still carries
+**`scripts/build/build_exe_onefile.bat` is not part of the v5.3.0 release.** It still carries
 v5.0.0 version stamps throughout and predates the 2D→3D packaging whitelist, so
 it bundles neither `onnxruntime.dll`, `DirectML.dll`, `models/MANIFEST.json` nor
 `model_fetcher` / `model_download_dialog`: a binary built from it plays video but
 answers `models/MANIFEST.json is missing from this install` to every AI action.
-v5.2.1 ships a single asset, the portable folder from `build_exe_v521.bat`.
+v5.3.0 ships a single asset, the portable folder from `scripts/build/build_exe_v530.bat`.

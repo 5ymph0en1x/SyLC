@@ -19,6 +19,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "parallel_select.h"
+
 class DepthStabilizer {
 public:
     explicit DepthStabilizer(size_t n);
@@ -136,6 +138,22 @@ public:
     // fit trivially reproduces a constant ema, so the ratio is
     // provably 0/anything regardless of cut_threshold -- see step()).
     float cut_threshold = 0.35f;
+    // Adaptive gate on the depth-cut residual (2026-08-06). The ambient
+    // normalized residual is content-dependent: measured live medians run
+    // ~0.02-0.07 on calm shots but 0.16-0.22 during fast motion, against the
+    // fixed 0.35 threshold above -- on a busy film the ambient peaks crossed
+    // it about once per second (331 depth cuts in 433 s), and every false
+    // fire hard-resets the temporal state: visible depth pumping. A depth cut
+    // must now ALSO be an outlier against the content's own recent level:
+    //     normalized > cut_baseline_gain * running_baseline.
+    // Calm content keeps the absolute threshold (gain*baseline sits far below
+    // 0.35); busy content raises the effective bar to where only a genuine
+    // affine-fit failure -- a real cut -- reaches. The scene/histogram
+    // detector and the boundary scout are unaffected and still OR in. A slow
+    // dissolve raises the baseline as it progresses, which correctly KEEPS the
+    // blend path for it. 0 disables the gate (pre-2026-08-06 behavior;
+    // service maps SYLC_SYNTH3D_DEPTHCUT_ADAPT=0 to it).
+    float cut_baseline_gain = 3.0f;
     float scene_cut_threshold = 0.42f;
     // Auto-convergence: per-shot zero-parallax suggestion. The percentile of
     // the SAME confidence-filtered stabilized sample the tone range uses,
@@ -156,6 +174,12 @@ public:
     float last_scene_change() const { return last_scene_change_; }
     float last_confidence() const { return last_confidence_; }
     bool last_cut() const { return last_cut_; }
+    bool last_depth_cut() const { return last_depth_cut_; }
+    bool last_scene_cut() const { return last_scene_cut_; }
+    // -1 denotes the explicit flat-reference/structured-input degeneracy,
+    // which is a depth cut but has no meaningful normalized ratio.
+    float last_depth_residual() const { return last_depth_residual_; }
+    float residual_baseline() const { return residual_baseline_; }
     uint64_t cut_count() const { return cut_count_; }
     uint64_t snap_count() const { return snap_count_; }
     float last_stability() const { return last_stability_; }
@@ -174,11 +198,17 @@ private:
     std::vector<float> ema_;
     bool primed_ = false;
     std::vector<float> tmp_;
+    sylc_select::Scratch select_scratch_;  // histogram/offset reuse, no per-map alloc
     float last_motion_ = 0.0f;
     float last_effective_alpha_ = 0.0f;
     float last_scene_change_ = 0.0f;
     float last_confidence_ = 1.0f;
     bool last_cut_ = false;
+    bool last_depth_cut_ = false;
+    bool last_scene_cut_ = false;
+    float last_depth_residual_ = 0.0f;
+    float residual_baseline_ = 0.0f;       // ambient level between cuts
+    bool residual_baseline_primed_ = false;
     uint64_t cut_count_ = 0;
     bool tone_primed_ = false;
     float tone_lo_ = 0.0f;

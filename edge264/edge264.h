@@ -69,6 +69,20 @@ void edge264_flush(Edge264Decoder *dec);
 void edge264_free(Edge264Decoder **pdec);
 int edge264_decode_NAL(Edge264Decoder *dec, const uint8_t *buf, const uint8_t *end, Edge264UnrefCb unref_cb, void *unref_arg);
 int edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow);
+// SyLC motion export (2026-08-04): per-macroblock motion field of a frame
+// previously returned by edge264_get_frame(borrow=1) and not yet returned.
+// For each macroblock in raster order: mv_out receives 2 int16 (x, y) in
+// QUARTER-PEL per DISPLAY frame, expressed as the production flow
+// convention (content displacement prev->cur; the raw codec vector points
+// current->reference and is negated/normalized by POC distance here);
+// valid_out receives 1 for an inter macroblock with a usable reference,
+// 0 otherwise (intra/PCM/unreferenced -> the consumer treats it as "no
+// candidate"). *mbs_w/*mbs_h receive the frame dimensions in macroblocks.
+// max_mbs guards the caller's buffers. Returns 0 on success, ENOMSG when
+// the frame cannot be identified, EINVAL on bad arguments.
+int edge264_export_motion(Edge264Decoder *dec, void *return_arg,
+                          int16_t *mv_out, uint8_t *valid_out,
+                          int *mbs_w, int *mbs_h, int max_mbs);
 void edge264_return_frame(Edge264Decoder *dec, void *return_arg);
 void edge264_release_frame(Edge264Decoder *dec, void *return_arg);
 void edge264_bump_frames(Edge264Decoder *dec);

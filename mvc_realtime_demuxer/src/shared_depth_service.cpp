@@ -484,8 +484,13 @@ void fuse_bidirectional(const std::vector<float>& prev_luma,
                         std::vector<float>& out_reliability,
                         std::vector<float>& out_motion,
                         double& motion_sum, float& mean_flow,
-                        int max_threads) {
+                        int max_threads,
+                        const DenseFlow* codec_hint) {
     const size_t n = static_cast<size_t>(width) * height;
+    const bool has_hint = codec_hint != nullptr &&
+                          codec_hint->x.size() == n &&
+                          codec_hint->y.size() == n &&
+                          codec_hint->quality.size() == n;
     out_x.resize(n);
     out_y.resize(n);
     out_reliability.resize(n);
@@ -520,9 +525,29 @@ void fuse_bidirectional(const std::vector<float>& prev_luma,
             // Égalité -> causal (déterministe, et le prior de causalité est
             // le bon: à résidu égal, l'estimateur direct l'emporte).
             const bool pick_b = rb < ra;
-            const float px = pick_b ? bx : ax;
-            const float py = pick_b ? by : ay;
-            const float r = pick_b ? rb : ra;
+            float px = pick_b ? bx : ax;
+            float py = pick_b ? by : ay;
+            float r = pick_b ? rb : ra;
+            float q_sel = pick_b ? qb : qa;
+            // Phase 1 (04/08) : candidat DÉCODEUR, même arbitrage. Qualité
+            // 0 = bloc intra/absent, le candidat n'existe pas — jamais
+            // adopté même si son résidu serait meilleur (un vecteur non
+            // déclaré n'est pas une observation). Strictement < : à
+            // égalité, causal puis futur gardent la main.
+            if (has_hint) {
+                const float qh = clamp01(codec_hint->quality[i]);
+                if (qh > 0.0f) {
+                    const float hx = codec_hint->x[i];
+                    const float hy = codec_hint->y[i];
+                    const float rh = residual(hx, hy);
+                    if (rh < r) {
+                        px = hx;
+                        py = hy;
+                        r = rh;
+                        q_sel = qh;
+                    }
+                }
+            }
             // Accord symétrique des deux directions: mouvement localement
             // linéaire confirmé par deux estimateurs indépendants.
             const float sym_err = std::sqrt(
@@ -534,8 +559,7 @@ void fuse_bidirectional(const std::vector<float>& prev_luma,
             // reproduit la cible est fiable même si l'autre direction
             // désaccorde (dernière frame d'un plan: le futur appartient au
             // plan suivant).
-            const float self_conf =
-                (pick_b ? qb : qa) * std::exp(-40.0f * r);
+            const float self_conf = q_sel * std::exp(-40.0f * r);
             const float rel = clamp01(std::max(sym, self_conf));
             out_x[i] = px;
             out_y[i] = py;
@@ -558,6 +582,132 @@ void fuse_bidirectional(const std::vector<float>& prev_luma,
         mag_sum += chunk_mag[c];
     }
     mean_flow = static_cast<float>(mag_sum / static_cast<double>(n));
+}
+
+void rasterize_motion_hints(const int16_t* mv_xy, const uint8_t* valid,
+                            int blocks_w, int blocks_h,
+                            int source_width, int source_height,
+                            int grid_width, int grid_height,
+                            float time_scale,
+                            std::vector<float>& out_x,
+                            std::vector<float>& out_y,
+                            std::vector<float>& out_quality) {
+    const size_t n = static_cast<size_t>(grid_width) * grid_height;
+    out_x.assign(n, 0.0f);
+    out_y.assign(n, 0.0f);
+    out_quality.assign(n, 0.0f);
+    if (mv_xy == nullptr || blocks_w <= 0 || blocks_h <= 0 ||
+        source_width <= 0 || source_height <= 0 ||
+        grid_width <= 0 || grid_height <= 0) {
+        return;
+    }
+    // Quart-de-pel source -> texels grille, étirement anisotrope (le même
+    // que le prep). time_scale ramène « par frame d'affichage » à « par
+    // observation consommée ».
+    const float sx = 0.25f * time_scale *
+                     static_cast<float>(grid_width) / source_width;
+    const float sy = 0.25f * time_scale *
+                     static_cast<float>(grid_height) / source_height;
+    for (int gy = 0; gy < grid_height; ++gy) {
+        const int by = std::min(
+            blocks_h - 1,
+            static_cast<int>((gy + 0.5f) * blocks_h / grid_height));
+        for (int gx = 0; gx < grid_width; ++gx) {
+            const int bx = std::min(
+                blocks_w - 1,
+                static_cast<int>((gx + 0.5f) * blocks_w / grid_width));
+            const size_t b = static_cast<size_t>(by) * blocks_w + bx;
+            if (valid != nullptr && valid[b] == 0) continue;
+            const size_t i = static_cast<size_t>(gy) * grid_width + gx;
+            out_x[i] = mv_xy[2 * b] * sx;
+            out_y[i] = mv_xy[2 * b + 1] * sy;
+            out_quality[i] = 1.0f;
+        }
+    }
+}
+
+double mean_divergence(const std::vector<float>& flow_x,
+                       const std::vector<float>& flow_y,
+                       int width, int height) {
+    const size_t n = static_cast<size_t>(width) * height;
+    if (width < 3 || height < 3 || flow_x.size() != n || flow_y.size() != n)
+        return 0.0;
+    double sum = 0.0;
+    long count = 0;
+    for (int y = 1; y < height - 1; y += 2) {
+        const size_t row = static_cast<size_t>(y) * width;
+        for (int x = 1; x < width - 1; x += 2) {
+            const double dfx = 0.5 * (flow_x[row + x + 1] -
+                                      flow_x[row + x - 1]);
+            const double dfy = 0.5 * (flow_y[row + width + x] -
+                                      flow_y[row - width + x]);
+            sum += dfx + dfy;
+            ++count;
+        }
+    }
+    return count ? sum / count : 0.0;
+}
+
+void expand_boundary_motion(std::vector<float>& motion,
+                            const std::vector<float>& boundary,
+                            const std::vector<float>& flow_x,
+                            const std::vector<float>& flow_y,
+                            int width, int height,
+                            std::vector<float>& scratch,
+                            int max_threads,
+                            bool directional) {
+    const size_t n = static_cast<size_t>(width) * height;
+    if (width < 3 || height < 3 || motion.size() != n ||
+        boundary.size() != n) {
+        return;
+    }
+    const bool has_flow = directional &&
+                          flow_x.size() == n && flow_y.size() == n;
+    scratch = motion;
+    // Sondes anti-traînée : amont/aval sur les deux axes, distances 2 et 3
+    // (le 3×3 isotrope couvre déjà la distance 1).
+    static const int kProbes[8][2] = {
+        {-2, 0}, {2, 0}, {0, -2}, {0, 2},
+        {-3, 0}, {3, 0}, {0, -3}, {0, 3}};
+    parallel_chunks(height - 2, max_threads,
+                    [&](int, int begin, int end) {
+    for (int y = 1 + begin; y < 1 + end; ++y) {
+        for (int x = 1; x < width - 1; ++x) {
+            const size_t i = static_cast<size_t>(y) * width + x;
+            if (boundary[i] < 0.20f) continue;
+            float local_max = 0.0f;
+            for (int oy = -1; oy <= 1; ++oy)
+                for (int ox = -1; ox <= 1; ++ox)
+                    local_max = std::max(
+                        local_max,
+                        scratch[static_cast<size_t>(y + oy) * width +
+                                x + ox]);
+            if (has_flow) {
+                for (int p = 0; p < 8; ++p) {
+                    const int px = x + kProbes[p][0];
+                    const int py = y + kProbes[p][1];
+                    if (px < 0 || px >= width || py < 0 || py >= height)
+                        continue;
+                    const size_t j = static_cast<size_t>(py) * width + px;
+                    const float mj = scratch[j];
+                    if (mj <= local_max) continue;
+                    // Le flot DE LA SONDE doit avancer de moi vers elle
+                    // (projeté >= 0.75 texel) : je suis alors sa traînée.
+                    const float advance =
+                        flow_x[j] * kProbes[p][0] + flow_y[j] * kProbes[p][1];
+                    const float span = static_cast<float>(
+                        kProbes[p][0] * kProbes[p][0] +
+                        kProbes[p][1] * kProbes[p][1]);
+                    if (advance * advance >= 0.5625f * span &&
+                        advance > 0.0f) {
+                        local_max = mj;
+                    }
+                }
+            }
+            motion[i] = local_max;
+        }
+    }
+    });
 }
 
 DenseFlow estimate_flow(const std::vector<float>& source_full,
@@ -997,6 +1147,314 @@ void refine_observation(std::vector<float>& depth,
     depth.swap(scratch);
 }
 
+namespace {
+inline float median5(float a, float b, float c, float d, float e) {
+    float v[5] = {a, b, c, d, e};
+    std::sort(v, v + 5);
+    return v[2];
+}
+}  // namespace
+
+void realign_contours(std::vector<uint16_t>& depth_q16,
+                      const std::vector<float>& luma,
+                      int width, int height,
+                      std::vector<uint16_t>& scratch,
+                      int max_threads) {
+    const size_t n = static_cast<size_t>(width) * height;
+    if (width < 3 || height < 3 || depth_q16.size() != n ||
+        luma.size() != n) {
+        return;
+    }
+    constexpr int kReach = 4;       // image-edge search radius (texels)
+    constexpr int kRepOff = 2;      // representatives at anchor +2..+6
+    constexpr int kRepEnd = 6;
+    constexpr float kWide = 0.7f;   // weight of the ±2-scale gradient
+    constexpr float kEdgeMin = 0.12f;   // decisive luma edge (bi-scale)
+    constexpr float kUnique = 0.55f;    // 2nd edge above this fraction = ambiguous
+    constexpr float kSep = 0.10f;       // real layer separation (nearness)
+    constexpr float kMove = 0.06f;      // minimum own-side error to act
+    constexpr float kLumaMargin = 0.03f;
+    constexpr float kAgreeLuma = 0.06f; // trench fill: luma continuity bound
+    constexpr int kMajorityLines = 3;   // of 5 lines across (see phase 2)
+    // Floating-edge veto (04/08 v2, "the deformed cheek"): a depth cliff
+    // that already sits on image evidence is already anchored — only a
+    // cliff floating on image-FLAT ground (the model's invention: a halo
+    // over uniform sky) may be moved. Without this, a soft shot lets a
+    // dominant INTERNAL shading edge (jaw shadow -> lit cheek) masquerade
+    // as the layer edge: the lit strip's luma resembles the background
+    // more than the adjacent shadow, the luma vote is fooled, and the
+    // face is carved toward the far layer. Luma-value proximity is not
+    // layer membership on smooth-shaded surfaces; the presence of image
+    // support under the cliff is the structural discriminator.
+    constexpr float kFlatGround = 0.035f;
+
+    // v3 (04/08, "the actress's wavy cheek"): per-texel decisions on a
+    // grainy, defocused silhouette flickered line-to-line (measured 30/48,
+    // 17/48, even 1/48 lines corrected), each flip being a FULL layer jump
+    // — the wavy contour. Three additions, one shared principle (decide on
+    // robust statistics, commit only coherent decisions):
+    //   1. the guide luma is smoothed 1-2-1 ACROSS scan lines, so sensor
+    //      grain cannot flip marginal gates between neighbouring lines;
+    //   2. gradients are BI-SCALE (max of the ±1 diff and 0.7x the ±2
+    //      diff): a defocused silhouette spreads over 3-5 texels and is
+    //      invisible to the fine diff alone (uniqueness widens its
+    //      exclusion to ±3 when the wide scale wins — a soft edge's own
+    //      shoulders are not "second edges");
+    //   3. representatives anchor BEYOND the contested interval
+    //      [min(e,q*), max(e,q*)] — image edge to floating cliff — so no
+    //      halo/ramp width can ever poison the medians; a defocused ramp
+    //      then splits at its own luma midpoint (sub-texel-correct), and
+    //      when both rims agree on ONE layer the interval is a hallucinated
+    //      trench, refilled from the agreed layer (luma-continuity gated).
+    // Phase 2 commits a proposal only when >= 3 of the 5 surrounding scan
+    // lines propose within ±1 texel: an isolated line's full-layer jump IS
+    // the artifact, so it is never applied.
+    std::vector<float> guide(n, 0.0f);
+    std::vector<uint8_t> prop_mask(n, uint8_t(0));
+    std::vector<uint16_t> prop_value(n, uint16_t(0));
+
+    auto pass = [&](bool vertical) {
+        const int along_n = vertical ? height : width;
+        const int across_n = vertical ? width : height;
+        if (along_n < 2 * (kReach + kRepEnd) + 1) return;
+        scratch.assign(depth_q16.begin(), depth_q16.end());
+        const uint16_t* in = scratch.data();
+
+        // Transverse 1-2-1 smoothing of the decision guide (border rows
+        // replicate). The published luma is untouched.
+        parallel_chunks(height, max_threads, [&](int, int y0, int y1) {
+            for (int y = y0; y < y1; ++y) {
+                for (int x = 0; x < width; ++x) {
+                    const size_t i = static_cast<size_t>(y) * width + x;
+                    size_t a, b;
+                    if (vertical) {
+                        a = static_cast<size_t>(y) * width +
+                            std::max(0, x - 1);
+                        b = static_cast<size_t>(y) * width +
+                            std::min(width - 1, x + 1);
+                    } else {
+                        a = static_cast<size_t>(std::max(0, y - 1)) * width + x;
+                        b = static_cast<size_t>(std::min(height - 1, y + 1)) *
+                            width + x;
+                    }
+                    guide[i] = 0.25f * (luma[a] + 2.0f * luma[i] + luma[b]);
+                }
+            }
+        });
+        std::fill(prop_mask.begin(), prop_mask.end(), uint8_t(0));
+
+        // ---- phase 1: per-texel proposals --------------------------------
+        parallel_chunks(across_n, max_threads,
+                        [&](int, int begin, int end) {
+        for (int across = begin; across < end; ++across) {
+            auto at = [&](int along) {
+                return vertical
+                    ? static_cast<size_t>(along) * width + across
+                    : static_cast<size_t>(across) * width + along;
+            };
+            // Bi-scale gradient with the winning scale reported (fine=false
+            // means the wide scale won).
+            auto grad = [&](int j, bool& fine_won) {
+                const float fine = std::abs(guide[at(j + 1)] -
+                                            guide[at(j - 1)]);
+                float wide = 0.0f;
+                if (j >= 2 && j + 2 <= along_n - 1)
+                    wide = kWide * std::abs(guide[at(j + 2)] -
+                                            guide[at(j - 2)]);
+                fine_won = fine >= wide;
+                return std::max(fine, wide);
+            };
+            for (int p = kReach + kRepEnd;
+                 p < along_n - (kReach + kRepEnd); ++p) {
+                const int j0 = std::max(1, p - kReach);
+                const int j1 = std::min(along_n - 2, p + kReach);
+                // Cheap gate: no real layer separation nearby = nothing to
+                // re-anchor (covers the vast flat majority of the grid).
+                float d_min = 1.0f, d_max = 0.0f;
+                for (int j = j0; j <= j1; ++j) {
+                    const float dj = in[at(j)] / 65535.0f;
+                    d_min = std::min(d_min, dj);
+                    d_max = std::max(d_max, dj);
+                }
+                if (d_max - d_min < kSep) continue;
+                // Dominant image edge, then its uniqueness: a second strong
+                // edge in the window (textured background, filament) makes
+                // THE silhouette position ambiguous — do nothing rather
+                // than re-anchor onto the wrong edge.
+                float g_max = 0.0f;
+                int e = -1;
+                bool e_fine = true;
+                for (int j = j0; j <= j1; ++j) {
+                    bool fine_won = true;
+                    const float g = grad(j, fine_won);
+                    if (g > g_max) { g_max = g; e = j; e_fine = fine_won; }
+                }
+                if (g_max < kEdgeMin || e < 0) continue;
+                const int exclude = e_fine ? 2 : 3;
+                float g_second = 0.0f;
+                for (int j = j0; j <= j1; ++j) {
+                    if (std::abs(j - e) <= exclude) continue;
+                    bool fine_won = true;
+                    g_second = std::max(g_second, grad(j, fine_won));
+                }
+                if (g_second > kUnique * g_max) continue;
+                // Floating-edge veto: among the significant depth cliffs in
+                // the window, the one FARTHEST from the image edge is the
+                // cliff this correction would erase (the halo's outer rim /
+                // the invented mid-face cliff of an eaten arm). It may only
+                // be erased if the image is flat beneath it — a supported
+                // cliff is a real, already-anchored silhouette (possibly
+                // weaker than a nearby shading edge; see the deformed-cheek
+                // report): leave it alone.
+                int q_star = -1;
+                {
+                    float cd_max = 0.0f;
+                    for (int j = j0; j <= j1; ++j) {
+                        cd_max = std::max(
+                            cd_max,
+                            std::abs(static_cast<float>(in[at(j + 1)]) -
+                                     static_cast<float>(in[at(j - 1)])) /
+                                65535.0f);
+                    }
+                    if (cd_max < kSep) continue;
+                    int best_distance = -1;
+                    for (int j = j0; j <= j1; ++j) {
+                        const float cd = std::abs(
+                            static_cast<float>(in[at(j + 1)]) -
+                            static_cast<float>(in[at(j - 1)])) / 65535.0f;
+                        if (cd < 0.5f * cd_max) continue;
+                        const int distance = std::abs(j - e);
+                        if (distance > best_distance) {
+                            best_distance = distance;
+                            q_star = j;
+                        }
+                    }
+                    bool fine_won = true;
+                    if (q_star >= 0 &&
+                        grad(q_star, fine_won) >= kFlatGround) {
+                        continue;
+                    }
+                }
+                // The contested interval runs from the image edge to the
+                // floating cliff; only texels inside it may move, and the
+                // side representatives anchor BEYOND it, so no halo or
+                // defocus-ramp width can poison the medians.
+                const int lo_anchor = std::min(e, q_star);
+                const int hi_anchor = std::max(e, q_star);
+                if (p < lo_anchor || p > hi_anchor) continue;
+                if (lo_anchor - kRepEnd < 0 ||
+                    hi_anchor + kRepEnd > along_n - 1) {
+                    continue;
+                }
+                float rep_lo_d, rep_hi_d, rep_lo_l, rep_hi_l;
+                {
+                    float dm[5], dp[5], lm[5], lp[5];
+                    for (int k = 0; k < 5; ++k) {
+                        const size_t lo = at(lo_anchor - kRepOff - k);
+                        const size_t hi = at(hi_anchor + kRepOff + k);
+                        dm[k] = in[lo] / 65535.0f;
+                        dp[k] = in[hi] / 65535.0f;
+                        lm[k] = guide[lo];
+                        lp[k] = guide[hi];
+                    }
+                    rep_lo_d = median5(dm[0], dm[1], dm[2], dm[3], dm[4]);
+                    rep_hi_d = median5(dp[0], dp[1], dp[2], dp[3], dp[4]);
+                    rep_lo_l = median5(lm[0], lm[1], lm[2], lm[3], lm[4]);
+                    rep_hi_l = median5(lp[0], lp[1], lp[2], lp[3], lp[4]);
+                }
+                const float y = guide[at(p)];
+                const float d = in[at(p)] / 65535.0f;
+                float proposal;
+                if (std::abs(rep_lo_d - rep_hi_d) >= kSep) {
+                    // Layer-edge mode. Which side of the image edge does
+                    // this texel live on? The edge texel itself is decided
+                    // by its own luma (a step between two texels maximizes
+                    // the centered diff on BOTH, and the argmax may land
+                    // one texel short) — a defocused ramp thereby splits
+                    // at its luma midpoint.
+                    int side;
+                    if (p < e) side = -1;
+                    else if (p > e) side = +1;
+                    else if (std::abs(y - rep_lo_l) + kLumaMargin <
+                             std::abs(y - rep_hi_l)) side = -1;
+                    else if (std::abs(y - rep_hi_l) + kLumaMargin <
+                             std::abs(y - rep_lo_l)) side = +1;
+                    else continue;   // genuinely mixed edge texel
+                    const float rep_own_d = side < 0 ? rep_lo_d : rep_hi_d;
+                    const float rep_oth_d = side < 0 ? rep_hi_d : rep_lo_d;
+                    const float rep_own_l = side < 0 ? rep_lo_l : rep_hi_l;
+                    const float rep_oth_l = side < 0 ? rep_hi_l : rep_lo_l;
+                    // Misassignment test: current depth clearly belongs to
+                    // the OTHER side while the luma votes for its own side.
+                    // Both must hold — the luma vote is what protects a
+                    // bright filament with legitimate near depth.
+                    const float err_own = std::abs(d - rep_own_d);
+                    const float err_oth = std::abs(d - rep_oth_d);
+                    if (err_own <= kMove || err_oth >= 0.5f * err_own)
+                        continue;
+                    if (std::abs(y - rep_own_l) + kLumaMargin >=
+                        std::abs(y - rep_oth_l)) {
+                        continue;
+                    }
+                    proposal = rep_own_d;
+                } else {
+                    // Agreement mode: both rims are the SAME layer — the
+                    // interval is a hallucinated trench (no image support
+                    // on its floating rim, luma continuous with the rims):
+                    // refill it from the agreed layer.
+                    const float agreed = 0.5f * (rep_lo_d + rep_hi_d);
+                    if (std::abs(d - agreed) <= 2.0f * kMove) continue;
+                    if (std::abs(y - 0.5f * (rep_lo_l + rep_hi_l)) >
+                        kAgreeLuma) {
+                        continue;
+                    }
+                    proposal = agreed;
+                }
+                prop_mask[at(p)] = 1;
+                prop_value[at(p)] = static_cast<uint16_t>(
+                    clamp01(proposal) * 65535.0f + 0.5f);
+            }
+        }
+        });
+
+        // ---- phase 2: transverse majority --------------------------------
+        // Commit only decisions shared by >= kMajorityLines of the 5 scan
+        // lines around the texel (within ±1 texel along the scan): an
+        // isolated line's full-layer jump is exactly the wavy-contour
+        // artifact and must never reach the output.
+        parallel_chunks(across_n, max_threads,
+                        [&](int, int begin, int end) {
+        for (int across = begin; across < end; ++across) {
+            for (int p = 0; p < along_n; ++p) {
+                const size_t ip = vertical
+                    ? static_cast<size_t>(p) * width + across
+                    : static_cast<size_t>(across) * width + p;
+                if (!prop_mask[ip]) continue;
+                int lines = 0;
+                for (int da = -2; da <= 2; ++da) {
+                    const int ac = across + da;
+                    if (ac < 0 || ac >= across_n) continue;
+                    bool any = false;
+                    for (int dl = -1; dl <= 1 && !any; ++dl) {
+                        const int al = p + dl;
+                        if (al < 0 || al >= along_n) continue;
+                        const size_t j = vertical
+                            ? static_cast<size_t>(al) * width + ac
+                            : static_cast<size_t>(ac) * width + al;
+                        if (prop_mask[j]) any = true;
+                    }
+                    if (any) ++lines;
+                }
+                if (lines >= kMajorityLines)
+                    depth_q16[ip] = prop_value[ip];
+            }
+        }
+        });
+    };
+    pass(false);
+    pass(true);
+}
+
 void build_geometry_map(const std::vector<uint16_t>& depth_q16,
                         const std::vector<float>& rgb_chw,
                         const std::vector<float>& luma,
@@ -1344,6 +1802,7 @@ void SharedDepthService::attach(uint64_t client_id) {
         latest_.reset();
         ++output_sequence_;
         output_time_ = {};
+        output_video_ms_ = -1.0;
     }
     last_snap_ms_.store(-1, std::memory_order_release);
     last_snap_video_ms_.store(-1.0, std::memory_order_release);
@@ -1390,7 +1849,8 @@ int SharedDepthService::client_count() const {
     return clients_.load(std::memory_order_acquire);
 }
 
-bool SharedDepthService::wants_input(uint64_t client_id) {
+bool SharedDepthService::wants_input(uint64_t client_id,
+                                     double video_time_ms) {
     if (!running() || clients_.load(std::memory_order_acquire) <= 0) return false;
     const auto now = Clock::now();
     std::lock_guard<std::mutex> lk(input_mtx_);
@@ -1403,13 +1863,59 @@ bool SharedDepthService::wants_input(uint64_t client_id) {
 
     leader_id_ = client_id;
     leader_seen_ = now;
+    const double last_pts =
+        last_submitted_video_ms_.load(std::memory_order_acquire);
+    if (video_time_ms >= 0.0 && last_pts >= 0.0 &&
+        std::abs(video_time_ms - last_pts) <= kPtsJitterMs) {
+        duplicate_pts_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     grants_.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+void SharedDepthService::note_plate_state(
+        bool requested, bool armed, bool live, double cut_in) {
+    plate_requested_.store(requested, std::memory_order_relaxed);
+    plate_armed_.store(armed, std::memory_order_relaxed);
+    plate_live_.store(live, std::memory_order_relaxed);
+    if (requested && armed && !live) {
+        plate_held_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // Only meaningful while the advisory still describes a real, recent cut:
+    // the sentinel (-1e9) and long-expired values must not count.
+    if (live && cut_in > -500.0 && cut_in < 300.0) {
+        plate_post_.fetch_add(1, std::memory_order_relaxed);
+        plate_cut_in_.store(static_cast<float>(cut_in),
+                            std::memory_order_relaxed);
+    }
 }
 
 void SharedDepthService::note_drain_miss(bool ring_empty) {
     if (ring_empty) drain_empty_.fetch_add(1, std::memory_order_relaxed);
     else drain_stalled_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SharedDepthService::note_pass(uint64_t client_id) {
+    {
+        // Same mutex wants_input() already takes once per pass, so this adds no
+        // new contention profile.
+        std::lock_guard<std::mutex> lk(input_mtx_);
+        if (leader_id_ != client_id) return;
+    }
+    const int64_t now =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now().time_since_epoch()).count();
+    const int64_t prev = last_pass_ns_.exchange(now, std::memory_order_acq_rel);
+    if (prev == 0) return;                       // first pass has no interval
+    const int64_t dt_us = (now - prev) / 1000;
+    // A paused or backgrounded surface can leave an arbitrarily long gap that
+    // would swamp the average and hide the very jitter this is here to show.
+    if (dt_us <= 0 || dt_us > 500000) return;
+    pass_us_sum_.fetch_add(static_cast<uint64_t>(dt_us),
+                           std::memory_order_relaxed);
+    pass_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool SharedDepthService::submit(
@@ -1429,6 +1935,18 @@ bool SharedDepthService::submit(
     {
         std::lock_guard<std::mutex> lk(input_mtx_);
         if (leader_id_ != client_id) return false;
+        // Copies can already be in the renderer's asynchronous staging ring
+        // when wants_input() first observes a repeated pause PTS. Reject them
+        // here as the authoritative second gate, before any temporal state or
+        // counters advance.
+        const double last_pts =
+            last_submitted_video_ms_.load(std::memory_order_acquire);
+        if (video_time_ms >= 0.0 && last_pts >= 0.0 &&
+            std::abs(video_time_ms - last_pts) <= kPtsJitterMs) {
+            duplicate_pts_.fetch_add(1, std::memory_order_relaxed);
+            leader_seen_ = Clock::now();
+            return false;
+        }
         // Latest-only means OVERWRITE: refusing while a frame sat unconsumed
         // turned submit jitter into skipped source intervals (measured
         // round 6b: source_ms alternating 42/83 ms and ~20% of the pipeline's
@@ -1441,31 +1959,57 @@ bool SharedDepthService::submit(
         input_source_width_ = std::max(0, source_width);
         input_source_height_ = std::max(0, source_height);
         input_fresh_ = true;
+        if (video_time_ms >= 0.0)
+            last_submitted_video_ms_.store(
+                video_time_ms, std::memory_order_release);
         leader_seen_ = Clock::now();
         submits_.fetch_add(1, std::memory_order_relaxed);
+        // Wall time from the GPU copy being issued to it reaching the mailbox.
+        // One render pass is the designed cost (the drain is deliberately
+        // non-blocking and picks up the previous pass's copy); materially more
+        // means copies land late, and every miss costs a whole source interval.
+        const int64_t lat_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                leader_seen_ - capture_time).count();
+        if (lat_us >= 0 && lat_us <= 500000) {
+            taplat_us_sum_.fetch_add(static_cast<uint64_t>(lat_us),
+                                     std::memory_order_relaxed);
+            taplat_count_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     input_cv_.notify_one();
     return true;
 }
 
 std::shared_ptr<const SharedDepthService::GeometryMap> SharedDepthService::snapshot(
-        uint64_t after_sequence, uint64_t& sequence) const {
+        uint64_t after_sequence, uint64_t& sequence,
+        double& source_video_ms) const {
     std::lock_guard<std::mutex> lk(output_mtx_);
     sequence = output_sequence_;
+    source_video_ms = output_video_ms_;
     if (!latest_ || output_sequence_ == after_sequence) return {};
     return latest_;
 }
 
 void SharedDepthService::notify_seek() {
     reset_stabilizer_.store(true, std::memory_order_release);
+    // A seek may legitimately land on a PTS seen before the jump. The new
+    // epoch must be allowed to submit it once.
+    last_submitted_video_ms_.store(-1.0, std::memory_order_release);
     // Advisory events belong to the pre-seek timeline. The NONE sentinel,
     // never -1.0: a small negative is real hold-window data.
     lookahead_cut_ms_.store(kLookaheadNone, std::memory_order_release);
     lookahead_storm_ms_.store(kLookaheadNone, std::memory_order_release);
+    // Cut boundaries too: after a seek the media clock jumps, and a stale
+    // boundary from the pre-seek timeline could pin the cross-shot gate
+    // (backward seek) or fake one (forward seek across a cut).
+    std::lock_guard<std::mutex> lk(cut_pts_mtx_);
+    cut_pts_.clear();
 }
 
 void SharedDepthService::set_lookahead_advisory(double cut_in_ms,
-                                                double storm_in_ms) {
+                                                double storm_in_ms,
+                                                double cut_pts_ms) {
     static const bool enabled = []() {
         char* env = nullptr;   // house idiom (MSVC-safe, cf. SYLC_FLOW_THREADS)
         size_t len = 0;
@@ -1480,6 +2024,127 @@ void SharedDepthService::set_lookahead_advisory(double cut_in_ms,
     lookahead_cut_ms_.store(cut_in_ms, std::memory_order_release);
     lookahead_storm_ms_.store(storm_in_ms, std::memory_order_release);
     lookahead_set_ms_.store(steady_now_ms(), std::memory_order_release);
+    if (cut_pts_ms >= 0.0) note_cut_pts(cut_pts_ms);
+}
+
+void SharedDepthService::note_cut_pts(double pts_ms) {
+    if (!(pts_ms >= 0.0) || !std::isfinite(pts_ms)) return;
+    std::lock_guard<std::mutex> lk(cut_pts_mtx_);
+    // The same cut arrives from two independent observers (scout ahead of
+    // presentation, worker snap behind it) whose media clocks agree only to
+    // rounding + one observation: merge anything within half a frame. 21 ms
+    // covers 24 fps; at higher rates two REAL cuts are never that close.
+    for (double& c : cut_pts_) {
+        if (std::abs(c - pts_ms) < 21.0) {
+            // Keep the EARLIER boundary: the scout dates the cut at the new
+            // shot's first frame, the worker snap can only be at/after it.
+            c = std::min(c, pts_ms);
+            return;
+        }
+    }
+    if (cut_pts_.size() >= kMaxCutBoundaries)
+        cut_pts_.erase(cut_pts_.begin());
+    cut_pts_.push_back(pts_ms);
+    std::sort(cut_pts_.begin(), cut_pts_.end());
+}
+
+void SharedDepthService::note_motion_hints(
+        double pts_ms, double frame_ms, int blocks_w, int blocks_h,
+        int source_width, int source_height,
+        std::vector<int16_t>&& mv_xy, std::vector<uint8_t>&& valid) {
+    static const bool enabled = []() {
+        char* env = nullptr;   // house idiom (MSVC-safe, cf. SYLC_FLOW_THREADS)
+        size_t len = 0;
+        bool on = true;
+        if (_dupenv_s(&env, &len, "SYLC_SYNTH3D_MV_HINTS") == 0 && env) {
+            on = env[0] != '0';   // SYLC_SYNTH3D_MV_HINTS=0 = rollback
+            free(env);
+        }
+        return on;
+    }();
+    if (!enabled) return;
+    if (!(pts_ms >= 0.0) || blocks_w <= 0 || blocks_h <= 0 ||
+        mv_xy.size() != 2 * static_cast<size_t>(blocks_w) * blocks_h) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(hints_mtx_);
+    // Every presentation surface forwards the decoder packet, while all
+    // surfaces using the same graph attach to this ONE process-wide service.
+    // Repeated packets for the same source frame must therefore replace their
+    // existing slot instead of shrinking the six-frame ring to 6 / clients.
+    // Keep the epsilon deliberately tiny: the 21 ms lookup tolerance absorbs
+    // clock rounding, but using it here would merge real adjacent frames at
+    // 50/60/120 fps.
+    constexpr double kSamePtsEpsilonMs = 0.01;
+    MotionHints* slot = nullptr;
+    for (MotionHints& hint : hints_) {
+        if (hint.pts_ms >= 0.0 &&
+            std::abs(hint.pts_ms - pts_ms) <= kSamePtsEpsilonMs) {
+            slot = &hint;
+            break;
+        }
+    }
+    if (!slot) {
+        slot = &hints_[hint_write_];
+        hint_write_ = (hint_write_ + 1) % kHintRing;
+    }
+    slot->pts_ms = pts_ms;
+    slot->frame_ms = frame_ms > 1.0 ? frame_ms : 41.7;
+    slot->blocks_w = blocks_w;
+    slot->blocks_h = blocks_h;
+    slot->source_width = source_width;
+    slot->source_height = source_height;
+    slot->mv_xy = std::move(mv_xy);
+    slot->valid = std::move(valid);
+}
+
+bool SharedDepthService::fetch_motion_hints(
+        double pts_ms, MotionHints& out) const {
+    if (!(pts_ms >= 0.0)) return false;
+    std::lock_guard<std::mutex> lk(hints_mtx_);
+    for (const MotionHints& h : hints_) {
+        // Même clef média que la garde cross-shot : la moitié d'une frame
+        // absorbe les arrondis des différentes horloges.
+        if (h.pts_ms >= 0.0 && std::abs(h.pts_ms - pts_ms) < 21.0) {
+            out = h;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SharedDepthService::cross_shot(double map_video_ms,
+                                    double presented_video_ms) const {
+    std::lock_guard<std::mutex> lk(cut_pts_mtx_);
+    bool gated = false;
+    for (size_t i = 0; i < cut_pts_.size();) {
+        const double c = cut_pts_[i];
+        // Prune by MEDIA distance, not wall time: a boundary 4 s behind the
+        // playhead can no longer separate any live map from any presented
+        // frame (the worker republishes within ~2 frames of real time).
+        if (presented_video_ms >= 0.0 && presented_video_ms - c > 4000.0) {
+            cut_pts_.erase(cut_pts_.begin() + static_cast<ptrdiff_t>(i));
+            continue;
+        }
+        if (cross_shot_gate(map_video_ms, presented_video_ms, c))
+            gated = true;
+        ++i;
+    }
+    if (gated) gate_frames_.fetch_add(1, std::memory_order_relaxed);
+    return gated;
+}
+
+double SharedDepthService::latest_presented_cut(
+        double presented_video_ms) const {
+    if (!std::isfinite(presented_video_ms) || presented_video_ms < 0.0)
+        return -1.0;
+    std::lock_guard<std::mutex> lk(cut_pts_mtx_);
+    double latest = -1.0;
+    for (double c : cut_pts_) {
+        if (presented_video_ms >= c - kPtsJitterMs)
+            latest = std::max(latest, c);
+    }
+    return latest;
 }
 
 int64_t SharedDepthService::last_snap_steady_ms() const {
@@ -1519,15 +2184,28 @@ std::string SharedDepthService::status() const {
             age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 Clock::now() - output_time_).count();
     }
-    char buf[832] = {};
+    size_t mv_slots = 0;
+    {
+        std::lock_guard<std::mutex> lk(hints_mtx_);
+        for (const MotionHints& hint : hints_)
+            if (hint.pts_ms >= 0.0) ++mv_slots;
+    }
+    char buf[1280] = {};
     std::snprintf(
         buf, sizeof(buf),
         "state=%s provider=%s views=%d side=%d fps=%.1f "
         "flow_ms=%.1f infer_ms=%.1f "
         "stab_ms=%.1f inwait_ms=%.1f reswait_ms=%.1f joinwait_ms=%.1f "
-        "cycle_ms=%.1f grants=%llu submits=%llu dempty=%llu dstall=%llu "
-        "la_stale=%llu la_seen=%llu "
+        "cycle_ms=%.1f pass_ms=%.1f taplat_ms=%.1f "
+        "grants=%llu submits=%llu duppts=%llu "
+        "dempty=%llu dstall=%llu "
+        "plateheld=%llu platepost=%llu platecut=%.0f "
+        "plate_req=%d plate_arm=%d plate_live=%d "
+        "la_stale=%llu la_seen=%llu gate=%llu "
         "source_ms=%.1f update_ms=%.1f age_ms=%lld clients=%d cuts=%llu "
+        "cut_bnd=%llu cut_src=%llu cut_depth=%llu depthres=%.3f "
+        "depthbase=%.3f "
+        "mvslots=%zu "
         "motion=%.3f flow=%.2f alpha=%.3f conf=%.3f stable=%.3f "
         "history=%.2f scene=%.3f crop=%d:%d:%d:%d crop_conf=%.2f "
         "crop_ready=%d grid=%dx%d instance=%llu err=%s",
@@ -1542,20 +2220,43 @@ std::string SharedDepthService::status() const {
         static_cast<double>(reswait_ms_.load(std::memory_order_acquire)),
         static_cast<double>(joinwait_ms_.load(std::memory_order_acquire)),
         static_cast<double>(cycle_ms_.load(std::memory_order_acquire)),
+        static_cast<double>(pass_ms_.load(std::memory_order_acquire)),
+        static_cast<double>(taplat_ms_.load(std::memory_order_acquire)),
         static_cast<unsigned long long>(grants_.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(submits_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            duplicate_pts_.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(
             drain_empty_.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(
             drain_stalled_.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(
+            plate_held_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            plate_post_.load(std::memory_order_relaxed)),
+        static_cast<double>(plate_cut_in_.load(std::memory_order_relaxed)),
+        plate_requested_.load(std::memory_order_relaxed) ? 1 : 0,
+        plate_armed_.load(std::memory_order_relaxed) ? 1 : 0,
+        plate_live_.load(std::memory_order_relaxed) ? 1 : 0,
+        static_cast<unsigned long long>(
             la_stale_.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(
             la_seen_.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(
+            gate_frames_.load(std::memory_order_relaxed)),
         static_cast<double>(source_dt_ms_.load(std::memory_order_acquire)),
         static_cast<double>(update_dt_ms_.load(std::memory_order_acquire)), age_ms,
         clients_.load(std::memory_order_acquire),
         static_cast<unsigned long long>(cuts_.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(
+            cut_boundary_.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(
+            cut_source_.load(std::memory_order_acquire)),
+        static_cast<unsigned long long>(
+            cut_depth_.load(std::memory_order_acquire)),
+        static_cast<double>(depth_residual_.load(std::memory_order_acquire)),
+        static_cast<double>(depth_baseline_.load(std::memory_order_acquire)),
+        mv_slots,
         static_cast<double>(motion_.load(std::memory_order_acquire)),
         static_cast<double>(flow_.load(std::memory_order_acquire)),
         static_cast<double>(effective_alpha_.load(std::memory_order_acquire)),
@@ -1627,6 +2328,9 @@ void SharedDepthService::worker_main() {
         // qu'à la prep du map SUIVANT ; la fusion se fait dans l'étage S.
         std::vector<float> fwd_x, fwd_y, fwd_q;
         std::vector<float> fut_x, fut_y, fut_q;
+        // Phase 1 (04/08) : candidat DÉCODEUR rasterisé à la prep (grille),
+        // troisième entrée de la fusion à l'étage S. Vide = pas d'indice.
+        std::vector<float> hint_x, hint_y, hint_q;
         std::future<void> flow_task;           // direction causale
         std::future<void> future_task;         // direction future
         double flow_task_ms = 0.0;
@@ -1637,6 +2341,10 @@ void SharedDepthService::worker_main() {
         float mean_flow = 0.0f;
         float histogram_distance = 0.0f;
         bool source_cut = false;
+        // This observation CROSSED a recorded cut boundary (authoritative
+        // scout/worker knowledge): the S-stage must guarantee the snap even
+        // when both content detectors are blind (similar compositions).
+        bool boundary_cut = false;
         bool have_prev = false;
         bool valid_video_time = false;
         double video_time_ms = -1.0;
@@ -1662,6 +2370,7 @@ void SharedDepthService::worker_main() {
     std::vector<float> surface_boundary(n, 0.0f);
     std::vector<float> surface_scratch(n, 0.0f);
     std::vector<uint16_t> q16(n, 0);
+    std::vector<uint16_t> realign_scratch;
     bool have_previous_image = false;
     DepthStabilizer stabilizer(n);
     // Confirms the source-histogram scene-cut signal over two consecutive
@@ -1687,6 +2396,13 @@ void SharedDepthService::worker_main() {
     double reswait_ms_accum = 0.0;
     double joinwait_ms_accum = 0.0;
     double cycle_ms_accum = 0.0;
+    // Previous snapshot of the client-side cumulative counters. They are
+    // written from the render thread, so the window value is a delta rather
+    // than an accumulate-and-clear like the stage timers above.
+    uint64_t pass_count_seen = 0;
+    uint64_t pass_us_seen = 0;
+    uint64_t taplat_count_seen = 0;
+    uint64_t taplat_us_seen = 0;
     auto last_cycle_top = Clock::now();
     bool have_cycle_top = false;
     // Two deliberately separate clocks:
@@ -1707,6 +2423,16 @@ void SharedDepthService::worker_main() {
     bool have_update_time = false;
     const int flow_threads = flow_threads_from_env();
     stabilizer.worker_threads = flow_threads;
+    {
+        // SYLC_SYNTH3D_DEPTHCUT_ADAPT=0 restores the fixed 0.35 depth-cut
+        // threshold (disables the ambient-baseline outlier gate).
+        char* env = nullptr;   // house idiom (MSVC-safe)
+        size_t len = 0;
+        if (_dupenv_s(&env, &len, "SYLC_SYNTH3D_DEPTHCUT_ADAPT") == 0 && env) {
+            if (env[0] == '0') stabilizer.cut_baseline_gain = 0.0f;
+            std::free(env);
+        }
+    }
     int pending_crop_top = 0;
     int pending_crop_bottom = 0;
     int pending_crop_count = 0;
@@ -1819,11 +2545,23 @@ void SharedDepthService::worker_main() {
                 }
             }
             const auto fuse_start = Clock::now();
+            // Phase 1 : le candidat décodeur entre dans le même arbitrage
+            // par résidu que le futur — rejeté là où il est faux, adopté là
+            // où l'encodeur voyait mieux que notre block matching (oracle :
+            // ×2 en motion/fast/looming).
+            synth3d_flow::DenseFlow hint;
+            synth3d_flow::DenseFlow* hint_ptr = nullptr;
+            if (done.hint_q.size() == n) {
+                hint.x = std::move(done.hint_x);
+                hint.y = std::move(done.hint_y);
+                hint.quality = std::move(done.hint_q);
+                hint_ptr = &hint;
+            }
             synth3d_flow::fuse_bidirectional(
                 prev_luma, luma, forward, future, width, height,
                 done.video_time_scale, publish_flow_x, publish_flow_y,
                 flow_reliability, motion, motion_sum, mean_flow,
-                flow_threads);
+                flow_threads, hint_ptr);
             flow_ms_accum += std::chrono::duration<double, std::milli>(
                 Clock::now() - fuse_start).count();
         }
@@ -1849,28 +2587,24 @@ void SharedDepthService::worker_main() {
             // Motion at a silhouette is often registered one or two pixels on
             // only one side. Expand it along the guard band so the complete
             // neck/shoulder boundary chooses the short-memory path together.
-            // Row-parallel: reads come from the pre-copied snapshot, each row
-            // writes only its own motion[] — bitwise identical at any thread
-            // count (round-6 serial-tail shave).
-            surface_scratch = motion;
-            parallel_chunks(height - 2, flow_threads,
-                            [&](int, int begin, int end) {
-            for (int y = 1 + begin; y < 1 + end; ++y) {
-                for (int x = 1; x < width - 1; ++x) {
-                    const size_t i = static_cast<size_t>(y) * width + x;
-                    if (surface_boundary[i] < 0.20f) continue;
-                    float local_max = 0.0f;
-                    for (int oy = -1; oy <= 1; ++oy)
-                        for (int ox = -1; ox <= 1; ++ox)
-                            local_max = std::max(
-                                local_max,
-                                surface_scratch[
-                                    static_cast<size_t>(y + oy) * width +
-                                    x + ox]);
-                    motion[i] = local_max;
+            // Phase 2 (04/08) : la portée directionnelle anti-traînée ne
+            // s'active qu'avec un transport fusionné disponible.
+            static const bool trail_erode = []() {
+                char* env = nullptr;   // house idiom (MSVC-safe)
+                size_t len = 0;
+                bool on = true;
+                if (_dupenv_s(&env, &len, "SYLC_SYNTH3D_TRAIL_ERODE") == 0 &&
+                    env) {
+                    on = env[0] != '0';   // =0 : expansion 3x3 historique
+                    free(env);
                 }
-            }
-            });
+                return on;
+            }();
+            synth3d_flow::expand_boundary_motion(
+                motion, surface_boundary, publish_flow_x, publish_flow_y,
+                width, height, surface_scratch, flow_threads,
+                trail_erode && publish_flow_x.size() == n &&
+                    publish_flow_y.size() == n);
         }
         const auto stab_start = Clock::now();
         float update_dt_ms = DepthStabilizer::kReferenceDtMs;
@@ -1924,11 +2658,66 @@ void SharedDepthService::worker_main() {
                 for (auto& mv : motion) mv = std::max(mv, 0.35f);
             }
         }
+        // Phase 2 (04/08) — plancher LOOMING : l'expansion (marche face
+        // caméra, dolly, zoom) est lue DANS la divergence du transport
+        // fusionné — plus besoin d'un avis externe pour ce régime. Comme
+        // l'avis tempête, un plancher de mouvement gradué déclenche le
+        // chemin mémoire-courte du stabilizer sur tout le champ pendant que
+        // l'image entière se déforme (l'oracle a montré que la translation
+        // pure y sous-estime le mouvement réel). Seuil = DIV_LOOM de
+        // l'oracle (0.0035/texel à cadence source), rampe pleine à 2x.
+        // SYLC_SYNTH3D_LOOM_FLOOR=0 = rollback.
+        {
+            static const bool loom_on = []() {
+                char* env = nullptr;   // house idiom (MSVC-safe)
+                size_t len = 0;
+                bool on = true;
+                if (_dupenv_s(&env, &len, "SYLC_SYNTH3D_LOOM_FLOOR") == 0 &&
+                    env) {
+                    on = env[0] != '0';
+                    free(env);
+                }
+                return on;
+            }();
+            if (loom_on && done.have_prev &&
+                publish_flow_x.size() == n && publish_flow_y.size() == n) {
+                const double div = synth3d_flow::mean_divergence(
+                    publish_flow_x, publish_flow_y, width, height) *
+                    (41.7 / std::max(4.0f, done.source_dt_ms));
+                const float loom = clamp01(
+                    (static_cast<float>(std::abs(div)) - 0.0035f) / 0.0035f);
+                if (loom > 0.0f) {
+                    const float floor_value = 0.30f * loom;
+                    for (auto& mv : motion)
+                        mv = std::max(mv, floor_value);
+                }
+            }
+        }
+        // A crossed boundary is authoritative: raise the signal to the
+        // stabilizer's own threshold so its internal OR fires even when the
+        // two shots' histograms AND depth statistics are deceptively similar
+        // (shot/reverse-shot faces) — the case where blending would imprint
+        // the old shot's contours into the new one for the EMA's half-life.
+        float scene_signal = source_cut_step ? histogram_distance : 0.0f;
+        if (done.boundary_cut)
+            scene_signal = boundary_scene_signal(
+                histogram_distance, stabilizer.scene_cut_threshold);
         bool cut = stabilizer.step(
             raw.data(), q16.data(),
             done.have_prev ? motion.data() : nullptr,
-            source_cut_step ? histogram_distance : 0.0f, confidence.data(),
+            scene_signal, confidence.data(),
             surface_boundary.data());
+        // Snapshot the cause before the optional temporal-window retry resets
+        // the stabilizer. Previously that retry made a real geometry snap
+        // disappear from `cuts`, preventing any evidence-based threshold work.
+        const bool detected_depth_cut = stabilizer.last_depth_cut();
+        const bool detected_scene_cut = stabilizer.last_scene_cut();
+        const float detected_depth_residual =
+            stabilizer.last_depth_residual();
+        depth_baseline_.store(stabilizer.residual_baseline(),
+                              std::memory_order_release);
+        depth_residual_.store(detected_depth_residual,
+                              std::memory_order_release);
         stab_ms_accum += std::chrono::duration<double, std::milli>(
             Clock::now() - stab_start).count();
         if (cut && input_views > 1 && !source_cut_step) {
@@ -1973,15 +2762,17 @@ void SharedDepthService::worker_main() {
                 Clock::now() - retry_stab_start).count();
             // reset() unprimes the stabilizer, so this step() always takes the
             // priming path and returns cut=false -- yet the EMA and tone range
-            // were both just fully replaced, a real geometry teleport
-            // functionally identical to a snap. Record it unconditionally so
-            // the ramp actually engages here; deliberately NOT mirrored into
-            // cuts_ (that diagnostic counter's pre-existing blind spot on
-            // this exact branch is out of scope for this fix).
+            // were both just fully replaced, a real geometry teleport.
+            // Record both the ramp event and its honest diagnostic cause.
+            cuts_.fetch_add(1, std::memory_order_acq_rel);
+            cut_depth_.fetch_add(1, std::memory_order_acq_rel);
             last_snap_ms_.store(steady_now_ms(), std::memory_order_release);
             last_snap_video_ms_.store(
                 valid_video_time ? video_time_ms : -1.0,
                 std::memory_order_release);
+            // Depth-residual retry = a real cut at THIS map's observation:
+            // record its boundary for the cross-shot gate too.
+            if (valid_video_time) note_cut_pts(video_time_ms);
             for (int view = 0; view < input_views; ++view)
                 std::copy(
                     reprime_input.begin(), reprime_input.end(),
@@ -2010,15 +2801,48 @@ void SharedDepthService::worker_main() {
                                      std::memory_order_release);
         if (cut) {
             cuts_.fetch_add(1, std::memory_order_acq_rel);
+            if (done.boundary_cut)
+                cut_boundary_.fetch_add(1, std::memory_order_acq_rel);
+            else if (detected_scene_cut || source_cut_step)
+                cut_source_.fetch_add(1, std::memory_order_acq_rel);
+            else if (detected_depth_cut)
+                cut_depth_.fetch_add(1, std::memory_order_acq_rel);
             last_snap_ms_.store(steady_now_ms(), std::memory_order_release);
             last_snap_video_ms_.store(
                 valid_video_time ? video_time_ms : -1.0,
                 std::memory_order_release);
+            // Cross-shot boundary from the worker's own detection: covers a
+            // cut the scout missed (dedupes with the scout's pts otherwise).
+            // A boundary-driven cut is already in the list — re-noting it at
+            // this observation's pts (up to a frame later) would just add a
+            // second, later-dated boundary for the same cut.
+            if (valid_video_time && !done.boundary_cut)
+                note_cut_pts(video_time_ms);
         }
 
         {
             std::vector<uint16_t> ownership_geometry;
             const auto geometry_start = Clock::now();
+            // Contour re-anchoring (04/08): snap the stabilized map's layer
+            // edges onto the image edges before ownership analysis, so the
+            // near-halo a monocular model paints over the background beside
+            // a silhouette never reaches the warp (or blocks the plate from
+            // learning the true background there). See realign_contours.
+            static const bool realign_on = []() {
+                char* env = nullptr;   // house idiom (MSVC-safe)
+                size_t len = 0;
+                bool on = true;
+                if (_dupenv_s(&env, &len, "SYLC_SYNTH3D_REALIGN") == 0 &&
+                    env) {
+                    on = env[0] != '0';   // SYLC_SYNTH3D_REALIGN=0 = rollback
+                    free(env);
+                }
+                return on;
+            }();
+            if (realign_on) {
+                synth3d_surface::realign_contours(
+                    q16, luma, width, height, realign_scratch, flow_threads);
+            }
             synth3d_surface::build_geometry_map(
                 q16, input, luma, confidence, surface_boundary,
                 width, height, ownership_geometry,
@@ -2026,7 +2850,17 @@ void SharedDepthService::worker_main() {
             GeometryMap geometry(kGeometryChannels * n);
             const bool has_flow = publish_flow_x.size() == n &&
                                   publish_flow_y.size() == n;
-            for (size_t i = 0; i < n; ++i) {
+            // Pure per-pixel repack (reads ownership + transport, writes the
+            // published channels once each): no accumulation and no cross-
+            // pixel reads, so chunking is bitwise identical to the sequential
+            // loop at any worker count -- the parallel_chunks.h guarantee.
+            // This was the last serial per-pixel pass left inside the
+            // geometry segment of the stab_ms window (realign and
+            // build_geometry_map above it already take flow_threads).
+            parallel_chunks(static_cast<int>(n), flow_threads,
+                            [&](int, int i_begin, int i_end) {
+            for (size_t i = static_cast<size_t>(i_begin);
+                 i < static_cast<size_t>(i_end); ++i) {
                 const float raw_depth = ownership_geometry[4 * i + 0] / 65535.0f;
                 const float owned_depth = ownership_geometry[4 * i + 1] / 65535.0f;
                 const float safety = ownership_geometry[4 * i + 2] / 65535.0f;
@@ -2051,6 +2885,7 @@ void SharedDepthService::worker_main() {
                     clamp01(rel) * 65535.0f + 0.5f);
                 geometry[out + 5] = 0;
             }
+            });
             stab_ms_accum += std::chrono::duration<double, std::milli>(
                 Clock::now() - geometry_start).count();
             auto published = std::make_shared<GeometryMap>(std::move(geometry));
@@ -2058,6 +2893,11 @@ void SharedDepthService::worker_main() {
             latest_ = std::move(published);
             ++output_sequence_;
             output_time_ = Clock::now();
+            // Shot identity (04/08): the map travels with the media PTS of
+            // the observation it was computed from. This is what lets the
+            // renderer test cross-shot state instead of racing deadlines.
+            output_video_ms_ =
+                valid_video_time ? video_time_ms : -1.0;
         }
 
         ++fps_count;
@@ -2082,6 +2922,33 @@ void SharedDepthService::worker_main() {
                 std::memory_order_release);
             cycle_ms_.store(static_cast<float>(cycle_ms_accum / fps_count),
                             std::memory_order_release);
+            // Client-side counters: cumulative and written from other threads,
+            // so the window value is a delta against the previous snapshot.
+            // Single reader (this worker), hence no lock.
+            const uint64_t pc = pass_count_.load(std::memory_order_relaxed);
+            const uint64_t ps = pass_us_sum_.load(std::memory_order_relaxed);
+            if (pc > pass_count_seen) {
+                pass_ms_.store(
+                    static_cast<float>((ps - pass_us_seen) /
+                                       static_cast<double>(pc - pass_count_seen)
+                                       * 1e-3),
+                    std::memory_order_release);
+            }
+            pass_count_seen = pc;
+            pass_us_seen = ps;
+
+            const uint64_t tc = taplat_count_.load(std::memory_order_relaxed);
+            const uint64_t ts = taplat_us_sum_.load(std::memory_order_relaxed);
+            if (tc > taplat_count_seen) {
+                taplat_ms_.store(
+                    static_cast<float>((ts - taplat_us_seen) /
+                                       static_cast<double>(tc - taplat_count_seen)
+                                       * 1e-3),
+                    std::memory_order_release);
+            }
+            taplat_count_seen = tc;
+            taplat_us_seen = ts;
+
             fps_count = 0;
             flow_ms_accum = 0.0;
             infer_ms_accum = 0.0;
@@ -2215,6 +3082,22 @@ void SharedDepthService::worker_main() {
                 std::chrono::duration<double, std::milli>(
                     capture_time - last_capture_time).count());
         }
+        // Cross-shot boundary consumption (04/08 round 2): does THIS
+        // observation cross a recorded cut boundary? Same math as the
+        // renderer gate, applied to (previous observation, this observation).
+        // Consumed exactly once by construction: next cycle the previous pts
+        // is already at/after the boundary. Checked BEFORE last_video_time_ms
+        // is overwritten below.
+        cur.boundary_cut = false;
+        if (valid_video_time && have_video_time) {
+            std::lock_guard<std::mutex> lk(cut_pts_mtx_);
+            for (double c : cut_pts_) {
+                if (cross_shot_gate(last_video_time_ms, video_time_ms, c)) {
+                    cur.boundary_cut = true;
+                    break;
+                }
+            }
+        }
         last_capture_time = capture_time;
         have_capture_time = true;
         last_video_time_ms = valid_video_time ? video_time_ms : -1.0;
@@ -2231,6 +3114,7 @@ void SharedDepthService::worker_main() {
         cur.publish_flow_y.clear();
         cur.fwd_q.clear();
         cur.fut_q.clear();
+        cur.hint_q.clear();
         cur.flow_ran = false;
         cur.flow_task_ms = 0.0;
         cur.future_task_ms = 0.0;
@@ -2238,6 +3122,26 @@ void SharedDepthService::worker_main() {
         const float video_time_scale =
             cur.source_dt_ms / DepthStabilizer::kReferenceDtMs;
         cur.video_time_scale = video_time_scale;
+        // Phase 1 (04/08) : indice décodeur pour CETTE observation, clef
+        // pts (même horloge média que la garde cross-shot). L'échelle
+        // temporelle ramène « par frame d'affichage » à « par observation »
+        // (le worker peut consommer une frame sur deux).
+        if (valid_video_time) {
+            MotionHints hints;
+            if (fetch_motion_hints(video_time_ms, hints)) {
+                synth3d_flow::rasterize_motion_hints(
+                    hints.mv_xy.data(),
+                    hints.valid.empty() ? nullptr : hints.valid.data(),
+                    hints.blocks_w, hints.blocks_h,
+                    hints.source_width > 0 ? hints.source_width
+                                           : std::max(1, source_width),
+                    hints.source_height > 0 ? hints.source_height
+                                            : std::max(1, source_height),
+                    width, height,
+                    static_cast<float>(cur.source_dt_ms / hints.frame_ms),
+                    cur.hint_x, cur.hint_y, cur.hint_q);
+            }
+        }
 
         // Reference bindings keep the transplanted blocks below verbatim:
         // this map's buffers live in `cur`, the previous map's luma in `prior`
@@ -2369,12 +3273,16 @@ void SharedDepthService::worker_main() {
         // Gated (confirmed) verdict: an unconfirmed single-frame spike reads
         // as "not a cut" here so it cannot suppress flow/re-prime temporal
         // history, and (below) cannot drive step()'s internal scene-cut OR
-        // either. depth_cut is always false on this call: the residual cut
-        // lives entirely inside step()'s own OR and is never routed through
-        // this gate -- CutGate's depth_cut=true path exists for callers who
-        // want an immediate verdict and is exercised only by its unit tests
-        // (test_cut_gate.py), not by this integration.
-        const bool source_cut = cut_gate.update(false, histogram_distance);
+        // either. The residual cut lives entirely inside step()'s own OR and
+        // is never routed through this gate. depth_cut=true — the "an
+        // authoritative cut already happened this cycle" path — is taken
+        // when this observation crossed a recorded boundary (04/08 round 2):
+        // it confirms instantly (a clean hard cut produces ONE exceedance,
+        // which alone would never confirm here) and re-arms, so flow is
+        // suppressed and the temporal window re-primed on the exact first
+        // post-cut observation.
+        const bool source_cut =
+            cut_gate.update(cur.boundary_cut, histogram_distance);
         cur.source_cut = source_cut;
         cur.histogram_distance = histogram_distance;
         cur.motion_sum = motion_sum;

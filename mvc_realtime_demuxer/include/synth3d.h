@@ -35,6 +35,7 @@
 #include <string>
 #include <vector>
 #include "shared_depth_service.h"
+#include "stereo_lab.h"
 
 struct Synth3DParams {
     bool  enabled = false;
@@ -48,6 +49,16 @@ struct Synth3DParams {
     // flow-transported, previously SEEN background over the stretch fallback.
     // Off by default (author visual gate); off is byte-identical to before.
     bool  temporal_fill = false;
+    // Additive final corrector. It owns separate outputs and leaves the six
+    // raw v5.2.1c planes immutable for exact A/B rollback.
+    bool  stereo_lab = true;
+    // Calibrated final-disparity envelope. Values are percentages of the
+    // physical image width, derived by the host from screen geometry and VAC
+    // diopters. The shader preserves every disparity below the soft knee and
+    // asymptotically approaches the hard envelope.
+    bool  comfort_enabled = false;
+    float comfort_soft_pct = 0.0f;
+    float comfort_hard_pct = 0.0f;
     bool  depth_view = false;
     bool  diagnostics = false;    // depth + disocclusion overlay on warped image
     std::wstring model_path, ort_dir;
@@ -113,7 +124,9 @@ public:
     // alpha-aware foreground decontamination in the narrow transition band.
     // Passing nullptr disarms the matte and restores the historical shader path.
     bool set_test_matte(const uint8_t* alpha_or_null, uint32_t width,
-                        uint32_t height, size_t count, int mode);
+                        uint32_t height, size_t count, int mode,
+                        const uint8_t* reliability_or_null = nullptr,
+                        size_t reliability_count = 0);
     bool read_plane(ID3D11DeviceContext* ctx, int slot,
                     std::vector<uint8_t>& out, uint32_t& w, uint32_t& h,
                     uint32_t& bpp, std::string& err);  // debug staging readback
@@ -126,8 +139,19 @@ public:
     // frame-size change. Cheap and lock-free; safe to call whether or not a worker runs.
     void notify_seek();
     // Look-ahead advisory (two-filter scout): forwards the presented-relative
-    // delays to the depth service. Lock-free, no-op without a service.
-    void set_lookahead_advisory(double cut_in_ms, double storm_in_ms);
+    // delays — and the ABSOLUTE media PTS of the reported cut (cross-shot
+    // gate boundary, <0 = none) — to the depth service. Lock-free, no-op
+    // without a service.
+    void set_lookahead_advisory(double cut_in_ms, double storm_in_ms,
+                                double cut_pts_ms = -1.0);
+    // Codec motion hints (phase 1, 04/08): forwards the decoder's block
+    // motion field for one frame to the depth service ring. No-op without
+    // a service; the vectors move, never block.
+    void set_motion_hints(double pts_ms, double frame_ms,
+                          int blocks_w, int blocks_h,
+                          int source_width, int source_height,
+                          std::vector<int16_t>&& mv_xy,
+                          std::vector<uint8_t>&& valid);
     // Post-cut/seek ease-out ramp duration in ms (default 300). Right after a
     // confirmed cut or a consumed seek, process() scales cb.max_disp by
     // t*(2-t) where t = clamp((now - last_snap)/ramp_ms, 0, 1), so the new
@@ -148,6 +172,7 @@ private:
 
     // --- renderer thread only (called under NativeRenderer::Impl::mtx) ----------
     bool ensure_pipeline(std::string& err);            // shaders/sampler/raster/cbuffer
+    bool ensure_provenance_shader(std::string& err);   // optional Lab metadata sidecar
     bool ensure_prep(std::string& err);                // grid prep RT + staging ring
     bool ensure_depth(std::string& err);               // grid RG16_UNORM geometry tex
     bool ensure_matte(std::string& err);               // optional RG8 alpha/distance tex
@@ -169,6 +194,7 @@ private:
     CP<ID3D11PixelShader>     psPrep_, psWarpLuma_, psWarpChroma_;
     CP<ID3D11PixelShader>     psViewLuma_, psViewChroma_;
     CP<ID3D11PixelShader>     psPlateAccum_;           // round 5a background plate
+    CP<ID3D11PixelShader>     psProvenance_;           // Lab-only metadata sidecar
     CP<ID3D11SamplerState>    sampler_;                // LINEAR / CLAMP
     CP<ID3D11RasterizerState> raster_;                 // CULL_NONE (fullscreen triangle)
     CP<ID3D11Buffer>          cb_;                     // b0: SynthCB (64 bytes)
@@ -201,6 +227,7 @@ private:
     bool    plate_valid_ = false;      // false => clear both before next accum
     bool    map_refreshed_ = false;    // upload_depth uploaded a NEW map this call
     int64_t plate_snap_seen_ = -1;     // service snap stamp consumed by the purge
+    double  plate_cut_seen_ms_ = -1.0; // absolute cut PTS consumed by this surface
 
     CP<ID3D11Texture2D>          matteTex_;            // arbitrary-grid RG8_UNORM, DYNAMIC
     CP<ID3D11ShaderResourceView> matteSrv_;
@@ -208,6 +235,14 @@ private:
     CP<ID3D11Texture2D>          warpTex_[kNumOut];
     CP<ID3D11RenderTargetView>   warpRtv_[kNumOut];
     CP<ID3D11ShaderResourceView> warpSrv_[kNumOut];
+    // Full-luma visibility provenance, one packed R32_UINT map per eye.  The
+    // chroma pass loads these decisions instead of independently solving
+    // ownership/disocclusion at a different sampling lattice.
+    CP<ID3D11Texture2D>          provenanceTex_[2];
+    CP<ID3D11RenderTargetView>   provenanceRtv_[2];
+    CP<ID3D11ShaderResourceView> provenanceSrv_[2];
+    std::unique_ptr<StereoLab>   stereo_lab_;           // additive final pass
+    bool                         lab_outputs_valid_ = false;
     ID3D11ShaderResourceView*    out_srv_[kNumOut] = {nullptr, nullptr, nullptr,
                                                       nullptr, nullptr, nullptr};
 
@@ -221,7 +256,9 @@ private:
     bool        depth_valid_   = false;                // a nearness map has been uploaded
     bool        depth_dirty_   = false;                // test depth changed -> re-upload
 
-    std::vector<uint8_t> test_matte_;                  // packed RG alpha/boundary-distance
+    // Packed RGBA: alpha, horizontal boundary distance, local registration
+    // reliability, reserved. Fresh network mattes use reliability=255.
+    std::vector<uint8_t> test_matte_;
     uint32_t              matte_width_ = 0;
     uint32_t              matte_height_ = 0;
     uint32_t              matte_texture_width_ = 0;
@@ -239,6 +276,9 @@ private:
     std::shared_ptr<SharedDepthService> depth_service_;
     uint64_t              client_id_ = 0;
     uint64_t              depth_sequence_ = 0;
+    // Media PTS of the source observation behind the CURRENTLY UPLOADED map
+    // (-1 = none/untimed): this surface's side of the cross-shot state test.
+    double                depth_video_ms_ = -1.0;
     bool                  service_attached_ = false;
     float                 ramp_ms_ = 300.f;          // post-cut/seek ease-out duration
     std::string           local_error_;              // GPU/resource failure for status/UI

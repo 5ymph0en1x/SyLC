@@ -25,7 +25,7 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-// cbuffer b0 (SynthCB in the HLSL) — 80 bytes (5 x 16). Layout must match the
+// cbuffer b0 (SynthCB in the HLSL) — 96 bytes (6 x 16). Layout must match the
 // cbuffer declaration in shaders/synth3d.hlsl.
 struct SynthCB {
     float max_disp;        // c0.x  disparity budget, fraction of image WIDTH
@@ -44,9 +44,14 @@ struct SynthCB {
     int   matte_mode;      // c3.w: 0=off, 1=guard, 2=alpha-aware contour
     int   temporal_fill;   // c4.x: round 5a background plate on/off
     float plate_ceiling;   // c4.y: nearness ceiling for plate refresh
-    float pad4[2];         // c4.zw
+    float far_snap_on;     // c4.z: v4 sub-texel background reclaim (1=on)
+    float pad4;            // c4.w
+    float comfort_soft_disp; // c5.x: untouched knee, fraction of image width
+    float comfort_hard_disp; // c5.y: asymptotic envelope, image-width fraction
+    int   comfort_enabled;   // c5.z
+    float pad5;              // c5.w
 };
-static_assert(sizeof(SynthCB) == 80, "SynthCB must be 80 bytes");
+static_assert(sizeof(SynthCB) == 96, "SynthCB must be 96 bytes");
 
 // ImageNet normalization — the SAME constants DepthEngine's input contract expects
 // and that python_bindings.cpp's depth_infer_test applies (Task 2).
@@ -137,6 +142,25 @@ bool Synth3D::ensure_pipeline(std::string& err) {
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     if (FAILED(device_->CreateBuffer(&cbd, nullptr, &cb_))) {
         err = "synth3d: CreateBuffer(SynthCB) failed"; vs_.Reset(); return false;
+    }
+    return true;
+}
+
+bool Synth3D::ensure_provenance_shader(std::string& err) {
+    if (psProvenance_) return true;
+    if (!device_) {
+        err = "synth3d: no device for provenance sidecar";
+        return false;
+    }
+    sylc::ShaderBytecode bytecode;
+    if (!sylc::load_shader_bytecode(
+            IDR_SYLC_SYNTH3D_PS_PROVENANCE, bytecode, err)) {
+        return false;
+    }
+    if (FAILED(device_->CreatePixelShader(
+            bytecode.data, bytecode.size, nullptr, &psProvenance_))) {
+        err = "CreatePixelShader(PS_WarpProvenance) failed";
+        return false;
     }
     return true;
 }
@@ -258,7 +282,7 @@ bool Synth3D::ensure_matte(std::string& err) {
     td.Height           = matte_height_;
     td.MipLevels        = 1;
     td.ArraySize        = 1;
-    td.Format           = DXGI_FORMAT_R8G8_UNORM;
+    td.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
     td.SampleDesc.Count = 1;
     td.Usage            = D3D11_USAGE_DYNAMIC;
     td.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
@@ -281,13 +305,19 @@ bool Synth3D::ensure_matte(std::string& err) {
 
 bool Synth3D::ensure_warp(uint32_t y_w, uint32_t y_h, uint32_t c_w, uint32_t c_h,
                           DXGI_FORMAT fmt, std::string& err) {
-    if (warpTex_[0] && y_w_ == y_w && y_h_ == y_h && c_w_ == c_w && c_h_ == c_h &&
+    if (warpTex_[0] && provenanceTex_[0] &&
+        y_w_ == y_w && y_h_ == y_h && c_w_ == c_w && c_h_ == c_h &&
         plane_fmt_ == fmt) {
         return true;
     }
     for (int i = 0; i < kNumOut; ++i) {
         warpSrv_[i].Reset(); warpRtv_[i].Reset(); warpTex_[i].Reset();
         out_srv_[i] = nullptr;
+    }
+    for (int i = 0; i < 2; ++i) {
+        provenanceSrv_[i].Reset();
+        provenanceRtv_[i].Reset();
+        provenanceTex_[i].Reset();
     }
     outputs_valid_ = false;
     readTex_.Reset(); read_w_ = read_h_ = 0; read_fmt_ = DXGI_FORMAT_UNKNOWN;
@@ -316,6 +346,40 @@ bool Synth3D::ensure_warp(uint32_t y_w, uint32_t y_h, uint32_t c_w, uint32_t c_h
             return false;
         }
         out_srv_[i] = warpSrv_[i].Get();
+    }
+
+    // The full-resolution luma pass is the sole visibility solver.  Persist
+    // its compact decision in two integer maps so 4:2:0 chroma cannot choose
+    // a different layer merely because it runs on a half-resolution lattice.
+    D3D11_TEXTURE2D_DESC provenance_desc = {};
+    provenance_desc.Width = y_w;
+    provenance_desc.Height = y_h;
+    provenance_desc.MipLevels = 1;
+    provenance_desc.ArraySize = 1;
+    provenance_desc.Format = DXGI_FORMAT_R32_UINT;
+    provenance_desc.SampleDesc.Count = 1;
+    provenance_desc.Usage = D3D11_USAGE_DEFAULT;
+    provenance_desc.BindFlags = D3D11_BIND_RENDER_TARGET |
+                                D3D11_BIND_SHADER_RESOURCE;
+    for (int i = 0; i < 2; ++i) {
+        if (FAILED(device_->CreateTexture2D(
+                &provenance_desc, nullptr, &provenanceTex_[i])) ||
+            FAILED(device_->CreateRenderTargetView(
+                provenanceTex_[i].Get(), nullptr, &provenanceRtv_[i])) ||
+            FAILED(device_->CreateShaderResourceView(
+                provenanceTex_[i].Get(), nullptr, &provenanceSrv_[i]))) {
+            err = "synth3d: provenance texture/view creation failed";
+            for (int k = 0; k < kNumOut; ++k) {
+                warpSrv_[k].Reset(); warpRtv_[k].Reset(); warpTex_[k].Reset();
+                out_srv_[k] = nullptr;
+            }
+            for (int k = 0; k < 2; ++k) {
+                provenanceSrv_[k].Reset();
+                provenanceRtv_[k].Reset();
+                provenanceTex_[k].Reset();
+            }
+            return false;
+        }
     }
     y_w_ = y_w; y_h_ = y_h; c_w_ = c_w; c_h_ = c_h; plane_fmt_ = fmt;
     // A geometry/format change means a new source: re-prime the shared temporal
@@ -346,6 +410,7 @@ void Synth3D::release_depth_grid() {
     plateReadTex_.Reset();
     plate_read_ = 0;
     plate_valid_ = false;
+    plate_cut_seen_ms_ = -1.0;
     prepRtv_.Reset(); prepTex_.Reset();
     stag_write_  = 0;
     seq_ctr_     = 0;
@@ -354,9 +419,16 @@ void Synth3D::release_depth_grid() {
 }
 
 void Synth3D::release_gpu() {
+    lab_outputs_valid_ = false;
+    if (stereo_lab_) stereo_lab_->release();
     for (int i = 0; i < kNumOut; ++i) {
         warpSrv_[i].Reset(); warpRtv_[i].Reset(); warpTex_[i].Reset();
         out_srv_[i] = nullptr;
+    }
+    for (int i = 0; i < 2; ++i) {
+        provenanceSrv_[i].Reset();
+        provenanceRtv_[i].Reset();
+        provenanceTex_[i].Reset();
     }
     release_depth_grid();
     matteSrv_.Reset(); matteTex_.Reset();
@@ -364,6 +436,7 @@ void Synth3D::release_gpu() {
     matte_dirty_ = matte_armed_;
     readTex_.Reset(); read_w_ = read_h_ = 0; read_fmt_ = DXGI_FORMAT_UNKNOWN;
     cb_.Reset(); raster_.Reset(); sampler_.Reset();
+    psProvenance_.Reset();
     psViewChroma_.Reset(); psViewLuma_.Reset();
     psWarpChroma_.Reset(); psWarpLuma_.Reset(); psPrep_.Reset();
     vs_.Reset();
@@ -518,8 +591,13 @@ bool Synth3D::upload_depth(ID3D11DeviceContext* ctx, std::string& err) {
     } else {
         if (!depth_service_) return true;
         uint64_t sequence = depth_sequence_;
-        snapshot = depth_service_->snapshot(depth_sequence_, sequence);
+        double source_video_ms = -1.0;
+        snapshot = depth_service_->snapshot(
+            depth_sequence_, sequence, source_video_ms);
         if (!snapshot) return true;                // keep the local GPU texture
+        // Shot identity of the map this surface is about to warp with:
+        // adopted together with the pixels (cross-shot gate, 04/08).
+        depth_video_ms_ = source_video_ms;
         if (snapshot->size() !=
             SharedDepthService::kGeometryChannels *
             static_cast<size_t>(grid_width_) * grid_height_) {
@@ -581,7 +659,7 @@ bool Synth3D::upload_depth(ID3D11DeviceContext* ctx, std::string& err) {
 
 bool Synth3D::upload_matte(ID3D11DeviceContext* ctx, std::string& err) {
     if (!matte_armed_ || !matte_dirty_) return true;
-    const size_t expected = 2 * static_cast<size_t>(matte_width_) * matte_height_;
+    const size_t expected = 4 * static_cast<size_t>(matte_width_) * matte_height_;
     if (!matteTex_ || test_matte_.size() != expected) {
         err = "synth3d: human matte storage does not match its texture";
         return false;
@@ -595,8 +673,8 @@ bool Synth3D::upload_matte(ID3D11DeviceContext* ctx, std::string& err) {
     auto* out = static_cast<uint8_t*>(m.pData);
     for (uint32_t row = 0; row < matte_height_; ++row) {
         std::memcpy(out + static_cast<size_t>(row) * m.RowPitch,
-                    test_matte_.data() + 2 * static_cast<size_t>(row) * matte_width_,
-                    2 * matte_width_);
+                    test_matte_.data() + 4 * static_cast<size_t>(row) * matte_width_,
+                    4 * matte_width_);
     }
     ctx->Unmap(matteTex_.Get(), 0);
     matte_dirty_ = false;
@@ -619,9 +697,15 @@ bool Synth3D::process(ID3D11DeviceContext* ctx,
                       int matrix_sel, int transfer_sel,
                       double video_time_ms) {
     outputs_valid_ = false;
+    lab_outputs_valid_ = false;
     map_refreshed_ = false;
     if (!ctx || !src || !src[0] || !src[1] || !src[2]) return false;
     if (!y_w || !y_h || !c_w || !c_h) return false;
+
+    // Timed here, before any early return below can skip it: the question this
+    // answers is how often the renderer comes back at all, not how often it
+    // completes a warp.
+    if (!test_armed_ && depth_service_) depth_service_->note_pass(client_id_);
 
     std::string err;
     if (!ensure_pipeline(err) || !ensure_prep(err) || !ensure_depth(err) ||
@@ -631,11 +715,11 @@ bool Synth3D::process(ID3D11DeviceContext* ctx,
         return false;
     }
 
-    // The six warp textures were bound as PS resources by the PREVIOUS present()
-    // (and by cast_encode's packer); binding them as render targets now would be a
-    // read/write hazard. Unbind t0..t6 — present() re-binds all seven itself.
-    ID3D11ShaderResourceView* const kNoSrv[7] = {};
-    ctx->PSSetShaderResources(0, 7, kNoSrv);
+    // The final Stereo Lab pass uses through t11. Any of its corrected outputs
+    // may also have been bound by the previous present()/cast. Clear the whole
+    // shared range before raw warp or Lab textures return to the OM stage.
+    ID3D11ShaderResourceView* const kNoSrv[12] = {};
+    ctx->PSSetShaderResources(0, 12, kNoSrv);
 
     SynthCB cb = {};
     cb.max_disp       = params_.strength_pct * 0.01f;   // % of width -> fraction
@@ -669,6 +753,25 @@ bool Synth3D::process(ID3D11DeviceContext* ctx,
                           plateTex_[0] && plateTex_[1] && psPlateAccum_;
     cb.temporal_fill = plate_on ? 1 : 0;
     cb.plate_ceiling = 0.45f;
+    // v4 sub-texel background reclaim in guided_nearness (see the shader):
+    // the CPU realign fixed the grid scale, this closes the pixel band
+    // inside the edge texel. SYLC_SYNTH3D_FAR_SNAP=0 = rollback.
+    static const bool far_snap_on = []() {
+        char* env = nullptr;   // house idiom (MSVC-safe, cf. SYLC_FLOW_THREADS)
+        size_t len = 0;
+        bool on = true;
+        if (_dupenv_s(&env, &len, "SYLC_SYNTH3D_FAR_SNAP") == 0 && env) {
+            on = env[0] != '0';
+            free(env);
+        }
+        return on;
+    }();
+    cb.far_snap_on = far_snap_on ? 1.0f : 0.0f;
+    cb.comfort_soft_disp = params_.comfort_soft_pct * 0.01f;
+    cb.comfort_hard_disp = params_.comfort_hard_pct * 0.01f;
+    cb.comfort_enabled = (params_.comfort_enabled &&
+                          cb.comfort_soft_disp >= 0.0f &&
+                          cb.comfort_hard_disp > cb.comfort_soft_disp) ? 1 : 0;
     if (cb.crop_top + cb.crop_bottom > 0.55f) {
         cb.crop_top = 0.0f;
         cb.crop_bottom = 0.0f;
@@ -679,6 +782,7 @@ bool Synth3D::process(ID3D11DeviceContext* ctx,
     // Scale the disparity budget down right after the snap and let it inflate
     // back to full over ramp_ms_. The test-depth bypass keeps its full
     // geometry unconditionally -- golden/warp tests assert on it directly.
+    double cut_in_diag = SharedDepthService::kLookaheadNone;
     if (!test_armed_ && depth_service_) {
         const double snap_video = depth_service_->last_snap_video_ms();
         const bool have_video_clock =
@@ -715,6 +819,7 @@ bool Synth3D::process(ID3D11DeviceContext* ctx,
         // cross-shot map (the author's "red/cyan residue overflowing onto
         // the frame after the cut").
         const double cut_in = depth_service_->lookahead_cut_in_ms();
+        cut_in_diag = cut_in;
         if (cut_in > -150.0 && cut_in < static_cast<double>(ramp_ms_) &&
             ramp_ms_ > 0.0f) {
             // -150..0 = the scout's hold window (the sentinel is -1e9, far
@@ -728,6 +833,18 @@ bool Synth3D::process(ID3D11DeviceContext* ctx,
             // never sample the plate there (its background IS old-shot
             // pixels), and the zero budget makes diagnostic_yuv paint
             // neutral instead of the stale map's color flats.
+            //
+            // NO pre-cut lead here, and that is deliberate — it was tried on
+            // 2026-08-03 and reverted the same evening on author A/B. Leading
+            // by one source frame kills the plate on the dying shot's LAST
+            // frame, where it is same-shot and entirely legitimate: plate_trust
+            // collapses to 0 and those disocclusions fall back to the stretch,
+            // which reads worse than the remembered background it replaced.
+            // The anticipation rule belongs to the DISPARITY (which does glide
+            // down over ramp_ms_ before the cut); the plate is not a continuous
+            // effect but a memory, and memory of the CURRENT shot stays valid
+            // right up to its last frame. The real exposure is on the other
+            // side of the cut — see the plate purge below.
             if (cut_in <= 0.0)
                 cb.temporal_fill = 0;
         }
@@ -751,7 +868,7 @@ bool Synth3D::process(ID3D11DeviceContext* ctx,
     // the result — a test depth is armed (inference bypassed) or the engine is not
     // running (still loading, or failed) — so a dead engine costs zero GPU/PCIe.
     if (!test_armed_ && depth_service_ &&
-        depth_service_->wants_input(client_id_)) {
+        depth_service_->wants_input(client_id_, video_time_ms)) {
         ID3D11RenderTargetView* rtv = prepRtv_.Get();
         ctx->OMSetRenderTargets(1, &rtv, nullptr);
         set_viewport(
@@ -760,7 +877,16 @@ bool Synth3D::process(ID3D11DeviceContext* ctx,
         ctx->PSSetShader(psPrep_.Get(), nullptr, 0);
         ctx->Draw(3, 0);                 // the draw covers the whole RT -> no clear
         push_readback(ctx, video_time_ms);
-        drain_readback(ctx);
+    }
+    // Retire any copies that were already in flight when a repeated pause PTS
+    // closed the capture gate. submit() performs the authoritative duplicate
+    // check, so none can advance the worker; draining prevents them resurfacing
+    // as stale observations when playback resumes.
+    if (!test_armed_ && depth_service_) {
+        bool staging_pending = false;
+        for (int i = 0; i < kRing; ++i)
+            staging_pending = staging_pending || stag_seq_[i] != 0;
+        if (staging_pending) drain_readback(ctx);
     }
 
     // (2) publish the freshest nearness map (test bypass wins over the engine).
@@ -781,6 +907,87 @@ bool Synth3D::process(ID3D11DeviceContext* ctx,
         return false;
     }
 
+    // A temporal plate is device-local memory and therefore needs its OWN
+    // shot identity. Waiting for the depth worker's snap is too late: with the
+    // readback/inference pipeline, T0 of the new shot can be presented one or
+    // two frames before that snap. Consume the absolute decoder/scout boundary
+    // on the presentation clock and invalidate both ping-pong targets exactly
+    // at T0, independently on every renderer surface.
+    double reached_cut_pts = -1.0;
+    bool plate_cut_crossed = false;
+    if (depth_service_ && std::isfinite(video_time_ms) && video_time_ms >= 0.0) {
+        reached_cut_pts = depth_service_->latest_presented_cut(video_time_ms);
+        if (reached_cut_pts >= 0.0 &&
+            (plate_cut_seen_ms_ < 0.0 ||
+             reached_cut_pts > plate_cut_seen_ms_ +
+                                   SharedDepthService::kPtsJitterMs)) {
+            plate_cut_seen_ms_ = reached_cut_pts;
+            plate_valid_ = false;
+            plate_cut_crossed = true;
+            // Even if a post-cut map is already available, do not sample a
+            // plate on the boundary frame. It may be rebuilt from T0 below,
+            // but becomes visible only on a later same-shot frame.
+            cb.temporal_fill = 0;
+            if (stereo_lab_) stereo_lab_->reset_epoch();
+        }
+    }
+
+    // Cross-shot gate (04/08) — the STATE test that replaces the deadline
+    // race. With the readback + pipeline lag, the map uploaded above can
+    // still belong to the shot BEFORE a cut that the presented frame is
+    // already past; warping the new shot with the old shot's geometry paints
+    // the old silhouettes as disocclusion masks (the red/cyan contours that
+    // survive every hard cut). While a recorded boundary c satisfies
+    // depth_video_ms_ < c <= video_time_ms, present FLAT: zero disparity
+    // budget (nothing is warped, diagnostics paint neutral) and no plate.
+    // The gate releases when the first map observed at/after the cut lands —
+    // by state, never by timer. Evaluated HERE because only upload_depth
+    // just decided which map this frame actually warps with; the cb was
+    // already uploaded for the prep pass, so a triggered gate re-uploads it
+    // (80 bytes). The temporal ramps above stay: they ease comfort and are
+    // the only cover on untimed clocks. SYLC_SYNTH3D_SHOT_GATE=0 = rollback.
+    bool shot_gate = false;
+    if (!test_armed_ && depth_service_ &&
+        std::isfinite(video_time_ms) && video_time_ms >= 0.0) {
+        static const bool gate_enabled = []() {
+            char* env = nullptr;   // house idiom (MSVC-safe, cf. SYLC_FLOW_THREADS)
+            size_t len = 0;
+            bool on = true;
+            if (_dupenv_s(&env, &len, "SYLC_SYNTH3D_SHOT_GATE") == 0 && env) {
+                on = env[0] != '0';   // SYLC_SYNTH3D_SHOT_GATE=0 = rollback
+                free(env);
+            }
+            return on;
+        }();
+        if (gate_enabled) {
+            shot_gate = depth_service_->cross_shot(
+                depth_video_ms_, video_time_ms);
+            if (shot_gate) {
+                cb.max_disp = 0.0f;
+                cb.temporal_fill = 0;
+            }
+        }
+    }
+    // Plate-specific state gate. This remains active even when the disparity
+    // shot gate is rolled back through its environment flag: no temporal RGB
+    // may be accumulated or sampled until the uploaded map is from the new
+    // shot. Test geometry is explicitly current-by-construction.
+    const bool plate_map_gate =
+        plate_on && !test_armed_ && reached_cut_pts >= 0.0 &&
+        (!(depth_video_ms_ >= 0.0) ||
+         depth_video_ms_ < reached_cut_pts - SharedDepthService::kPtsJitterMs);
+    if (plate_map_gate)
+        cb.temporal_fill = 0;
+    if (plate_cut_crossed || shot_gate || plate_map_gate)
+        ctx->UpdateSubresource(cb_.Get(), 0, nullptr, &cb, 0, 0);
+    // Instrument only the FINAL decision, after the PTS identity and map-state
+    // gates. Otherwise a cut-driven purge could be falsely reported as a live
+    // old-shot plate merely because the relative advisory was still positive.
+    if (depth_service_)
+        depth_service_->note_plate_state(
+            params_.temporal_fill, plate_on, cb.temporal_fill != 0,
+            cut_in_diag);
+
     // (2b) round 5a — temporal background plate. The accum pass runs once per
     // NEW map (the transport is map-to-map displacement; per-frame reruns
     // would re-apply it), except under a test depth whose transport is the
@@ -798,7 +1005,12 @@ bool Synth3D::process(ID3D11DeviceContext* ctx,
             ctx->ClearRenderTargetView(plateRtv_[1].Get(), zero);
             plate_valid_ = true;
         }
-        if (map_refreshed_ || test_armed_) {
+        // Never accumulate THROUGH the cross-shot gate: the fresh map is by
+        // definition pre-cut geometry while the frame pixels are post-cut —
+        // the mix is old-shot transport over new-shot content. The plate is
+        // already purged by the cut-PTS identity above; skipping also keeps it
+        // clean until a map from the new shot is available.
+        if ((map_refreshed_ && !shot_gate && !plate_map_gate) || test_armed_) {
             const int write = 1 - plate_read_;
             ID3D11ShaderResourceView* plate_in[4] = {
                 depthSrv_.Get(), nullptr,
@@ -822,17 +1034,28 @@ bool Synth3D::process(ID3D11DeviceContext* ctx,
         }
     }
 
-    // (3) luma pass (2 MRT: Y_L,Y_R) then chroma pass (4 MRT: U_L,V_L,U_R,V_R).
+    // (3) The two image-forming passes below are the exact v5.2.1c shaders.
+    // Their six outputs remain the immutable raw stereo reference.
     ID3D11ShaderResourceView* geometry_matte_plate[3] = {
         depthSrv_.Get(), matte_armed_ ? matteSrv_.Get() : nullptr,
         plate_on ? plateSrv_[plate_read_].Get() : nullptr
     };
     ctx->PSSetShaderResources(3, 3, geometry_matte_plate);
-    {
-        ID3D11RenderTargetView* rtvs[2] = { warpRtv_[0].Get(), warpRtv_[3].Get() };
+    if (params_.depth_view) {
+        ID3D11RenderTargetView* rtvs[2] = {
+            warpRtv_[0].Get(), warpRtv_[3].Get()
+        };
         ctx->OMSetRenderTargets(2, rtvs, nullptr);
         set_viewport(ctx, y_w, y_h);
-        ctx->PSSetShader(params_.depth_view ? psViewLuma_.Get() : psWarpLuma_.Get(), nullptr, 0);
+        ctx->PSSetShader(psViewLuma_.Get(), nullptr, 0);
+        ctx->Draw(3, 0);
+    } else {
+        ID3D11RenderTargetView* rtvs[2] = {
+            warpRtv_[0].Get(), warpRtv_[3].Get()
+        };
+        ctx->OMSetRenderTargets(2, rtvs, nullptr);
+        set_viewport(ctx, y_w, y_h);
+        ctx->PSSetShader(psWarpLuma_.Get(), nullptr, 0);
         ctx->Draw(3, 0);
     }
     {
@@ -840,12 +1063,60 @@ bool Synth3D::process(ID3D11DeviceContext* ctx,
                                             warpRtv_[4].Get(), warpRtv_[5].Get() };
         ctx->OMSetRenderTargets(4, rtvs, nullptr);
         set_viewport(ctx, c_w, c_h);
-        ctx->PSSetShader(params_.depth_view ? psViewChroma_.Get() : psWarpChroma_.Get(), nullptr, 0);
+        if (params_.depth_view) {
+            ctx->PSSetShader(psViewChroma_.Get(), nullptr, 0);
+        } else {
+            ctx->PSSetShader(psWarpChroma_.Get(), nullptr, 0);
+        }
         ctx->Draw(3, 0);
     }
 
-    // Release the OM stage so present()'s draw can bind these same textures as SRVs.
+    // Release the OM stage so the optional final Lab can consume the raw warp.
     ctx->OMSetRenderTargets(0, nullptr, nullptr);
+
+    // Stereo Lab is deliberately downstream and additive: the six warp
+    // textures above remain immutable golden/raw outputs. A Lab allocation or
+    // shader failure falls back to them for this and every later frame instead
+    // of taking synthesis or playback down.
+    for (int i = 0; i < kNumOut; ++i)
+        out_srv_[i] = warpSrv_[i].Get();
+    lab_outputs_valid_ = false;
+    if (!params_.depth_view && params_.stereo_lab) {
+        if (!stereo_lab_) stereo_lab_ = std::make_unique<StereoLab>();
+        ID3D11ShaderResourceView* raw[kNumOut] = {
+            warpSrv_[0].Get(), warpSrv_[1].Get(), warpSrv_[2].Get(),
+            warpSrv_[3].Get(), warpSrv_[4].Get(), warpSrv_[5].Get()
+        };
+        std::string lab_err;
+        const bool provenance_ready = ensure_provenance_shader(lab_err);
+        if (provenance_ready) {
+            // Metadata-only sidecar: it re-evaluates the c inverse warp but
+            // writes no colour plane. Thus the raw outputs above stay
+            // byte-exact while the Lab receives current-frame ownership.
+            ID3D11RenderTargetView* provenance_rtvs[2] = {
+                provenanceRtv_[0].Get(), provenanceRtv_[1].Get()
+            };
+            ctx->OMSetRenderTargets(2, provenance_rtvs, nullptr);
+            set_viewport(ctx, y_w, y_h);
+            ctx->PSSetShader(psProvenance_.Get(), nullptr, 0);
+            ctx->Draw(3, 0);
+            ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        }
+        ID3D11ShaderResourceView* provenance[2] = {
+            provenance_ready ? provenanceSrv_[0].Get() : nullptr,
+            provenance_ready ? provenanceSrv_[1].Get() : nullptr
+        };
+        lab_outputs_valid_ = stereo_lab_->process(
+            device_.Get(), ctx, vs_.Get(), sampler_.Get(), raw, src,
+            provenance, y_w, y_h, c_w, c_h, plane_fmt,
+            cb.plane_scale, cb.max_disp, cb.comfort_enabled != 0,
+            cb.comfort_soft_disp, cb.comfort_hard_disp, true, lab_err);
+        if (lab_outputs_valid_) {
+            ID3D11ShaderResourceView* const* corrected =
+                stereo_lab_->output_srvs();
+            for (int i = 0; i < kNumOut; ++i) out_srv_[i] = corrected[i];
+        }
+    }
     outputs_valid_ = true;
     return true;
 }
@@ -899,7 +1170,9 @@ bool Synth3D::set_test_geometry(const uint16_t* depth,
 
 bool Synth3D::set_test_matte(const uint8_t* alpha_or_null,
                              uint32_t width, uint32_t height,
-                             size_t count, int mode) {
+                             size_t count, int mode,
+                             const uint8_t* reliability_or_null,
+                             size_t reliability_count) {
     if (!alpha_or_null) {
         test_matte_.clear();
         matte_width_ = matte_height_ = 0;
@@ -915,43 +1188,58 @@ bool Synth3D::set_test_matte(const uint8_t* alpha_or_null,
     }
     const size_t expected = static_cast<size_t>(width) * height;
     if (count != expected) return false;
+    if (reliability_or_null && reliability_count != expected) return false;
 
-    // R keeps the network alpha. G stores the horizontal distance in matte
-    // pixels to the nearest fractional/step boundary (capped at 255). Stereo
-    // is epipolar, so this O(width*height) two-pass transform replaces many
-    // shader texture probes while retaining a disparity-scaled guard band.
-    test_matte_.assign(2 * expected, 0);
+    // R keeps network alpha, G the horizontal boundary distance, and B the
+    // CURRENT-frame local registration reliability. The latter is deliberately
+    // independent of the scalar tracker score: a globally good transport can
+    // still have no correspondence in the newly uncovered strip behind a
+    // moving actor. A is reserved for a future matte-side diagnostic.
+    test_matte_.assign(4 * expected, 0);
     std::vector<uint16_t> distance(width, 255);
+    std::vector<uint8_t> effective_alpha(width, 0);
     for (uint32_t row = 0; row < height; ++row) {
         const uint8_t* src = alpha_or_null + static_cast<size_t>(row) * width;
+        const size_t row_offset = static_cast<size_t>(row) * width;
+        for (uint32_t x = 0; x < width; ++x) {
+            const uint8_t reliability = reliability_or_null
+                ? reliability_or_null[row_offset + x] : 255u;
+            effective_alpha[x] = static_cast<uint8_t>(
+                (static_cast<uint32_t>(src[x]) * reliability + 127u) / 255u);
+        }
         int last = -65536;
         for (uint32_t x = 0; x < width; ++x) {
-            const int a = src[x];
+            const int a = effective_alpha[x];
             const bool fractional = a > 4 && a < 251;
-            const bool left_step = x > 0 && std::abs(a - static_cast<int>(src[x - 1])) > 10;
+            const bool left_step = x > 0 && std::abs(
+                a - static_cast<int>(effective_alpha[x - 1])) > 10;
             const bool right_step = x + 1 < width &&
-                std::abs(a - static_cast<int>(src[x + 1])) > 10;
+                std::abs(a - static_cast<int>(effective_alpha[x + 1])) > 10;
             if (fractional || left_step || right_step) last = static_cast<int>(x);
             distance[x] = static_cast<uint16_t>((std::min)(
                 255, static_cast<int>(x) - last));
         }
         int next = 65536;
         for (uint32_t rx = width; rx-- > 0;) {
-            const int a = src[rx];
+            const int a = effective_alpha[rx];
             const bool fractional = a > 4 && a < 251;
             const bool left_step = rx > 0 &&
-                std::abs(a - static_cast<int>(src[rx - 1])) > 10;
+                std::abs(a - static_cast<int>(effective_alpha[rx - 1])) > 10;
             const bool right_step = rx + 1 < width &&
-                std::abs(a - static_cast<int>(src[rx + 1])) > 10;
+                std::abs(a - static_cast<int>(effective_alpha[rx + 1])) > 10;
             if (fractional || left_step || right_step) next = static_cast<int>(rx);
             distance[rx] = static_cast<uint16_t>((std::min)(
                 static_cast<int>(distance[rx]),
                 (std::min)(255, next - static_cast<int>(rx))));
         }
         for (uint32_t x = 0; x < width; ++x) {
-            const size_t out = 2 * (static_cast<size_t>(row) * width + x);
+            const size_t source_index = static_cast<size_t>(row) * width + x;
+            const size_t out = 4 * source_index;
             test_matte_[out] = src[x];
             test_matte_[out + 1] = static_cast<uint8_t>(distance[x]);
+            test_matte_[out + 2] = reliability_or_null
+                ? reliability_or_null[source_index] : 255u;
+            test_matte_[out + 3] = 0u;
         }
     }
     matte_width_ = width;
@@ -1030,7 +1318,11 @@ bool Synth3D::read_plane(ID3D11DeviceContext* ctx, int slot, std::vector<uint8_t
         read_w_ = pw; read_h_ = ph; read_fmt_ = plane_fmt_;
     }
 
-    ctx->CopyResource(readTex_.Get(), warpTex_[slot].Get());
+    ID3D11Texture2D* final_texture =
+        lab_outputs_valid_ && stereo_lab_
+            ? stereo_lab_->output_texture(slot) : warpTex_[slot].Get();
+    if (!final_texture) { err = "read_plane: final output unavailable"; return false; }
+    ctx->CopyResource(readTex_.Get(), final_texture);
     D3D11_MAPPED_SUBRESOURCE m = {};
     // DEBUG PATH ONLY (tests / probes): a BLOCKING map is acceptable here because this
     // is never called from the playback path — unlike drain_readback's DO_NOT_WAIT.
@@ -1059,6 +1351,10 @@ void Synth3D::set_params(const Synth3DParams& p) {
     params_.convergence = p.convergence;
     params_.auto_convergence = p.auto_convergence;
     params_.temporal_fill = p.temporal_fill;
+    params_.stereo_lab = p.stereo_lab;
+    params_.comfort_enabled = p.comfort_enabled;
+    params_.comfort_soft_pct = p.comfort_soft_pct;
+    params_.comfort_hard_pct = p.comfort_hard_pct;
     params_.depth_view  = p.depth_view;
     params_.diagnostics = p.diagnostics;
     params_.crop_top     = p.crop_top;
@@ -1127,6 +1423,7 @@ bool Synth3D::start(ID3D11Device* dev, const Synth3DParams& p, std::string& err)
     in_scratch_.assign(3 * n, 0.0f);
     aspect_luma_scratch_.assign(n, 0.0f);
     depth_sequence_ = 0;
+    depth_video_ms_ = -1.0;
     depth_valid_ = false;
     depth_dirty_ = test_armed_;
     // An empty path is valid for renderer tests: synth3d_set_test_depth()
@@ -1143,6 +1440,12 @@ void Synth3D::request_stop() {
     outputs_valid_ = false;
     depth_valid_ = false;
     depth_sequence_ = 0;
+    depth_video_ms_ = -1.0;
+    plate_valid_ = false;
+    plate_snap_seen_ = -1;
+    plate_cut_seen_ms_ = -1.0;
+    lab_outputs_valid_ = false;
+    if (stereo_lab_) stereo_lab_->reset_epoch();
     params_.enabled = false;
     local_error_.clear();
 }
@@ -1158,12 +1461,33 @@ void Synth3D::stop() {
 }
 
 void Synth3D::notify_seek() {
+    // The service snap arrives only when its worker consumes the first
+    // post-seek observation. Purge renderer-local temporal RGB immediately;
+    // a seek is a shot discontinuity even before that asynchronous roundtrip.
+    plate_valid_ = false;
+    plate_cut_seen_ms_ = -1.0;
+    lab_outputs_valid_ = false;
+    if (stereo_lab_) stereo_lab_->reset_epoch();
     if (depth_service_) depth_service_->notify_seek();
 }
 
-void Synth3D::set_lookahead_advisory(double cut_in_ms, double storm_in_ms) {
+void Synth3D::set_lookahead_advisory(double cut_in_ms, double storm_in_ms,
+                                     double cut_pts_ms) {
     if (depth_service_)
-        depth_service_->set_lookahead_advisory(cut_in_ms, storm_in_ms);
+        depth_service_->set_lookahead_advisory(
+            cut_in_ms, storm_in_ms, cut_pts_ms);
+}
+
+void Synth3D::set_motion_hints(double pts_ms, double frame_ms,
+                               int blocks_w, int blocks_h,
+                               int source_width, int source_height,
+                               std::vector<int16_t>&& mv_xy,
+                               std::vector<uint8_t>&& valid) {
+    if (depth_service_)
+        depth_service_->note_motion_hints(
+            pts_ms, frame_ms, blocks_w, blocks_h,
+            source_width, source_height,
+            std::move(mv_xy), std::move(valid));
 }
 
 void Synth3D::set_ramp_ms(float ramp_ms) {
@@ -1171,6 +1495,28 @@ void Synth3D::set_ramp_ms(float ramp_ms) {
 }
 
 std::string Synth3D::status() const {
+    const std::string lab_suffix =
+        params_.stereo_lab && stereo_lab_
+            ? stereo_lab_->status_suffix()
+            : " lab=off lab_mean=0.000 lab_p95=0.000 "
+              "lab_asym=0.000 lab_px=0.0 lab_edge_px=0.0 "
+              "lab_edge_p95=0.000 comfort_hit_pct=0.0 "
+              "comfort_loss_mean_px=0.00 comfort_loss_p95_px=0.00 "
+              "pair=off pair_grid=0x0";
+    char comfort_buf[160] = {};
+    const bool comfort_valid = params_.comfort_enabled &&
+        params_.comfort_soft_pct >= 0.0f &&
+        params_.comfort_hard_pct > params_.comfort_soft_pct;
+    std::snprintf(
+        comfort_buf, sizeof(comfort_buf),
+        " comfort=%s comfort_soft_pct=%.4f comfort_hard_pct=%.4f",
+        comfort_valid ? "calibrated" : "off",
+        comfort_valid ? params_.comfort_soft_pct : 0.0f,
+        comfort_valid ? params_.comfort_hard_pct : 0.0f);
+    const std::string render_mode =
+        params_.stereo_lab && lab_outputs_valid_ ? "v521c+lab" : "v521c";
+    const std::string final_suffix =
+        " render=" + render_mode + lab_suffix + comfort_buf;
     if (!local_error_.empty()) {
         char buf[640] = {};
         std::snprintf(
@@ -1186,12 +1532,12 @@ std::string Synth3D::status() const {
             static_cast<unsigned long long>(
                 depth_service_ ? depth_service_->instance_id() : 0),
             local_error_.c_str());
-        return buf;
+        return std::string(buf) + final_suffix;
     }
     // Tap accounting lives in the SHARED service, not here: leader election
     // means only one of the N surfaces ever feeds it, and it is not the one the
     // player polls -- per-client counters read 0 on the surface being read.
-    if (depth_service_) return depth_service_->status();
+    if (depth_service_) return depth_service_->status() + final_suffix;
     if (test_armed_) {
         // The bypass has no service, but it does drive a real grid: report the
         // one its map and textures are sized for. Every other field is the
@@ -1206,16 +1552,17 @@ std::string Synth3D::status() const {
             "scene=0.000 crop=0:0:0:0 crop_conf=0.00 crop_ready=0 "
             "grid=%dx%d instance=0 err=-",
             grid_width_, grid_width_, grid_height_);
-        return buf;
+        return std::string(buf) + final_suffix;
     }
     // Byte-identical to NativeRenderer::synth3d_status()'s kOff -- nothing is
     // attached, so there is no grid to report and side= reads 0. Any field
     // added to one of these two lines MUST be added to the other.
-    return "state=off provider=none side=0 fps=0.0 flow_ms=0.0 infer_ms=0.0 "
+    return std::string(
+           "state=off provider=none side=0 fps=0.0 flow_ms=0.0 infer_ms=0.0 "
            "stab_ms=0.0 source_ms=120.0 update_ms=120.0 age_ms=-1 clients=0 "
            "cuts=0 motion=0.000 alpha=0.000 stable=0.000 history=1.00 "
            "scene=0.000 crop=0:0:0:0 crop_conf=0.00 crop_ready=0 "
-           "grid=0x0 instance=0 err=-";
+           "grid=0x0 instance=0 err=-") + final_suffix;
 }
 
 #endif // SYLC_NATIVE_RENDERER

@@ -173,6 +173,22 @@ bool NativeRenderer::initialize(uint64_t hwnd, uint32_t width, uint32_t height, 
 
     ComPtr<IDXGIDevice> dxgiDevice;
     if (FAILED(impl_->device.As(&dxgiDevice))) { last_error_ = "QI IDXGIDevice failed"; return false; }
+
+    // DXGI queues three frames ahead by default. For a player whose video clock
+    // is mpv's, that buys nothing -- the frames are already paced upstream --
+    // and costs up to three refreshes of latency plus an irregular Present()
+    // block once the queue saturates, which lands squarely on the p99 frame
+    // time that Z2A_VALIDATION.md calls the deciding number. One frame of
+    // queue keeps the GPU fed while making the block predictable.
+    // Device-scoped on purpose: SetMaximumFrameLatency on IDXGISwapChain2
+    // requires the waitable-object flag, which would mean the caller must wait
+    // before rendering -- a second pacing authority alongside the presenter.
+    unsigned frame_latency = 0;
+    ComPtr<IDXGIDevice1> dxgiDevice1;
+    if (SUCCEEDED(dxgiDevice.As(&dxgiDevice1)) && dxgiDevice1) {
+        if (SUCCEEDED(dxgiDevice1->SetMaximumFrameLatency(1))) frame_latency = 1;
+    }
+
     ComPtr<IDXGIAdapter> adapter;
     if (FAILED(dxgiDevice->GetAdapter(&adapter))) { last_error_ = "GetAdapter failed"; return false; }
     ComPtr<IDXGIFactory2> factory;
@@ -186,7 +202,12 @@ bool NativeRenderer::initialize(uint64_t hwnd, uint32_t width, uint32_t height, 
     sd.Format             = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.SampleDesc.Count   = 1;
     sd.BufferUsage        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sd.BufferCount        = 2;
+    // Three buffers under the flip model: with two, the GPU cannot start the
+    // next frame until the scanned-out buffer is released, so a frame that
+    // arrives just after a vsync waits a whole refresh. The third buffer costs
+    // one backbuffer of VRAM (~16 MB at 1080p FP16) and removes that stall;
+    // the queue depth stays bounded by the frame latency set above.
+    sd.BufferCount        = 3;
     sd.Scaling            = DXGI_SCALING_STRETCH;
     sd.SwapEffect         = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sd.AlphaMode          = DXGI_ALPHA_MODE_IGNORE;
@@ -223,9 +244,11 @@ bool NativeRenderer::initialize(uint64_t hwnd, uint32_t width, uint32_t height, 
 
     char buf[256];
     std::snprintf(buf, sizeof(buf),
-        "D3D11 flip-model | FL=0x%04x | %ux%u | %s | pipeline=%s",
-        static_cast<unsigned>(got), width_, height_,
-        cs_name, pipeline_ready_ ? "ready" : "FAILED");
+        "D3D11 flip-model | FL=0x%04x | %ux%u | %s | buffers=%u | latency=%s | pipeline=%s",
+        static_cast<unsigned>(got), width_, height_, cs_name,
+        static_cast<unsigned>(sd.BufferCount),
+        frame_latency ? "1" : "driver-default",
+        pipeline_ready_ ? "ready" : "FAILED");
     backend_info_ = buf;
     return true;
 }
@@ -554,6 +577,13 @@ void NativeRenderer::set_video_time_ms(double video_time_ms) {
     video_time_ms_ = value;
 }
 
+void NativeRenderer::set_synth3d_output_eye(int eye) {
+    const int selected = eye == 1 ? 1 : 0;
+    if (!impl_) { synth3d_output_eye_ = selected; return; }
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    synth3d_output_eye_ = selected;
+}
+
 void NativeRenderer::set_uniforms(int stereo_mode, int subtitle_enabled,
                                   float rx, float ry, float rw, float rh,
                                   float sdr_white, float output_gamma,
@@ -766,6 +796,15 @@ bool NativeRenderer::present(uint32_t sync_interval) {
         if (synth_ok) {
             ID3D11ShaderResourceView* const* o = impl_->synth3d->output_srvs();
             for (int i = 0; i < 6; ++i) srvs[1 + i] = o[i];
+            // Dual Projector uses two stereo_mode=0 windows.  That display
+            // shader samples t1..t3 only, so the right window must explicitly
+            // expose Synth3D's right trio there.  Source-plane routing cannot
+            // solve this: the successful synth pass replaces all six SRVs.
+            if (stereo_mode_ == 0 && synth3d_output_eye_ == 1) {
+                srvs[1] = o[3];
+                srvs[2] = o[4];
+                srvs[3] = o[5];
+            }
         } else if (impl_->synth3d && impl_->synth3d_params.enabled) {
             // Depth may be warming up, a newly-created presentation surface may
             // not have uploaded the shared snapshot yet, or a warp pass may fail.
@@ -971,7 +1010,10 @@ bool NativeRenderer::set_synth3d(bool enabled, float strength_pct, float converg
                                   const std::wstring& ort_dir, bool diagnostics,
                                   int side, int grid_width, int grid_height,
                                   float crop_top, float crop_bottom,
-                                  bool auto_convergence, bool temporal_fill) {
+                                  bool auto_convergence, bool temporal_fill,
+                                  bool stereo_lab, bool comfort_enabled,
+                                  float comfort_soft_pct,
+                                  float comfort_hard_pct) {
     last_error_.clear();
     if (!impl_) { last_error_ = "set_synth3d: no impl"; return false; }
     std::lock_guard<std::mutex> lk(impl_->mtx);
@@ -992,6 +1034,20 @@ bool NativeRenderer::set_synth3d(bool enabled, float strength_pct, float converg
     p.convergence  = convergence;
     p.auto_convergence = auto_convergence;
     p.temporal_fill = temporal_fill;
+    // Stereo Lab owns only separate final textures. Its explicit false value
+    // (or SYLC_STEREO_LAB=0) remains the exact raw v5.2.1c rollback.
+    p.stereo_lab = stereo_lab;
+    if (comfort_enabled &&
+        (!std::isfinite(comfort_soft_pct) ||
+         !std::isfinite(comfort_hard_pct) ||
+         comfort_soft_pct < 0.0f ||
+         comfort_hard_pct <= comfort_soft_pct)) {
+        last_error_ = "set_synth3d: invalid calibrated comfort envelope";
+        return false;
+    }
+    p.comfort_enabled = false;
+    p.comfort_soft_pct = 0.0f;
+    p.comfort_hard_pct = 0.0f;
     p.depth_view   = depth_view;
     p.diagnostics  = diagnostics;
     p.model_path   = model_path;
@@ -1028,7 +1084,9 @@ std::string NativeRenderer::synth3d_status() const {
         "stab_ms=0.0 "
         "source_ms=120.0 update_ms=120.0 age_ms=-1 clients=0 cuts=0 "
         "motion=0.000 alpha=0.000 stable=0.000 history=1.00 scene=0.000 "
-        "crop=0:0:0:0 crop_conf=0.00 crop_ready=0 grid=0x0 instance=0 err=-";
+        "crop=0:0:0:0 crop_conf=0.00 crop_ready=0 grid=0x0 instance=0 err=- "
+        "lab=off lab_mean=0.000 lab_p95=0.000 lab_asym=0.000 lab_px=0.0 "
+        "pair=off pair_grid=0x0";
     if (!impl_) return kOff;
     std::lock_guard<std::mutex> lk(impl_->mtx);
     if (!impl_->synth3d || !impl_->synth3d_params.enabled) return kOff;
@@ -1074,12 +1132,15 @@ bool NativeRenderer::synth3d_set_test_geometry(const uint16_t* depth,
 
 bool NativeRenderer::synth3d_set_test_matte(const uint8_t* alpha_or_null,
                                             uint32_t width, uint32_t height,
-                                            size_t count, int mode) {
+                                            size_t count, int mode,
+                                            const uint8_t* reliability_or_null,
+                                            size_t reliability_count) {
     if (!impl_) return true;
     std::lock_guard<std::mutex> lk(impl_->mtx);
     if (!impl_->synth3d) return true;
     return impl_->synth3d->set_test_matte(
-        alpha_or_null, width, height, count, mode);
+        alpha_or_null, width, height, count, mode,
+        reliability_or_null, reliability_count);
 }
 
 int NativeRenderer::synth3d_side() const {
@@ -1108,11 +1169,25 @@ bool NativeRenderer::synth3d_read_plane(int slot, std::vector<uint8_t>& out, uin
     return impl_->synth3d->read_plane(impl_->context.Get(), slot, out, w, h, bpp, err);
 }
 
-bool NativeRenderer::synth3d_set_lookahead(double cut_in_ms, double storm_in_ms) {
+bool NativeRenderer::synth3d_set_lookahead(double cut_in_ms, double storm_in_ms,
+                                           double cut_pts_ms) {
     if (!impl_) return false;
     std::lock_guard<std::mutex> lk(impl_->mtx);
     if (!impl_->synth3d) return false;
-    impl_->synth3d->set_lookahead_advisory(cut_in_ms, storm_in_ms);
+    impl_->synth3d->set_lookahead_advisory(cut_in_ms, storm_in_ms, cut_pts_ms);
+    return true;
+}
+
+bool NativeRenderer::synth3d_set_motion_hints(
+        double pts_ms, double frame_ms, int blocks_w, int blocks_h,
+        int source_width, int source_height,
+        std::vector<int16_t>&& mv_xy, std::vector<uint8_t>&& valid) {
+    if (!impl_) return false;
+    std::lock_guard<std::mutex> lk(impl_->mtx);
+    if (!impl_->synth3d) return false;
+    impl_->synth3d->set_motion_hints(
+        pts_ms, frame_ms, blocks_w, blocks_h, source_width, source_height,
+        std::move(mv_xy), std::move(valid));
     return true;
 }
 

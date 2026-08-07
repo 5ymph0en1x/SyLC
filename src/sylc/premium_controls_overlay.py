@@ -1,0 +1,3037 @@
+# -*- coding: utf-8 -*-
+"""
+Premium Controls Overlay - SyLC 3D Player
+=========================================
+Ultra-modern navigation bar reflecting the technical excellence of the 3D MVC player.
+
+Features:
+- Glassmorphism design with depth effects
+- Real-time technical indicators (MVC, FPS, sync, buffer)
+- Animated badges (3D Ready, HDR, MVC Active)
+- Timeline with animated gradient and preview
+- Sophisticated vector icons
+- Elegant separators and fluid animations
+"""
+
+import os
+import subprocess
+import tempfile
+import shutil
+import logging
+import math
+from concurrent.futures import ThreadPoolExecutor
+import time
+
+from sylc.runtime_paths import RUNTIME_DIR
+
+logger = logging.getLogger(__name__)
+from PySide6.QtWidgets import (
+    QWidget, QSlider, QPushButton, QHBoxLayout, QVBoxLayout, QLabel,
+    QComboBox, QSizePolicy, QGraphicsDropShadowEffect, QFrame, QLayout, QMenu,
+    QWidgetAction
+)
+from PySide6.QtCore import Qt, Signal, QTimer, QRectF, QPointF, QPoint, QSize, QPropertyAnimation, QEasingCurve, Property, Slot
+from PySide6.QtGui import (
+    QPainter, QColor, QFont, QFontMetrics, QPen, QBrush,
+    QPainterPath, QLinearGradient, QRadialGradient, QConicalGradient, QPixmap,
+    QImage, QGuiApplication, QAction, QActionGroup, QIcon, QPolygonF
+)
+
+# (license/subscription system removed - freeware build)
+
+# Labels of the "Depth preset" submenu in the AI menu, in display order. They
+# double as the identifiers emitted on synth3d_depth_preset_selected and
+# persisted by the host, which owns the real table (model candidates + inference
+# grid per preset) and pins these names equal to it. Spelled out here because
+# this overlay must not import the player -- the player imports IT.
+SYNTH3D_DEPTH_PRESET_LABELS = ("Quality", "Balanced", "Performance")
+
+
+# =============================================================================
+# HELPERS & THUMBNAIL EXTRACTION
+# =============================================================================
+
+def _resolve_external_tool(executable_name):
+    """Return an absolute path to an external tool (ffmpeg/ffprobe) if available."""
+    base_dir = RUNTIME_DIR
+
+    candidates = []
+    if os.name == 'nt' and not executable_name.lower().endswith('.exe'):
+        candidates.append(f"{executable_name}.exe")
+    candidates.append(executable_name)
+
+    for candidate in candidates:
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+
+        local_candidate = os.path.join(base_dir, candidate)
+        if os.path.exists(local_candidate):
+            return local_candidate
+
+    return None
+
+
+_thumbnail_executor = ThreadPoolExecutor(max_workers=2)
+
+
+def _extract_thumbnail_ffmpeg(video_file, time_pos):
+    """Extract a thumbnail with ffmpeg (worker function)."""
+    try:
+        ffmpeg_path = _resolve_external_tool('ffmpeg')
+        if not ffmpeg_path:
+            return None
+
+        temp_file = os.path.join(tempfile.gettempdir(), f"preview_{int(time.time() * 1000000)}.jpg")
+
+        cmd = [
+            ffmpeg_path,
+            '-ss', str(time_pos),
+            '-i', video_file,
+            '-frames:v', '1',
+            '-vf', 'scale=320:-1',  # XL tooltip (320x180)
+            '-q:v', '5',
+            '-y',
+            temp_file
+        ]
+
+        creationflags = 0
+        if os.name == 'nt':
+            creationflags = 0x08000000  # CREATE_NO_WINDOW
+
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2.0,
+            creationflags=creationflags
+        )
+
+        if result.returncode == 0 and os.path.exists(temp_file):
+            return temp_file
+        return None
+    except:
+        return None
+
+
+class PreviewTooltip(QWidget):
+    """XL hover preview: 320x180 thumbnail + hh:mm:ss pill, screen-clamped.
+
+    The tooltip follows the mouse on EVERY move (position + time pill update
+    immediately); only the image swaps asynchronously as thumbnails arrive."""
+    THUMB_W, THUMB_H, PILL_H, GAP, PAD = 320, 180, 26, 6, 2
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setFixedSize(self.THUMB_W + 2 * self.PAD,
+                          self.THUMB_H + self.GAP + self.PILL_H + 2 * self.PAD)
+        self._pixmap = None
+        self._time_text = "00:00:00"
+        self.hide()
+
+    def set_thumbnail(self, pixmap):
+        self._pixmap = pixmap
+        self.update()
+
+    def set_time_text(self, text):
+        if text != self._time_text:
+            self._time_text = text
+            self.update()
+
+    def clear(self):
+        self._pixmap = None
+        self.update()
+
+    # Back-compat shim: legacy ffmpeg path called setPixmap() on the QLabel version
+    def setPixmap(self, pixmap):
+        self.set_thumbnail(pixmap)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        if not p.isActive():
+            return
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        thumb = QRectF(self.PAD, self.PAD, self.THUMB_W, self.THUMB_H)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor(16, 16, 20)))
+        p.drawRoundedRect(thumb, 8, 8)
+        if self._pixmap and not self._pixmap.isNull():
+            path = QPainterPath()
+            path.addRoundedRect(thumb, 8, 8)
+            p.setClipPath(path)
+            p.drawPixmap(thumb.toRect(), self._pixmap)
+            p.setClipping(False)
+        p.setPen(QPen(PremiumColors.ACCENT_PRIMARY, 2))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(thumb, 8, 8)
+        # time pill
+        fm = p.fontMetrics()
+        tw = fm.horizontalAdvance(self._time_text) + 24
+        pill = QRectF((self.width() - tw) / 2, self.PAD + self.THUMB_H + self.GAP,
+                      tw, self.PILL_H)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(PremiumColors.BG_GLASS))
+        p.drawRoundedRect(pill, self.PILL_H / 2, self.PILL_H / 2)
+        p.setPen(QPen(PremiumColors.TEXT_PRIMARY))
+        p.drawText(pill, Qt.AlignmentFlag.AlignCenter, self._time_text)
+
+    def show_at(self, global_x, global_y_top):
+        scr = QGuiApplication.screenAt(QPoint(int(global_x), int(global_y_top)))
+        scr = scr or QGuiApplication.primaryScreen()
+        geo = scr.availableGeometry()
+        x = int(global_x) - self.width() // 2
+        x = max(geo.left(), min(x, geo.right() - self.width()))
+        y = max(geo.top(), int(global_y_top) - self.height() - 12)
+        self.move(x, y)
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+
+
+# =============================================================================
+# PREMIUM COLOR PALETTE
+# =============================================================================
+
+class PremiumColors:
+    """Premium color palette for the 3D player."""
+
+    # Primary accent (Cyan 3D)
+    ACCENT_PRIMARY = QColor(0, 200, 255)  # Bright cyan
+    ACCENT_SECONDARY = QColor(0, 150, 220)  # Deep blue
+    ACCENT_GLOW = QColor(0, 200, 255, 80)  # Cyan glow
+
+    # Success / Active states
+    SUCCESS = QColor(0, 230, 118)  # Active MVC green
+    SUCCESS_GLOW = QColor(0, 230, 118, 60)
+
+    # Warning / Info
+    WARNING = QColor(255, 170, 0)  # Orange
+    INFO = QColor(138, 180, 248)  # Info blue
+
+    # Background layers (glassmorphism)
+    BG_DARK = QColor(18, 18, 22)  # Main background
+    BG_SURFACE = QColor(28, 28, 35)  # Surface
+    BG_ELEVATED = QColor(38, 38, 48)  # Elevated
+    BG_GLASS = QColor(45, 45, 55, 200)  # Glass effect
+
+    # Borders
+    BORDER_SUBTLE = QColor(255, 255, 255, 20)
+    BORDER_GLOW = QColor(0, 200, 255, 40)
+
+    # Text
+    TEXT_PRIMARY = QColor(240, 240, 245)
+    TEXT_SECONDARY = QColor(160, 165, 180)
+    TEXT_MUTED = QColor(100, 105, 115)
+
+
+# =============================================================================
+# PREMIUM ICON BUTTON
+# =============================================================================
+
+class PremiumIconButton(QPushButton):
+    """
+    Button with premium vector icon and sophisticated hover effects.
+    """
+
+    def __init__(self, icon_type, size='medium', parent=None):
+        super().__init__(parent)
+        self.icon_type = icon_type
+        self._hover_progress = 0.0
+        self._press_progress = 0.0
+        self._glow_intensity = 0.0
+        # Size presets
+        sizes = {
+            'small': (32, 32),
+            'medium': (40, 40),
+            'large': (52, 52),
+            'primary': (56, 56)
+        }
+        w, h = sizes.get(size, (40, 40))
+        self.setFixedSize(w, h)
+        self.is_primary = (size == 'primary')
+        # "Active" look for buttons that cannot be checkable (a QPushButton
+        # carrying a menu pops the menu on click and never toggles): same blue
+        # background as the checked state, driven programmatically by the host.
+        self._active_look = False
+
+        # Animation timer
+        self._anim_timer = QTimer(self)
+        self._anim_timer.timeout.connect(self._update_animation)
+        self._anim_timer.setInterval(16)  # ~60 FPS
+        self._animations_blocked = False  # V7b+++ STUTTER FIX
+
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet("background: transparent; border: none;")
+
+    def set_active_look(self, active):
+        """Show/clear the checked-style blue background without being checkable."""
+        active = bool(active)
+        if active != self._active_look:
+            self._active_look = active
+            self.update()
+
+    def stop_animations(self):
+        """Stop animation timer to reduce activity during cleanup."""
+        if self._anim_timer.isActive():
+            self._anim_timer.stop()
+        self._animations_blocked = True  # V7b+++ Block restart on hover
+
+    def enable_animations(self):
+        """Re-enable animations after MVC mode ends."""
+        self._animations_blocked = False
+
+    def enterEvent(self, event):
+        # V7b+++ STUTTER FIX: Don't start animation if blocked (MVC mode)
+        if not self._animations_blocked:
+            self._anim_timer.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        # Stop timer immediately on leave to prevent stuttering
+        self._anim_timer.stop()
+        super().leaveEvent(event)
+
+    def _update_animation(self):
+        changed = False
+
+        # Hover animation - only check underMouse if we need to animate
+        is_hovered = self.underMouse()
+        target_hover = 1.0 if is_hovered else 0.0
+        if abs(self._hover_progress - target_hover) > 0.01:
+            self._hover_progress += (target_hover - self._hover_progress) * 0.15
+            changed = True
+        else:
+            self._hover_progress = target_hover
+
+        # Glow pulse for primary button - only when hovered or playing
+        if self.is_primary and is_hovered:
+            self._glow_intensity = 0.5 + 0.5 * abs((time.time() * 2) % 2 - 1)
+            changed = True
+        elif self.is_primary:
+            self._glow_intensity = 0.5  # Static when not hovered
+
+        if changed:
+            self.update()
+        elif not is_hovered:
+            # Stop timer when animation is stable and not hovered
+            self._anim_timer.stop()
+
+    def paintEvent(self, event):
+        # Guard against painting during destruction
+        if not self.isVisible():
+            return
+        try:
+            painter = QPainter(self)
+            if not painter.isActive():
+                return  # Painter failed to initialize
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+            cx, cy = self.width() / 2, self.height() / 2
+            radius = min(self.width(), self.height()) / 2 - 2
+
+            # === BACKGROUND ===
+            if self.is_primary:
+                # Primary button: gradient with glow
+                gradient = QRadialGradient(cx, cy, radius * 1.2)
+                gradient.setColorAt(0, QColor(0, 180, 240, 255))
+                gradient.setColorAt(0.7, QColor(0, 130, 200, 255))
+                gradient.setColorAt(1, QColor(0, 100, 180, 255))
+
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(gradient))
+                painter.drawEllipse(QPointF(cx, cy), radius, radius)
+
+                # Glow effect
+                if self._glow_intensity > 0:
+                    glow_gradient = QRadialGradient(cx, cy, radius * 1.5)
+                    glow_alpha = int(60 * self._glow_intensity)
+                    glow_gradient.setColorAt(0, QColor(0, 200, 255, glow_alpha))
+                    glow_gradient.setColorAt(0.5, QColor(0, 200, 255, glow_alpha // 2))
+                    glow_gradient.setColorAt(1, QColor(0, 200, 255, 0))
+                    painter.setBrush(QBrush(glow_gradient))
+                    painter.drawEllipse(QPointF(cx, cy), radius * 1.3, radius * 1.3)
+
+                # Border glow
+                painter.setPen(QPen(QColor(100, 220, 255, 150), 1.5))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(QPointF(cx, cy), radius, radius)
+            else:
+                # Secondary button: glass effect
+                if self.isChecked() or self._active_look:
+                    # Active (Checked) State - Cyan Tint
+                    bg_color = QColor(0, 140, 220, 160)
+                    border_color = QColor(100, 220, 255, 200)
+                    painter.setPen(QPen(border_color, 1.5))
+                    painter.setBrush(QBrush(bg_color))
+                    painter.drawRoundedRect(QRectF(2, 2, self.width() - 4, self.height() - 4), 10, 10)
+                else:
+                    # Normal / Hover State
+                    bg_alpha = int(40 + 60 * self._hover_progress)
+                    border_alpha = int(30 + 50 * self._hover_progress)
+
+                    painter.setPen(QPen(QColor(255, 255, 255, border_alpha), 1))
+                    painter.setBrush(QBrush(QColor(60, 65, 80, bg_alpha)))
+                    painter.drawRoundedRect(QRectF(2, 2, self.width() - 4, self.height() - 4), 10, 10)
+
+                    # Hover glow
+                    if self._hover_progress > 0.1:
+                        glow_color = QColor(0, 200, 255, int(30 * self._hover_progress))
+                        painter.setPen(QPen(glow_color, 2))
+                        painter.setBrush(Qt.BrushStyle.NoBrush)
+                        painter.drawRoundedRect(QRectF(2, 2, self.width() - 4, self.height() - 4), 10, 10)
+
+            # === ICON ===
+            icon_color = QColor(255, 255, 255, 240)
+            if not self.isEnabled():
+                icon_color = QColor(255, 255, 255, 80)
+
+            self._draw_icon(painter, cx, cy, icon_color)
+        except Exception:
+            pass  # Ignore paint errors during seek/thread contention
+
+    def _draw_icon(self, painter, cx, cy, color):
+        """Draws the vector icon."""
+        painter.setPen(QPen(color, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        scale = 0.4 if self.is_primary else 0.35
+        s = min(self.width(), self.height()) * scale
+
+        if self.icon_type == 'play':
+            path = QPainterPath()
+            path.moveTo(cx - s * 0.35, cy - s * 0.5)
+            path.lineTo(cx + s * 0.5, cy)
+            path.lineTo(cx - s * 0.35, cy + s * 0.5)
+            path.closeSubpath()
+            painter.setBrush(QBrush(color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPath(path)
+
+        elif self.icon_type == 'pause':
+            painter.setBrush(QBrush(color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            bar_w = s * 0.25
+            gap = s * 0.15
+            painter.drawRoundedRect(QRectF(cx - gap - bar_w, cy - s * 0.45, bar_w, s * 0.9), 2, 2)
+            painter.drawRoundedRect(QRectF(cx + gap, cy - s * 0.45, bar_w, s * 0.9), 2, 2)
+
+        elif self.icon_type == 'stop':
+            painter.setBrush(QBrush(color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(QRectF(cx - s * 0.35, cy - s * 0.35, s * 0.7, s * 0.7), 3, 3)
+
+        elif self.icon_type == 'folder':
+            path = QPainterPath()
+            # Folder shape
+            path.moveTo(cx - s * 0.5, cy - s * 0.25)
+            path.lineTo(cx - s * 0.2, cy - s * 0.25)
+            path.lineTo(cx - s * 0.1, cy - s * 0.4)
+            path.lineTo(cx + s * 0.5, cy - s * 0.4)
+            path.lineTo(cx + s * 0.5, cy + s * 0.35)
+            path.lineTo(cx - s * 0.5, cy + s * 0.35)
+            path.closeSubpath()
+            painter.strokePath(path, QPen(color, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+
+        elif self.icon_type == 'fullscreen':
+            pen = QPen(color, 2)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            corners = [
+                (cx - s * 0.4, cy - s * 0.4, 1, 1),  # TL
+                (cx + s * 0.4, cy - s * 0.4, -1, 1),  # TR
+                (cx - s * 0.4, cy + s * 0.4, 1, -1),  # BL
+                (cx + s * 0.4, cy + s * 0.4, -1, -1),  # BR
+            ]
+            for x, y, dx, dy in corners:
+                painter.drawLine(QPointF(x, y), QPointF(x + dx * s * 0.25, y))
+                painter.drawLine(QPointF(x, y), QPointF(x, y + dy * s * 0.25))
+
+        elif self.icon_type == 'exit_fullscreen':
+            pen = QPen(color, 2)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            offset = s * 0.15
+            corners = [
+                (cx - offset, cy - offset, -1, -1),
+                (cx + offset, cy - offset, 1, -1),
+                (cx - offset, cy + offset, -1, 1),
+                (cx + offset, cy + offset, 1, 1),
+            ]
+            for x, y, dx, dy in corners:
+                painter.drawLine(QPointF(x, y), QPointF(x + dx * s * 0.25, y))
+                painter.drawLine(QPointF(x, y), QPointF(x, y + dy * s * 0.25))
+
+        elif self.icon_type == 'volume':
+            # Speaker cone
+            path = QPainterPath()
+            path.moveTo(cx - s * 0.25, cy - s * 0.15)
+            path.lineTo(cx - s * 0.05, cy - s * 0.15)
+            path.lineTo(cx + s * 0.15, cy - s * 0.4)
+            path.lineTo(cx + s * 0.15, cy + s * 0.4)
+            path.lineTo(cx - s * 0.05, cy + s * 0.15)
+            path.lineTo(cx - s * 0.25, cy + s * 0.15)
+            path.closeSubpath()
+            painter.setBrush(QBrush(color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPath(path)
+            # Sound waves
+            painter.setPen(QPen(color, 1.5))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawArc(QRectF(cx + s * 0.1, cy - s * 0.2, s * 0.25, s * 0.4), -60 * 16, 120 * 16)
+            painter.drawArc(QRectF(cx + s * 0.1, cy - s * 0.35, s * 0.4, s * 0.7), -55 * 16, 110 * 16)
+
+        elif self.icon_type == 'volume_mute':
+            # Muted speaker
+            path = QPainterPath()
+            path.moveTo(cx - s * 0.3, cy - s * 0.15)
+            path.lineTo(cx - s * 0.1, cy - s * 0.15)
+            path.lineTo(cx + s * 0.1, cy - s * 0.35)
+            path.lineTo(cx + s * 0.1, cy + s * 0.35)
+            path.lineTo(cx - s * 0.1, cy + s * 0.15)
+            path.lineTo(cx - s * 0.3, cy + s * 0.15)
+            path.closeSubpath()
+            painter.setBrush(QBrush(color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPath(path)
+            # X mark
+            painter.setPen(QPen(color, 2))
+            painter.drawLine(QPointF(cx + s * 0.2, cy - s * 0.2), QPointF(cx + s * 0.45, cy + s * 0.2))
+            painter.drawLine(QPointF(cx + s * 0.45, cy - s * 0.2), QPointF(cx + s * 0.2, cy + s * 0.2))
+
+        elif self.icon_type == 'skip_back':
+            painter.setBrush(QBrush(color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            # Bar
+            painter.drawRect(QRectF(cx - s * 0.4, cy - s * 0.35, s * 0.12, s * 0.7))
+            # Arrow
+            path = QPainterPath()
+            path.moveTo(cx + s * 0.35, cy - s * 0.35)
+            path.lineTo(cx - s * 0.15, cy)
+            path.lineTo(cx + s * 0.35, cy + s * 0.35)
+            path.closeSubpath()
+            painter.drawPath(path)
+
+        elif self.icon_type == 'skip_forward':
+            painter.setBrush(QBrush(color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            # Bar
+            painter.drawRect(QRectF(cx + s * 0.28, cy - s * 0.35, s * 0.12, s * 0.7))
+            # Arrow
+            path = QPainterPath()
+            path.moveTo(cx - s * 0.35, cy - s * 0.35)
+            path.lineTo(cx + s * 0.15, cy)
+            path.lineTo(cx - s * 0.35, cy + s * 0.35)
+            path.closeSubpath()
+            painter.drawPath(path)
+
+        elif self.icon_type == '3d':
+            font = QFont('Segoe UI', int(s * 0.8), QFont.Weight.Bold)
+            painter.setFont(font)
+            painter.setPen(color)
+            painter.drawText(QRectF(0, 0, self.width(), self.height()),
+                             Qt.AlignmentFlag.AlignCenter, '3D')
+
+        elif self.icon_type == 'ai3d':
+            # "AI" monogram with a stereo ghost: the same glyph echoed with a
+            # small horizontal offset, like the parallax double the 2D->3D
+            # synthesis creates. Same typography as the '3d' glyph.
+            font = QFont('Segoe UI', int(s * 0.8), QFont.Weight.Bold)
+            painter.setFont(font)
+            rect = QRectF(0, 0, self.width(), self.height())
+            ghost = QColor(color)
+            ghost.setAlphaF(color.alphaF() * 0.35)
+            painter.setPen(ghost)
+            painter.drawText(rect.translated(-s * 0.12, 0),
+                             Qt.AlignmentFlag.AlignCenter, 'AI')
+            painter.setPen(color)
+            painter.drawText(rect.translated(s * 0.06, 0),
+                             Qt.AlignmentFlag.AlignCenter, 'AI')
+
+        elif self.icon_type == 'disc':
+            # Optical disc: outer ring + center hub (open a Blu-ray)
+            painter.setPen(QPen(color, 1.8, Qt.PenStyle.SolidLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            r = s * 0.5
+            painter.drawEllipse(QPointF(cx, cy), r, r)
+            painter.drawEllipse(QPointF(cx, cy), r * 0.35, r * 0.35)
+            painter.setBrush(QBrush(color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QPointF(cx, cy), r * 0.12, r * 0.12)
+
+        elif self.icon_type == 'archive':
+            # Optical disc above a down-arrow: save/rip the disc to an .iso image
+            painter.setPen(QPen(color, 1.7, Qt.PenStyle.SolidLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            dcy = cy - s * 0.16
+            r = s * 0.34
+            painter.drawEllipse(QPointF(cx, dcy), r, r)
+            painter.drawEllipse(QPointF(cx, dcy), r * 0.34, r * 0.34)
+            painter.setBrush(QBrush(color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QPointF(cx, dcy), r * 0.11, r * 0.11)
+            # down arrow (export to file)
+            pen = QPen(color, 2.0)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            ay0, ay1 = cy + s * 0.20, cy + s * 0.50
+            painter.drawLine(QPointF(cx, ay0), QPointF(cx, ay1))
+            painter.drawLine(QPointF(cx - s * 0.13, ay1 - s * 0.15), QPointF(cx, ay1))
+            painter.drawLine(QPointF(cx + s * 0.13, ay1 - s * 0.15), QPointF(cx, ay1))
+
+
+# =============================================================================
+# PREMIUM STATUS BADGE
+# =============================================================================
+
+class PremiumStatusBadge(QWidget):
+    """
+    Animated status badge with glow effect.
+    Displays player state (Ready, MVC Active, etc.)
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._status = "Ready"
+        self._status_type = "info"  # info, success, warning, error
+        self._glow_phase = 0.0
+        self._is_active = False
+
+        self.setFixedHeight(28)
+        self.setMinimumWidth(100)
+
+        # Animation timer
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._update_glow)
+        self._timer.setInterval(30)
+
+    def set_status(self, text, status_type="info", active=False):
+        """
+        Sets the displayed status.
+
+        Args:
+            text: Text to display
+            status_type: 'info', 'success', 'warning', 'error'
+            active: If True, enables the glow animation
+        """
+        self._status = text
+        self._status_type = status_type
+        self._is_active = active
+
+        if active and not self._timer.isActive():
+            self._timer.start()
+        elif not active:
+            self._timer.stop()
+            self._glow_phase = 0.0
+
+        self.updateGeometry()
+        self.update()
+
+    def _update_glow(self):
+        self._glow_phase = (self._glow_phase + 0.05) % (2 * 3.14159)
+        self.update()
+
+    def sizeHint(self):
+        fm = QFontMetrics(QFont('Segoe UI', 10, QFont.Weight.Medium))
+        text_width = fm.horizontalAdvance(self._status)
+        return self.size().__class__(text_width + 40, 28)
+
+    def paintEvent(self, event):
+        try:
+            painter = QPainter(self)
+            if not painter.isActive():
+                return
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+            # Colors by type
+            colors = {
+                'info': (PremiumColors.INFO, QColor(138, 180, 248, 30)),
+                'success': (PremiumColors.SUCCESS, QColor(0, 230, 118, 40)),
+                'warning': (PremiumColors.WARNING, QColor(255, 170, 0, 30)),
+                'error': (QColor(255, 100, 100), QColor(255, 100, 100, 30)),
+            }
+            accent_color, bg_color = colors.get(self._status_type, colors['info'])
+
+            # Background with glow if active
+            rect = QRectF(0, 0, self.width(), self.height())
+
+            if self._is_active:
+                import math
+                glow_intensity = 0.5 + 0.5 * math.sin(self._glow_phase)
+                glow_alpha = int(40 + 40 * glow_intensity)
+                glow_color = QColor(accent_color.red(), accent_color.green(), accent_color.blue(), glow_alpha)
+
+                # Outer glow
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(glow_color))
+                painter.drawRoundedRect(rect.adjusted(-2, -2, 2, 2), 16, 16)
+
+            # Main background
+            painter.setPen(QPen(accent_color.lighter(120), 1))
+            painter.setBrush(QBrush(bg_color))
+            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 12, 12)
+
+            # Indicator dot
+            dot_x = 12
+            dot_y = self.height() / 2
+
+            if self._is_active:
+                import math
+                pulse = 0.7 + 0.3 * math.sin(self._glow_phase * 2)
+                painter.setBrush(QBrush(accent_color))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(QPointF(dot_x, dot_y), 4 * pulse, 4 * pulse)
+            else:
+                painter.setBrush(QBrush(accent_color.darker(130)))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(QPointF(dot_x, dot_y), 3, 3)
+
+            # Text
+            font = QFont('Segoe UI', 10, QFont.Weight.Medium)
+            painter.setFont(font)
+            painter.setPen(PremiumColors.TEXT_PRIMARY)
+            text_rect = rect.adjusted(24, 0, -8, 0)
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self._status)
+        except Exception:
+            pass  # Ignore paint errors
+
+
+# =============================================================================
+# PREMIUM TECH INFO WIDGET
+# =============================================================================
+
+class PremiumTechInfo(QWidget):
+    """
+    Displays real-time technical information.
+    Format: "1080p • 23.976 fps • MVC"
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._resolution = ""
+        self._fps = ""
+        self._codec = ""
+        self._sync_status = "sync"  # sync, drift, error
+
+        self.setFixedHeight(24)
+        self.setMinimumWidth(150)
+
+    def set_info(self, resolution="", fps="", codec=""):
+        self._resolution = resolution
+        self._fps = fps
+        self._codec = codec
+        self.update()
+
+    def set_sync_status(self, status):
+        """'sync', 'drift', 'error'"""
+        self._sync_status = status
+        self.update()
+
+    def paintEvent(self, event):
+        try:
+            painter = QPainter(self)
+            if not painter.isActive():
+                return
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+
+            font = QFont('Segoe UI', 9)
+            painter.setFont(font)
+
+            x = 4
+            y = self.height() / 2 + 4
+
+            # Resolution
+            if self._resolution:
+                painter.setPen(PremiumColors.TEXT_SECONDARY)
+                painter.drawText(int(x), int(y), self._resolution)
+                x += QFontMetrics(font).horizontalAdvance(self._resolution) + 8
+
+                # Separator dot
+                painter.setPen(PremiumColors.TEXT_MUTED)
+                painter.setBrush(QBrush(PremiumColors.TEXT_MUTED))
+                painter.drawEllipse(QPointF(x, self.height() / 2), 2, 2)
+                x += 10
+
+            # FPS
+            if self._fps:
+                painter.setPen(PremiumColors.TEXT_SECONDARY)
+                painter.drawText(int(x), int(y), self._fps)
+                x += QFontMetrics(font).horizontalAdvance(self._fps) + 8
+
+                if self._codec:
+                    painter.setPen(PremiumColors.TEXT_MUTED)
+                    painter.setBrush(QBrush(PremiumColors.TEXT_MUTED))
+                    painter.drawEllipse(QPointF(x, self.height() / 2), 2, 2)
+                    x += 10
+
+            # Codec with color
+            if self._codec:
+                codec_color = PremiumColors.SUCCESS if 'MVC' in self._codec.upper() else PremiumColors.INFO
+                painter.setPen(codec_color)
+                painter.drawText(int(x), int(y), self._codec)
+        except Exception:
+            pass  # Ignore paint errors
+
+
+# =============================================================================
+# PREMIUM TIMELINE SLIDER
+# =============================================================================
+
+class PremiumTimelineSlider(QSlider):
+    """
+    Premium timeline with animated gradient, buffer indicator and hover preview.
+    Corrected version for consistent movement.
+    """
+
+    preview_requested = Signal(float)
+    extraction_done = Signal(float, str)
+    scrub_finished = Signal(float)
+
+    def __init__(self, orientation=Qt.Orientation.Horizontal, parent=None):
+        super().__init__(orientation, parent)
+        self.setMouseTracking(True)
+
+        self._hover_pos = -1
+        self._hover_time = 0
+        self._buffer_progress = 0.0
+        self._is_mvc_active = False
+        self._gradient_offset = 0.0
+        self._is_busy = False  # New flag to block interaction during seeks
+
+        # Preview machinery
+        self._player = None
+        self._video_file = None
+        self._thumbs_allowed = True
+        self._thumb_service = None      # edge264 ThumbnailService (None = ffmpeg legacy)
+        self._preview_widget = PreviewTooltip(self)
+        self._last_preview_time = -99
+        self._preview_cache = {}
+        self._displayed_exact = None    # (t_s, idr_s) of the exact vignette on screen
+        self._extraction_timer = QTimer(self)
+        self._extraction_timer.setSingleShot(True)
+        self._extraction_timer.timeout.connect(self._do_extraction)
+        self._pending_time = 0
+        self._pending_mouse_x = 0
+
+        self.extraction_done.connect(self._on_extraction_done)
+
+        # Animation
+        self._anim_timer = QTimer(self)
+        self._anim_timer.timeout.connect(self._animate)
+        self._anim_timer.setInterval(30)
+
+        # === CORRECTED SCRUBBING SYSTEM ===
+        self._is_scrubbing = False
+        self._scrub_start_value = 0
+        self._scrub_debounce_timer = QTimer(self)
+        self._scrub_debounce_timer.setSingleShot(True)
+        self._scrub_debounce_timer.setInterval(50)  # Reduced to 50ms for more responsiveness
+        self._scrub_debounce_timer.timeout.connect(self._on_scrub_debounce_expired)
+        self._pending_scrub_value = None
+
+        self.setFixedHeight(30) # Increased height to preventing clipping
+        self.setStyleSheet("background: transparent;")
+
+    def set_busy(self, busy):
+        """Block or unblock user interaction."""
+        self._is_busy = busy
+        self.update()
+
+    def set_player(self, player):
+        self._player = player
+
+    def set_thumbnail_provider(self, service):
+        """edge264 ThumbnailService, or None to use the legacy ffmpeg path."""
+        self._thumb_service = service
+
+    @staticmethod
+    def _fmt_time(seconds):
+        s = int(max(0, seconds))
+        h, s = divmod(s, 3600)
+        m, s = divmod(s, 60)
+        return f"{h:02}:{m:02}:{s:02}"
+
+    def _insert_cache(self, key, pixmap, exact=True, idr_s=None):
+        """Two-tier cache: entries are (pixmap, exact, idr_s). 'exact' thumbnails
+        are seek-aligned (decoded from the IDR a click at this key lands on) and
+        carry that IDR's PTS so the click can SNAP to it; 'approx' ones are
+        mid-GOP harvest frames — displayable, but they never overwrite an exact
+        entry and never suppress an exact request."""
+        cur = self._preview_cache.get(key)
+        if cur is not None and cur[1] and not exact:
+            return                                # never downgrade exact -> approx
+        if key in self._preview_cache:
+            del self._preview_cache[key]          # refresh LRU order
+        elif len(self._preview_cache) >= 150:
+            del self._preview_cache[next(iter(self._preview_cache))]
+        self._preview_cache[key] = (pixmap, exact, idr_s)
+
+    def _has_exact(self, key):
+        ent = self._preview_cache.get(key)
+        return bool(ent and ent[1])
+
+    def _nearest_cached(self, key, radius=30):
+        ent = self._preview_cache.get(key)
+        if ent:
+            return ent[0]
+        best, best_d = None, radius + 1
+        for k, (pm, _exact, _idr) in self._preview_cache.items():
+            d = abs(k - key)
+            if d < best_d:
+                best, best_d = pm, d
+        return best if best_d <= radius else None
+
+    @Slot(float, float, QImage)
+    def _on_service_thumbnail(self, t, idr_s, image):
+        """Exact (seek-aligned) thumbnails from the ThumbnailService."""
+        self._store_thumbnail(t, image, exact=True, idr_s=idr_s)
+
+    @Slot(float, QImage)
+    def _on_harvest_thumbnail(self, t, image):
+        """Approximate mid-GOP thumbnails harvested from playback frames."""
+        self._store_thumbnail(t, image, exact=False)
+
+    def _store_thumbnail(self, t, image, exact, idr_s=None):
+        pm = QPixmap.fromImage(image)
+        if pm.isNull():
+            return
+        self._insert_cache(round(t), pm, exact=exact, idr_s=idr_s)
+        # Swap the visible tooltip image if still relevant — but an approx frame
+        # never replaces an already-displayed exact one for the same key.
+        if self._hover_pos >= 0 and abs(t - self._hover_time) <= 2.0:
+            if exact:
+                self._preview_widget.set_thumbnail(pm)
+                self._displayed_exact = (float(t), idr_s)   # WYSIWYG identity
+            elif not self._has_exact(round(self._hover_time)):
+                self._preview_widget.set_thumbnail(pm)
+                self._displayed_exact = None
+
+    def set_thumbnails_allowed(self, allowed):
+        """Enable/disable hover thumbnails for the current source.
+
+        The player turns this off when the source sits on ANY optical-class
+        volume (DRIVE_CDROM) — physical disc OR mounted ISO. Physical: mpv
+        (audio) and the video demuxer already share the single optical head,
+        and a third ffmpeg reader causes measured 45-120s head thrash.
+        Mounted ISO: a concurrent ffmpeg probe made the virtual UDF volume's
+        reads fail during demuxer init (measured 2026-07-14, Avatar BD3D).
+        Regular files (MKV on HDD/SSD) keep thumbnails on.
+        """
+        self._thumbs_allowed = bool(allowed)
+        if not allowed:
+            self._extraction_timer.stop()
+            self._preview_widget.hide()
+
+    def set_video_file(self, video_path, duration):
+        """Configures the video file and duration for the slider."""
+        import os
+        import logging
+        
+        if not video_path: return
+        
+        norm_path = os.path.normpath(video_path)
+        
+        # Only reset cache if file actually changed
+        if self._video_file != norm_path:
+            self._video_file = norm_path
+            self._preview_cache.clear()
+            self._displayed_exact = None
+            # NO t=0 pre-warm extraction here: it raced the demuxer's open/probe
+            # window (measured 2026-07-14, Avatar BD3D ISO: the concurrent ffmpeg
+            # probe made the mounted UDF volume's reads return nothing → MVC init
+            # aborted). Thumbnails are extracted on hover only.
+
+        if duration and duration > 0:
+            # Use milliseconds for better precision
+            new_max = int(duration * 1000)
+            if self.maximum() != new_max:
+                self.setRange(0, new_max)
+            self.setEnabled(True)
+
+    def set_mvc_active(self, active):
+        self._is_mvc_active = active
+        # V7b+++ STUTTER FIX: DON'T start animation timer in MVC mode!
+        # The gradient animation was causing constant repaints (every 30ms)
+        # which caused stuttering when the window had focus.
+        # The animation is purely cosmetic - not needed during MVC playback.
+        if self._anim_timer.isActive():
+            self._anim_timer.stop()
+        self.update()
+
+    def set_buffer_progress(self, progress):
+        self._buffer_progress = max(0, min(1, progress))
+        self.update()
+
+    def _animate(self):
+        self._gradient_offset = (self._gradient_offset + 0.02) % 1.0
+        self.update()
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover_pos = -1
+        self._preview_widget.hide()
+        self._preview_widget.clear()
+        self._displayed_exact = None
+        # Reset so re-entering at the same spot re-shows the tooltip instantly
+        # (otherwise the 0.5s hover-delta gate swallows the first request)
+        self._last_preview_time = -99
+        self.update()
+        super().leaveEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.maximum() > 0:
+            pos = event.position().x() if hasattr(event, 'position') else event.pos().x()
+            self._hover_pos = pos
+            
+            # Margin correction for accurate hover time
+            margin = 16
+            usable_width = self.width() - 2 * margin
+            if usable_width > 0:
+                normalized_pos = (pos - margin) / usable_width
+                normalized_pos = max(0.0, min(1.0, normalized_pos))
+                self._hover_time = normalized_pos * (self.maximum() / 1000.0)
+            else:
+                self._hover_time = 0
+
+            # Real-time update during scrubbing
+            if self._is_scrubbing:
+                # Apply same margin logic for setting value
+                value = int(self._hover_time * 1000)
+                self.setValue(max(0, min(value, self.maximum())))
+                # Immediate emission during drag
+                self.sliderMoved.emit(self.value())
+
+            if not self._is_mvc_active:
+                self.preview_requested.emit(self._hover_time)
+
+            # Tooltip follows the mouse IMMEDIATELY (position + time pill);
+            # only the image updates asynchronously. GATED on _thumbs_allowed:
+            # on optical-class sources (physical disc / mounted ISO) thumbnails
+            # can never be extracted, so the tooltip would be a permanently
+            # empty black frame following the cursor -- show nothing instead.
+            if self._video_file and self._thumbs_allowed:
+                gp = self.mapToGlobal(QPointF(pos, 0).toPoint())
+                self._preview_widget.set_time_text(self._fmt_time(self._hover_time))
+                key = round(self._hover_time)
+                ent = self._preview_cache.get(key)
+                if ent is not None:
+                    self._preview_widget.set_thumbnail(ent[0])
+                    # WYSIWYG identity: remember which exact vignette is on screen
+                    self._displayed_exact = (float(key), ent[2]) if ent[1] else None
+                else:
+                    pm = self._nearest_cached(key)
+                    if pm is not None:
+                        self._preview_widget.set_thumbnail(pm)
+                        self._displayed_exact = None
+                
+                # Only show the native Qt tooltip widget if we are not rendering it via the 3D HUD
+                if not self.property('hud_mode'):
+                    self._preview_widget.show_at(gp.x(), gp.y())
+                else:
+                    self._preview_widget.hide()
+
+            # Thumbnail request (0.3s hover-delta gate) — also active during MVC
+            # playback; optical sources are governed by set_thumbnails_allowed
+            if (self._thumbs_allowed and self._video_file
+                    and abs(self._hover_time - self._last_preview_time) > 0.3):
+                self._last_preview_time = self._hover_time
+                if self._thumb_service is not None:
+                    # Request unless an EXACT (seek-aligned) thumb exists for
+                    # this key — approx harvest frames don't match the click
+                    # landing frame, so they must not suppress the request.
+                    if not self._has_exact(round(self._hover_time)):
+                        self._thumb_service.request(self._hover_time)
+                else:
+                    self._request_on_demand_preview(self._hover_time, pos)
+
+        self.update()
+        if self._is_scrubbing:
+            # OWN THE GESTURE (see mousePressEvent): QSlider's drag would rewrite
+            # the value with its full-width mapping on every move.
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        if self._is_busy: return  # Block interaction if busy
+
+        if event.button() == Qt.MouseButton.LeftButton and self.maximum() > 0:
+            pos = event.position().x() if hasattr(event, 'position') else event.pos().x()
+
+            # Margin correction
+            margin = 16
+            usable_width = self.width() - 2 * margin
+            if usable_width > 0:
+                normalized_pos = (pos - margin) / usable_width
+                normalized_pos = max(0.0, min(1.0, normalized_pos))
+                value = int(normalized_pos * self.maximum())
+            else:
+                value = 0
+
+            self.setValue(max(0, min(value, self.maximum())))
+
+            # Start scrubbing
+            self._is_scrubbing = True
+            self._scrub_start_value = value
+            # OWN THE GESTURE: emits sliderPressed for the player, WITHOUT
+            # forwarding to QSlider — its stylesheet absolute-jump would rewrite
+            # the value with a FULL-WIDTH pixel mapping (no 16px margin), landing
+            # the playhead right of the click and desyncing seek vs tooltip.
+            self.setSliderDown(True)
+
+            # Immediate emission for click
+            self.sliderMoved.emit(self.value())
+            self._pending_scrub_value = value
+            self._scrub_debounce_timer.stop()
+            event.accept()
+            return
+
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        """End of scrubbing - emits final seek with debounce."""
+        if event.button() == Qt.MouseButton.LeftButton and self._is_scrubbing:
+            self._is_scrubbing = False
+            final_value = self.value()
+
+            # Emit final seek via debounce
+            self._pending_scrub_value = final_value
+            self._scrub_debounce_timer.start()
+            # Emits sliderReleased (the player's seek hook) AFTER our final
+            # value is set — never forwarded to QSlider (see mousePressEvent).
+            self.setSliderDown(False)
+            event.accept()
+            return
+
+        super().mouseReleaseEvent(event)
+
+    def snap_to_vignette(self, target_s):
+        """PERFECT-SYNC SNAP (WYSIWYG): the user clicks on what they SEE. If an
+        exact vignette is DISPLAYED and the click is near it (slow sources make
+        the displayed thumb trail the cursor), seek to ITS IDR — the landing
+        frame is then the tooltip image, by construction. Fallback: the exact
+        cache entry at the clicked second. Allows a small FORWARD snap (click
+        marginally before the vignette's IDR, key-rounding artifact) but never
+        jumps more than 1s ahead. Returns target_s unchanged otherwise."""
+        try:
+            disp = self._displayed_exact
+            if (disp is not None and disp[1] is not None
+                    and abs(target_s - disp[0]) <= 5.0
+                    and -1.0 <= target_s - disp[1] < 15.0):
+                return float(disp[1])
+            ent = self._preview_cache.get(round(target_s))
+            if (ent is not None and ent[1] and ent[2] is not None
+                    and -1.0 <= target_s - ent[2] < 15.0):
+                return float(ent[2])
+        except Exception:
+            pass
+        return float(target_s)
+
+    def _on_scrub_debounce_expired(self):
+        """Called after debounce - emits scrub_finished signal."""
+        if self._pending_scrub_value is not None:
+            target_s = self.snap_to_vignette(float(self._pending_scrub_value) / 1000.0)
+            self.scrub_finished.emit(target_s)
+            self._pending_scrub_value = None
+
+    # --- Legacy ffmpeg preview path (non-H.264 sources only) ---
+    def _request_on_demand_preview(self, time_pos, mouse_x):
+        if round(time_pos) in self._preview_cache:
+            return   # already displayed by the hover handler
+        self._pending_time = time_pos
+        self._pending_mouse_x = mouse_x
+        self._extraction_timer.start(150)
+
+    def _do_extraction(self):
+        # Extraction runs during MVC playback too: the old V13 blanket ban
+        # (0xe24c4a02) predates the targeted ctypes/mpv guards, and this path
+        # only spawns ffmpeg out-of-process — it touches no decoder/mpv state.
+        # Physical optical sources stay excluded via set_thumbnails_allowed
+        # (third reader on the single optical head = measured 45-120s thrash).
+        if not self._thumbs_allowed or not self._video_file:
+            return
+
+        time_pos = self._pending_time
+        mouse_x = self._pending_mouse_x
+        future = _thumbnail_executor.submit(_extract_thumbnail_ffmpeg, self._video_file, time_pos)
+        future.add_done_callback(lambda f: self._handle_extraction_result(f, time_pos))
+
+    def _handle_extraction_result(self, future, time_pos):
+        try:
+            temp_file = future.result()
+            if temp_file:
+                self.extraction_done.emit(time_pos, temp_file)
+        except:
+            pass
+
+    @Slot(float, str)
+    def _on_extraction_done(self, time_pos, temp_file):
+        try:
+            pixmap = QPixmap(temp_file)
+            if not pixmap.isNull():
+                self._insert_cache(round(time_pos), pixmap)
+                if self._hover_pos >= 0 and abs(time_pos - self._hover_time) <= 2.0:
+                    self._preview_widget.set_thumbnail(pixmap)
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+        except Exception:
+            pass
+
+    def paintEvent(self, event):
+        try:
+            painter = QPainter(self)
+            if not painter.isActive():
+                return
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+            # Dimensions
+            margin = 16
+            track_height = 6
+            track_y = (self.height() - track_height) / 2
+            track_rect = QRectF(margin, track_y, self.width() - 2 * margin, track_height)
+
+            # === TRACK BACKGROUND ===
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(50, 55, 65)))
+            painter.drawRoundedRect(track_rect, track_height / 2, track_height / 2)
+
+            # === BUFFER INDICATOR ===
+            if self._buffer_progress > 0:
+                buffer_width = track_rect.width() * self._buffer_progress
+                buffer_rect = QRectF(track_rect.x(), track_rect.y(), buffer_width, track_rect.height())
+                painter.setBrush(QBrush(QColor(80, 85, 95)))
+                painter.drawRoundedRect(buffer_rect, track_height / 2, track_height / 2)
+
+            # === PROGRESS BAR ===
+            if self.maximum() > 0:
+                progress = self.value() / self.maximum()
+                progress_width = track_rect.width() * progress
+                progress_rect = QRectF(track_rect.x(), track_rect.y(), progress_width, track_rect.height())
+
+                if self._is_mvc_active:
+                    # Animated gradient for MVC mode
+                    gradient = QLinearGradient(0, 0, track_rect.width(), 0)
+                    offset = self._gradient_offset
+                    gradient.setColorAt(0, PremiumColors.ACCENT_PRIMARY)
+                    gradient.setColorAt((0.5 + offset) % 1.0, PremiumColors.SUCCESS)
+                    gradient.setColorAt(1, PremiumColors.ACCENT_SECONDARY)
+                    painter.setBrush(QBrush(gradient))
+                else:
+                    # Static gradient
+                    gradient = QLinearGradient(0, 0, progress_width, 0)
+                    gradient.setColorAt(0, PremiumColors.ACCENT_SECONDARY)
+                    gradient.setColorAt(1, PremiumColors.ACCENT_PRIMARY)
+                    painter.setBrush(QBrush(gradient))
+
+                painter.drawRoundedRect(progress_rect, track_height / 2, track_height / 2)
+
+            # === HANDLE ===
+            if self.maximum() > 0:
+                handle_x = track_rect.x() + (track_rect.width() * self.value() / self.maximum())
+                handle_radius = 8 if self._hover_pos >= 0 else 6
+
+                # Handle shadow
+                painter.setBrush(QBrush(QColor(0, 0, 0, 40)))
+                painter.drawEllipse(QPointF(handle_x, track_y + track_height / 2 + 1), handle_radius, handle_radius)
+
+                # Handle
+                gradient = QRadialGradient(handle_x, track_y + track_height / 2, handle_radius)
+                gradient.setColorAt(0, QColor(255, 255, 255))
+                gradient.setColorAt(1, QColor(220, 225, 235))
+                painter.setBrush(QBrush(gradient))
+                painter.setPen(QPen(PremiumColors.ACCENT_PRIMARY, 2))
+                painter.drawEllipse(QPointF(handle_x, track_y + track_height / 2), handle_radius, handle_radius)
+
+            # === HOVER INDICATOR ===
+            if self._hover_pos >= 0 and self.maximum() > 0:
+                painter.setPen(QPen(QColor(255, 255, 255, 100), 1))
+                painter.drawLine(QPointF(self._hover_pos, 0), QPointF(self._hover_pos, self.height()))
+
+            # === PREVIEW MARKER ===
+            if self._hover_pos >= 0 and self.maximum() > 0:
+                # Draw a small dot on the track at the hover position
+                painter.setBrush(QBrush(PremiumColors.ACCENT_GLOW))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(QPointF(self._hover_pos, track_y + track_height / 2), 3, 3)
+        except Exception:
+            pass  # Ignore paint errors
+
+
+# =============================================================================
+# PREMIUM VOLUME SLIDER
+# =============================================================================
+
+class PremiumVolumeSlider(QWidget):
+    """
+    Compact volume slider with integrated icon.
+    """
+
+    volume_changed = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._volume = 100
+        self._is_muted = False
+        self._hover = False
+        self._dragging = False
+
+        self.setFixedSize(110, 28)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_volume(self, value):
+        self._volume = max(0, min(100, value))
+        self._is_muted = (value == 0)
+        self.update()
+
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._update_volume_from_pos(event.position().x())
+            self._dragging = True
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            self._update_volume_from_pos(event.position().x())
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._dragging = False
+        super().mouseReleaseEvent(event)
+
+    def _update_volume_from_pos(self, x):
+        slider_start = 28
+        slider_width = self.width() - slider_start - 4
+        if slider_width > 0:
+            normalized = (x - slider_start) / slider_width
+            volume = int(max(0, min(100, normalized * 100)))
+            if volume != self._volume:
+                self._volume = volume
+                self._is_muted = (volume == 0)
+                self.volume_changed.emit(volume)
+                self.update()
+
+    def paintEvent(self, event):
+        try:
+            painter = QPainter(self)
+            if not painter.isActive():
+                return
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+            # === VOLUME ICON ===
+            icon_color = PremiumColors.TEXT_SECONDARY if not self._is_muted else PremiumColors.TEXT_MUTED
+            cx, cy = 14, self.height() / 2
+            s = 10
+
+            # Speaker cone
+            path = QPainterPath()
+            path.moveTo(cx - s * 0.35, cy - s * 0.2)
+            path.lineTo(cx - s * 0.1, cy - s * 0.2)
+            path.lineTo(cx + s * 0.15, cy - s * 0.45)
+            path.lineTo(cx + s * 0.15, cy + s * 0.45)
+            path.lineTo(cx - s * 0.1, cy + s * 0.2)
+            path.lineTo(cx - s * 0.35, cy + s * 0.2)
+            path.closeSubpath()
+            painter.setBrush(QBrush(icon_color))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPath(path)
+
+            if not self._is_muted and self._volume > 30:
+                painter.setPen(QPen(icon_color, 1.5))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawArc(QRectF(cx + s * 0.1, cy - s * 0.25, s * 0.3, s * 0.5), -60 * 16, 120 * 16)
+            if not self._is_muted and self._volume > 60:
+                painter.drawArc(QRectF(cx + s * 0.1, cy - s * 0.4, s * 0.5, s * 0.8), -55 * 16, 110 * 16)
+
+            # === SLIDER TRACK ===
+            slider_x = 28
+            slider_width = self.width() - slider_x - 4
+            slider_y = self.height() / 2
+            track_height = 4
+
+            # Track background
+            track_rect = QRectF(slider_x, slider_y - track_height / 2, slider_width, track_height)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(60, 65, 75)))
+            painter.drawRoundedRect(track_rect, 2, 2)
+
+            # Progress
+            progress_width = slider_width * (self._volume / 100)
+            if progress_width > 0:
+                progress_rect = QRectF(slider_x, slider_y - track_height / 2, progress_width, track_height)
+                painter.setBrush(QBrush(PremiumColors.ACCENT_PRIMARY))
+                painter.drawRoundedRect(progress_rect, 2, 2)
+
+            # Handle
+            if self._hover or self._dragging:
+                handle_x = slider_x + progress_width
+                painter.setBrush(QBrush(QColor(255, 255, 255)))
+                painter.setPen(QPen(PremiumColors.ACCENT_PRIMARY, 1.5))
+                painter.drawEllipse(QPointF(handle_x, slider_y), 5, 5)
+        except Exception:
+            pass  # Ignore paint errors
+
+
+# =============================================================================
+# VERTICAL SEPARATOR
+# =============================================================================
+
+class PremiumSeparator(QWidget):
+    """Elegant vertical separator."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(1)
+        self.setMinimumHeight(20)
+
+    def paintEvent(self, event):
+        try:
+            painter = QPainter(self)
+            if not painter.isActive():
+                return
+            gradient = QLinearGradient(0, 0, 0, self.height())
+            gradient.setColorAt(0, QColor(255, 255, 255, 0))
+            gradient.setColorAt(0.5, QColor(255, 255, 255, 40))
+            gradient.setColorAt(1, QColor(255, 255, 255, 0))
+            painter.setPen(QPen(QBrush(gradient), 1))
+            painter.drawLine(0, 4, 0, self.height() - 4)
+        except Exception:
+            pass  # Ignore paint errors
+
+
+# =============================================================================
+# PREMIUM CONTROLS OVERLAY - MAIN WIDGET
+# =============================================================================
+
+class PremiumSpectrumMeter(QWidget):
+    """Audio-reactive spectrum-style visualiser fed by the player's real mpv level.
+
+    A wide row of slim cyan bars with a pleasant spectral arch + lively per-band
+    motion, so it dances with the music and fills the transport gap. Sober and
+    on-theme. (mpv exposes overall level, not true FFT bands, so the per-band
+    motion is a level-driven envelope rather than literal frequency content.)
+    """
+    BANDS = 22
+    MIN_W, PREF_W, FIXED_H = 104, 188, 40
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # This is a first-class piece of telemetry at standard player widths.
+        # It may still compress responsively in a genuinely narrow window so the
+        # fullscreen control never overflows.
+        self.setFixedHeight(self.FIXED_H)
+        self.setMinimumWidth(0)
+        self.setMaximumWidth(self.PREF_W)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setToolTip("Live audio level")
+        n = self.BANDS
+        self._h = [0.0] * n          # smoothed bar heights 0..1
+        self._level = 0.0            # latest overall level 0..1
+        self._peak = 0.0             # latest transient peak 0..1
+        self._phase = 0.0
+        self._env = []               # fixed spectral arch (fuller mids, taper highs)
+        self._rate = []              # varied per-band wiggle speeds
+        for i in range(n):
+            x = i / (n - 1)
+            env = 0.40 + 0.60 * max(0.0, math.sin(math.pi * (0.12 + 0.76 * x)))
+            env *= (1.0 - 0.30 * x)
+            self._env.append(env)
+            self._rate.append(0.6 + 1.6 * ((i * 0.37 + 0.13) % 1.0))
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.setInterval(33)  # ~30 fps, only runs while there's signal
+
+    def sizeHint(self):
+        # Preferred (uncompressed) footprint; the layout shrinks below this
+        # toward minimumSizeHint (width 0) to absorb the bar's width deficit.
+        return QSize(self.PREF_W, self.FIXED_H)
+
+    def minimumSizeHint(self):
+        return QSize(0, self.FIXED_H)
+
+    def set_levels(self, level, peak=None):
+        """Feed the overall normalized level (0..1); peak adds a transient kick."""
+        self._level = max(0.0, min(1.0, float(level)))
+        if peak is not None:
+            self._peak = max(self._peak, max(0.0, min(1.0, float(peak))))
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def _tick(self):
+        self._phase += 0.16
+        lvl = self._level
+        n = self.BANDS
+        active = lvl > 0.003
+        for i in range(n):
+            wig = 0.5 + 0.5 * math.sin(self._phase * self._rate[i] + i * 1.7)
+            wig2 = 0.5 + 0.5 * math.sin(self._phase * self._rate[i] * 0.6 + i * 0.7 + 2.1)
+            tg = lvl * self._env[i] * (0.5 + 0.7 * wig * wig2)
+            tg = min(1.0, tg + self._peak * 0.18 * wig)
+            cur = self._h[i]
+            cur += (tg - cur) * (0.60 if tg > cur else 0.22)   # fast attack, slow release
+            if cur < 0.001 and tg < 0.001:
+                cur = 0.0
+            self._h[i] = cur
+            if cur > 0.003:
+                active = True
+        self._peak *= 0.90            # transient bleeds away between polls
+        self.update()
+        if not active:
+            self._timer.stop()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        if not p.isActive():
+            return
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        available = w
+        if available < 12:
+            return
+
+        n = max(5, min(self.BANDS, int(available / 5.0)))
+        top, bot = 6.0, h - 6.0
+        span = bot - top
+        gap = 2.0
+        bar_w = max(1.5, (available - gap * (n + 1)) / n)
+        rad = min(2.0, bar_w / 2.0)
+        grad = QLinearGradient(0, top, 0, bot)
+        grad.setColorAt(0.0, QColor(150, 233, 255))
+        grad.setColorAt(0.4, QColor(40, 196, 255))
+        grad.setColorAt(1.0, QColor(8, 90, 130))
+        x = gap
+        for draw_index in range(n):
+            i = int(round(draw_index * (self.BANDS - 1) / max(1, n - 1)))
+            # unlit track
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(255, 255, 255, 12))
+            p.drawRoundedRect(QRectF(x, top, bar_w, span), rad, rad)
+            v = self._h[i]
+            if v > 0.003:
+                lit_top = bot - v * span
+                p.save()
+                clip = QPainterPath()
+                clip.addRoundedRect(QRectF(x, top, bar_w, span), rad, rad)
+                p.setClipPath(clip)
+                p.setBrush(QBrush(grad))
+                p.drawRect(QRectF(x, lit_top, bar_w, bot - lit_top))
+                p.restore()
+            x += bar_w + gap
+
+
+class PremiumControlsOverlay(QWidget):
+    """
+    Ultra-modern premium controls bar for SyLC 3D player.
+
+    Signals:
+        play_toggled: Play/Pause
+        stop_clicked: Stop
+        fullscreen_toggled: Fullscreen
+        seeked(float): Seek position
+        volume_changed(int): Volume 0-100
+        file_opened: Open file
+        stereo_mode_changed(str): 3D mode changed
+        mode_3d_toggled(bool): 3D on/off
+        audio_track_changed(int): Audio track
+        subtitle_track_changed(int): Subtitles
+    """
+
+    play_toggled = Signal()
+    stop_clicked = Signal()
+    fullscreen_toggled = Signal()
+    seeked = Signal(float)
+    volume_changed = Signal(int)
+    file_opened = Signal()
+    disc_opened = Signal()  # open a Blu-ray 3D disc/folder (auto-detect the feature)
+    archive_requested = Signal()  # archive the current optical disc to an .iso image
+    export_mvhevc_requested = Signal(str)  # export current 3D media to MV-HEVC .mov; arg = 'quality'|'fast'
+    cast_requested = Signal(str)  # start/stop casting the live 3D session to the Quest; arg = 'wifi'|'usb'
+    synth3d_toggled = Signal(bool)  # enable/disable real-time 2D->3D AI conversion
+    synth3d_depth_view_toggled = Signal(bool)  # show the raw depth map instead of the warped stereo pair
+    synth3d_diagnostics_toggled = Signal(bool)  # live depth/disocclusion overlay
+    synth3d_preset_selected = Signal(str)  # comfort|cinema|immersion|custom
+    synth3d_depth_preset_selected = Signal(str)  # Quality|Balanced|Performance
+    synth3d_download_models_requested = Signal()
+    # Sliders are single-purpose (Task 8 review): *_preview fires on every
+    # valueChanged (live push to the renderer, never persisted to disk);
+    # *_changed fires only on sliderReleased (the value the host persists).
+    synth3d_strength_preview = Signal(int)      # tenths of a percent, 5..30
+    synth3d_strength_changed = Signal(int)      # tenths of a percent, 5..30
+    synth3d_convergence_preview = Signal(int)   # 0..100
+    synth3d_convergence_changed = Signal(int)   # 0..100
+    # Per-shot zero-parallax plane derived from the depth statistics; the
+    # Convergence slider above stays the manual fallback while unchecked.
+    synth3d_auto_convergence_toggled = Signal(bool)
+    # Round 5a: disocclusion holes prefer flow-transported, previously seen
+    # background over the stretch fallback (experimental, author gate).
+    synth3d_temporal_fill_toggled = Signal(bool)
+    stereo_mode_changed = Signal(str)
+    mode_3d_toggled = Signal(bool)
+    audio_track_changed = Signal(int)
+    subtitle_track_changed = Signal(int)
+
+    # Items offered by the stereo-mode combo (display labels only — the
+    # internal mode keys are unaffected, see stereo_mode_combo below).
+    # "Glasses (F-SBS)" is an OUTPUT layout like MultiView and Dual Projector,
+    # not a source format: it emits Full Side-by-Side 3840x1080 whatever the
+    # input was. Named for what the user plugs in, not for the pixel layout.
+    STEREO_COMBO_ITEMS = ("MultiView", "Side-by-Side", "Top-Bottom",
+                          "Dual Projector", "Glasses (F-SBS)")
+    METER_STANDARD_LAYOUT_WIDTH = 1180
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        # Window flags for overlay
+        self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # Never ACTIVATE on show: this is a top-level Tool window, and a plain
+        # show()/raise_() activates it — Windows then yanks the whole ownership
+        # group (the player) above every other app each time the bar reappears.
+        # Buttons/combos still work: clicks activate on demand; the bar just
+        # cannot steal the foreground by merely becoming visible.
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+
+        self._setup_ui()
+        self._connect_signals()
+
+    def _setup_ui(self):
+        """Configures the user interface."""
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(20, 16, 20, 16)
+        main_layout.setSpacing(12)
+        # The overlay is a top-level floating window that the PLAYER sizes
+        # explicitly (SyLC_3D_Player._update_overlays_geometry). By default a
+        # QLayout uses SetDefaultConstraint, which re-applies the layout's
+        # minimumSize as this WINDOW's minimum on every re-activation — so a
+        # badge toggle or a track-list update would re-grow the window back to
+        # its content minimum, pushing the fullscreen button past the client
+        # edge (and, because a badge toggle never re-runs the geometry clamp,
+        # it would silently re-introduce the overflow). SetNoConstraint decouples
+        # the layout from the window minimum: the player's resize() is the sole
+        # authority on the bar width, children are simply arranged within it, and
+        # the flexible VU meter absorbs any deficit. This is what makes the badge
+        # slot reflow-free at EVERY width, not just above the content floor.
+        main_layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
+
+        # === ROW 1: TIMELINE ===
+        timeline_layout = QHBoxLayout()
+        timeline_layout.setSpacing(12)
+
+        # Time labels - clean, without border or box
+        self.time_label = QLabel("00:00")
+        self.time_label.setStyleSheet(
+            f"color: {PremiumColors.TEXT_PRIMARY.name()}; font-size: 13px; font-weight: 500; font-family: 'Segoe UI'; background: transparent; border: none; padding: 0px;")
+        self.time_label.setMinimumWidth(45)
+
+        self.time_slider = PremiumTimelineSlider()
+
+        self.duration_label = QLabel("00:00")
+        self.duration_label.setStyleSheet(
+            f"color: {PremiumColors.TEXT_SECONDARY.name()}; font-size: 13px; font-family: 'Segoe UI'; background: transparent; border: none; padding: 0px;")
+        self.duration_label.setMinimumWidth(45)
+        self.duration_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        timeline_layout.addWidget(self.time_label)
+        timeline_layout.addWidget(self.time_slider, 1)
+        timeline_layout.addWidget(self.duration_label)
+
+        main_layout.addLayout(timeline_layout)
+
+        # === ROW 2: CONTROLS ===
+        controls_layout = QHBoxLayout()
+        controls_layout.setSpacing(8)
+
+        # --- LEFT GROUP: File, Audio, Subtitles ---
+        left_group = QHBoxLayout()
+        left_group.setSpacing(10)
+
+        self.open_file_button = PremiumIconButton('folder', 'medium')
+        self.open_file_button.setToolTip("Open file")
+        self.open_disc_button = PremiumIconButton('disc', 'medium')
+        self.open_disc_button.setToolTip("Open Blu-ray 3D (drive or BDMV folder)")
+        self.archive_button = PremiumIconButton('archive', 'medium')
+        self.archive_button.setToolTip("Backup / Export")
+        # EX-4: the former ISO button now opens a unified « Sauvegarde / Export »
+        # QMenu (ISO of the disc + MV-HEVC .mov export). The button itself is
+        # never disabled anymore (the individual menu entries carry their own
+        # enablement + tooltips, refreshed by the host on aboutToShow) so
+        # « Exporter en MV-HEVC » stays reachable even for a non-disc 3D file.
+        self._build_export_menu()
+
+        # Audio track
+        self.audio_track_combo = QComboBox()
+        self.audio_track_combo.addItem("Audio")
+        self.audio_track_combo.setMinimumWidth(160)
+        self.audio_track_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._style_combo(self.audio_track_combo)
+
+        # Subtitle track
+        self.subtitle_track_combo = QComboBox()
+        self.subtitle_track_combo.addItem("Subtitles")
+        self.subtitle_track_combo.setMinimumWidth(160)
+        self.subtitle_track_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._style_combo(self.subtitle_track_combo)
+
+        left_group.addWidget(self.open_file_button)
+        left_group.addWidget(self.open_disc_button)
+        left_group.addWidget(self.archive_button)
+        left_group.addWidget(self.audio_track_combo, 1)  # stretch factor 1
+        left_group.addWidget(self.subtitle_track_combo, 1)  # stretch factor 1 (same width)
+
+        # --- CENTER GROUP: Transport ---
+        center_group = QHBoxLayout()
+        center_group.setSpacing(8)
+        center_group.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.skip_back_button = PremiumIconButton('skip_back', 'small')
+        self.skip_back_button.setToolTip("Skip back 10s")
+
+        self.stop_button = PremiumIconButton('stop', 'medium')
+        self.stop_button.setToolTip("Stop")
+
+        self.play_pause_button = PremiumIconButton('play', 'primary')
+        self.play_pause_button.setToolTip("Play / Pause")
+
+        self.skip_forward_button = PremiumIconButton('skip_forward', 'small')
+        self.skip_forward_button.setToolTip("Skip forward 10s")
+
+        center_group.addWidget(self.skip_back_button)
+        center_group.addWidget(self.stop_button)
+        center_group.addWidget(self.play_pause_button)
+        center_group.addWidget(self.skip_forward_button)
+
+        # --- RIGHT GROUP: 3D, Volume, Fullscreen ---
+        right_group = QHBoxLayout()
+        right_group.setSpacing(8)
+        right_group.setAlignment(Qt.AlignmentFlag.AlignRight)
+
+        # Tech info
+        self.tech_info = PremiumTechInfo()
+
+        # Separator
+        sep1 = PremiumSeparator()
+
+        # Separator
+        sep2 = PremiumSeparator()
+
+        # 2D->3D (AI) conversion button + menu (dedicated 'ai3d' glyph: "AI"
+        # with a stereo-parallax ghost -- the button itself carries no state,
+        # only its menu's checkable actions do).
+        self.synth3d_button = PremiumIconButton('ai3d', 'medium')
+        self.synth3d_button.setToolTip("2D->3D AI conversion")
+        self._build_synth3d_menu()
+
+        # 3D Mode button
+        self.mode_3d_button = PremiumIconButton('3d', 'medium')
+        self.mode_3d_button.setCheckable(True)
+        self.mode_3d_button.setToolTip("Toggle 3D mode")
+
+        # Compatibility attribute for older host code. The visual format badge
+        # has deliberately been removed; the full slot belongs to the VU meter.
+        self.format_badge = None
+
+        # Stereo mode combo
+        self.stereo_mode_combo = QComboBox()
+        self.stereo_mode_combo.setObjectName("stereoModeCombo")
+        # Display label "MultiView"; the internal key stays 'mvc' (mode_map below) — dozens
+        # of consumers depend on the 'mvc' string, only the user-visible text changes.
+        self.stereo_mode_combo.addItems(list(self.STEREO_COMBO_ITEMS))
+        # Widened from a hardcoded 140 (which truncated "MultiView" to "MultiVi") to a
+        # font-metrics-derived floor covering the longest item, so no item is ever clipped.
+        combo_min_width = max(140, self._compute_stereo_combo_width())
+        self.stereo_mode_combo.setMinimumWidth(combo_min_width)
+        self.stereo_mode_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._style_combo(self.stereo_mode_combo)
+        # SyLC_3D_Player.APP_STYLE (applied on the parent PlayerWindow) carries a bare
+        # "QComboBox { min-width: 60px; ... }" rule. Qt's stylesheet cascade fills in any
+        # box-model property a closer/own stylesheet doesn't set from the nearest ancestor
+        # rule that does — and once a stylesheet supplies min-width, it replaces
+        # setMinimumWidth() for that widget. _style_combo's QComboBox block never declared
+        # min-width, so the ancestor's 60px silently won, shrinking this combo back down and
+        # truncating "MultiView"/"Side-by-Side" despite the setMinimumWidth() call above.
+        # An ID-selector rule has higher specificity than the ancestor's bare type selector,
+        # so it wins regardless of stylesheet application order or widget-tree position.
+        self.stereo_mode_combo.setStyleSheet(
+            self.stereo_mode_combo.styleSheet()
+            + f"\n#stereoModeCombo {{ min-width: {combo_min_width}px; }}"
+        )
+
+        # Separator
+        sep3 = PremiumSeparator()
+
+        # Volume
+        self.volume_slider = PremiumVolumeSlider()
+
+        # Fullscreen
+        self.fullscreen_button = PremiumIconButton('fullscreen', 'medium')
+        self.fullscreen_button.setToolTip("Fullscreen (F)")
+
+        # Layout
+        right_group.addStretch()
+        # right_group.addWidget(self.tech_info)
+        # right_group.addWidget(sep1)
+
+
+        # Audio telemetry: always keeps a legible footprint at standard widths.
+        self.vu_meter = PremiumSpectrumMeter()
+        right_group.addWidget(self.vu_meter, 1)
+        right_group.addSpacing(8)
+        right_group.addWidget(self.synth3d_button)
+        right_group.addWidget(self.mode_3d_button)
+        right_group.addWidget(self.stereo_mode_combo)
+        right_group.addWidget(sep2)
+        right_group.addWidget(self.volume_slider)
+        right_group.addWidget(self.fullscreen_button)
+
+        # Assemble controls row
+        # Balanced split (1:0:1) to perfectly center the transport controls
+        controls_layout.addLayout(left_group, 1)
+        controls_layout.addLayout(center_group, 0)
+        controls_layout.addLayout(right_group, 1)
+
+        main_layout.addLayout(controls_layout)
+
+    def resizeEvent(self, event):
+        """Keep audio telemetry guaranteed at normal widths, responsive below."""
+        meter = getattr(self, 'vu_meter', None)
+        if meter is not None:
+            minimum = (meter.MIN_W
+                       if event.size().width() >= self.METER_STANDARD_LAYOUT_WIDTH
+                       else 0)
+            if meter.minimumWidth() != minimum:
+                meter.setMinimumWidth(minimum)
+        super().resizeEvent(event)
+
+    def _compute_stereo_combo_width(self):
+        """Font-metrics width covering the longest STEREO_COMBO_ITEMS entry,
+        plus the combo's own CSS chrome (padding: 5px 10px, padding-right:
+        25px for the arrow, 1px border each side) and a safety margin, so no
+        item (e.g. "MultiView") is ever truncated regardless of DPI/hinting."""
+        font = QFont('Segoe UI')
+        font.setPixelSize(11)
+        fm = QFontMetrics(font)
+        widest = max(self.STEREO_COMBO_ITEMS, key=lambda s: fm.horizontalAdvance(s))
+        text_width = fm.horizontalAdvance(widest)
+        left_padding = 10
+        right_padding = 25  # reserved for the drop-down arrow
+        border = 1 * 2
+        safety_margin = 20
+        return int(text_width + left_padding + right_padding + border + safety_margin)
+
+    def _style_combo(self, combo, icon=None):
+        """Applies premium style to ComboBox."""
+        combo.setStyleSheet("""
+            QComboBox {
+                background-color: rgba(60, 65, 80, 0.8);
+                border: 1px solid rgba(255, 255, 255, 0.15);
+                border-radius: 6px;
+                padding: 5px 10px;
+                padding-right: 25px;
+                color: #E0E0E0;
+                font-size: 11px;
+                font-family: 'Segoe UI';
+                min-height: 22px;
+            }
+            QComboBox:hover {
+                background-color: rgba(70, 75, 90, 0.9);
+                border: 1px solid rgba(0, 200, 255, 0.4);
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 22px;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 6px solid #AAA;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #2a2d35;
+                color: #E0E0E0;
+                selection-background-color: rgba(0, 200, 255, 0.3);
+                border: 1px solid rgba(255, 255, 255, 0.15);
+                border-radius: 6px;
+                padding: 4px;
+                outline: none;
+            }
+            QComboBox QAbstractItemView::item {
+                padding: 6px 10px;
+                min-height: 24px;
+            }
+            QComboBox QAbstractItemView::item:hover {
+                background-color: rgba(0, 200, 255, 0.15);
+            }
+        """)
+
+    _EXPORT_MENU_STYLE = """
+        QMenu#sylcExportMenu {
+            background-color: rgba(20, 22, 30, 252);
+            color: #F0F2F7;
+            border: 1px solid rgba(69, 194, 245, 88);
+            border-radius: 12px;
+            padding: 8px;
+            font-family: "Segoe UI";
+            font-size: 10pt;
+        }
+        QMenu#sylcExportMenu::item {
+            min-height: 28px;
+            padding: 7px 34px 7px 42px;
+            margin: 2px 1px;
+            border: 1px solid transparent;
+            border-radius: 8px;
+        }
+        QMenu#sylcExportMenu::item:selected {
+            color: #FFFFFF;
+            background: qlineargradient(
+                x1: 0, y1: 0, x2: 1, y2: 0,
+                stop: 0 rgba(0, 200, 255, 58),
+                stop: 1 rgba(77, 116, 255, 34)
+            );
+            border: 1px solid rgba(74, 207, 255, 105);
+        }
+        QMenu#sylcExportMenu::item:disabled {
+            color: rgba(151, 158, 177, 128);
+            background: transparent;
+            border-color: transparent;
+        }
+        QMenu#sylcExportMenu::item:checked {
+            color: #FFFFFF;
+            background-color: rgba(0, 200, 255, 32);
+        }
+        QMenu#sylcExportMenu::icon {
+            left: 13px;
+            width: 20px;
+            height: 20px;
+        }
+        QMenu#sylcExportMenu::indicator {
+            width: 15px;
+            height: 15px;
+            left: 14px;
+        }
+        QMenu#sylcExportMenu::separator {
+            height: 1px;
+            margin: 7px 10px;
+            background-color: rgba(255, 255, 255, 24);
+        }
+        QMenu#sylcExportMenu::right-arrow {
+            right: 12px;
+        }
+        QWidget#sylcMenuHeader {
+            background: transparent;
+        }
+        QLabel#sylcMenuEyebrow {
+            color: #59D8FF;
+            font-family: "Segoe UI";
+            font-size: 8pt;
+            font-weight: 700;
+            letter-spacing: 1px;
+            background: transparent;
+        }
+        QLabel#sylcMenuSubtitle {
+            color: #9299AA;
+            font-family: "Segoe UI";
+            font-size: 9pt;
+            background: transparent;
+        }
+        QLabel#sylcMenuSection {
+            color: #7B8194;
+            font-family: "Segoe UI";
+            font-size: 8pt;
+            font-weight: 600;
+            letter-spacing: 1.2px;
+            background: transparent;
+        }
+        QToolTip {
+            color: #F4F6FA;
+            background-color: #20242F;
+            border: 1px solid rgba(89, 216, 255, 100);
+            border-radius: 6px;
+            padding: 6px 8px;
+        }
+    """
+
+    @staticmethod
+    def _export_menu_icon(kind, color=None):
+        """Return a crisp, theme-native vector icon for the export menus."""
+        accent = QColor(color or PremiumColors.ACCENT_PRIMARY)
+        pixmap = QPixmap(40, 40)
+        pixmap.setDevicePixelRatio(2.0)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(accent, 1.65)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        if kind == 'disc':
+            painter.drawEllipse(QRectF(2.5, 2.5, 15.0, 15.0))
+            painter.drawEllipse(QRectF(7.7, 7.7, 4.6, 4.6))
+            painter.drawArc(QRectF(5.0, 5.0, 10.0, 10.0), 35 * 16, 85 * 16)
+        elif kind == 'spatial':
+            painter.drawRoundedRect(QRectF(2.0, 4.5, 10.5, 11.0), 2.5, 2.5)
+            painter.drawRoundedRect(QRectF(7.5, 4.5, 10.5, 11.0), 2.5, 2.5)
+            painter.setBrush(QBrush(accent))
+            painter.drawEllipse(QRectF(8.3, 8.3, 3.4, 3.4))
+        elif kind == 'quality':
+            path = QPainterPath()
+            path.moveTo(10.0, 1.8)
+            path.lineTo(12.0, 7.6)
+            path.lineTo(18.2, 10.0)
+            path.lineTo(12.0, 12.1)
+            path.lineTo(10.0, 18.2)
+            path.lineTo(7.9, 12.1)
+            path.lineTo(1.8, 10.0)
+            path.lineTo(7.9, 7.6)
+            path.closeSubpath()
+            painter.drawPath(path)
+            painter.setBrush(QBrush(accent))
+            painter.drawEllipse(QRectF(8.2, 8.2, 3.6, 3.6))
+        elif kind == 'fast':
+            painter.setBrush(QBrush(accent))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawPolygon(QPolygonF([
+                QPointF(11.2, 1.5), QPointF(4.2, 11.0),
+                QPointF(9.2, 11.0), QPointF(7.8, 18.5),
+                QPointF(16.0, 8.3), QPointF(10.8, 8.3),
+            ]))
+        elif kind == 'eye':
+            path = QPainterPath()
+            path.moveTo(1.5, 10.0)
+            path.cubicTo(5.0, 4.3, 15.0, 4.3, 18.5, 10.0)
+            path.cubicTo(15.0, 15.7, 5.0, 15.7, 1.5, 10.0)
+            path.closeSubpath()
+            painter.drawPath(path)
+            painter.setBrush(QBrush(accent))
+            painter.drawEllipse(QRectF(7.4, 7.4, 5.2, 5.2))
+        elif kind == 'auto':
+            painter.drawArc(QRectF(3.0, 3.0, 14.0, 14.0), 35 * 16, 285 * 16)
+            painter.setBrush(QBrush(accent))
+            painter.drawPolygon(QPolygonF([
+                QPointF(15.0, 2.2), QPointF(18.3, 3.7), QPointF(15.7, 6.0)
+            ]))
+        elif kind in ('left', 'right'):
+            painter.drawEllipse(QRectF(2.5, 2.5, 15.0, 15.0))
+            font = QFont("Segoe UI", 9, QFont.Weight.Bold)
+            painter.setFont(font)
+            painter.drawText(QRectF(2.5, 2.2, 15.0, 15.0),
+                             Qt.AlignmentFlag.AlignCenter,
+                             'L' if kind == 'left' else 'R')
+        elif kind == 'quest':
+            path = QPainterPath()
+            path.moveTo(2.0, 11.7)
+            path.lineTo(3.1, 6.0)
+            path.cubicTo(3.5, 4.4, 5.0, 3.4, 6.7, 3.4)
+            path.lineTo(13.3, 3.4)
+            path.cubicTo(15.0, 3.4, 16.5, 4.4, 16.9, 6.0)
+            path.lineTo(18.0, 11.7)
+            path.cubicTo(18.3, 13.5, 17.0, 15.0, 15.3, 15.0)
+            path.cubicTo(13.7, 15.0, 13.0, 12.2, 10.0, 12.2)
+            path.cubicTo(7.0, 12.2, 6.3, 15.0, 4.7, 15.0)
+            path.cubicTo(3.0, 15.0, 1.7, 13.5, 2.0, 11.7)
+            painter.drawPath(path)
+        elif kind == 'wifi':
+            painter.drawArc(QRectF(1.5, 2.0, 17.0, 17.0), 38 * 16, 104 * 16)
+            painter.drawArc(QRectF(5.0, 6.0, 10.0, 10.0), 38 * 16, 104 * 16)
+            painter.setBrush(QBrush(accent))
+            painter.drawEllipse(QRectF(8.5, 14.5, 3.0, 3.0))
+        elif kind == 'usb':
+            painter.drawLine(QPointF(10.0, 17.5), QPointF(10.0, 4.0))
+            painter.drawLine(QPointF(10.0, 8.0), QPointF(5.7, 5.4))
+            painter.drawLine(QPointF(10.0, 11.0), QPointF(14.3, 8.5))
+            painter.setBrush(QBrush(accent))
+            painter.drawEllipse(QRectF(8.4, 15.7, 3.2, 3.2))
+            painter.drawRect(QRectF(3.9, 3.6, 3.2, 3.2))
+            painter.drawPolygon(QPolygonF([
+                QPointF(14.3, 5.4), QPointF(17.0, 8.2), QPointF(11.6, 8.2)
+            ]))
+        elif kind == 'depth':
+            # Two offset triangles -- a minimal "relief"/parallax cue for
+            # synthesized (2D->3D AI) depth, same offset-pair idiom as 'spatial'.
+            def _tri(ox, oy):
+                path = QPainterPath()
+                path.moveTo(10.0 + ox, 3.0 + oy)
+                path.lineTo(16.5 + ox, 15.5 + oy)
+                path.lineTo(3.5 + ox, 15.5 + oy)
+                path.closeSubpath()
+                return path
+            painter.drawPath(_tri(-1.6, -1.0))
+            painter.drawPath(_tri(1.6, 1.0))
+        elif kind == 'models':
+            # Three offset sheets -- a library you acquire and hold on disk.
+            # Only the EXPOSED edges of the two behind are drawn: three whole
+            # outlines collapse into crossed lines at 20 px, where this still
+            # reads as a stack.
+            front = QRectF(1.8, 7.4, 11.4, 10.4)
+            painter.drawRoundedRect(front, 1.8, 1.8)
+            previous = front
+            for dx, dy in ((2.3, -2.3), (4.6, -4.6)):
+                sheet = front.translated(dx, dy)
+                edge = QPainterPath()
+                edge.moveTo(sheet.left(), previous.top())
+                edge.lineTo(sheet.left(), sheet.top())
+                edge.lineTo(sheet.right(), sheet.top())
+                edge.lineTo(sheet.right(), sheet.bottom())
+                edge.lineTo(previous.right(), sheet.bottom())
+                painter.drawPath(edge)
+                previous = sheet
+        elif kind == 'grid':
+            # A subdivided square. Literally true: a depth preset selects the
+            # inference grid (756 vs 518), which is the speed lever.
+            painter.drawRoundedRect(QRectF(2.6, 2.6, 14.8, 14.8), 2.4, 2.4)
+            for offset in (7.5, 12.5):
+                painter.drawLine(QPointF(offset, 2.6), QPointF(offset, 17.4))
+                painter.drawLine(QPointF(2.6, offset), QPointF(17.4, offset))
+            painter.setBrush(QBrush(accent))
+            painter.drawRect(QRectF(8.4, 8.4, 3.2, 3.2))
+        elif kind == 'parallax':
+            # A caliper: two end stops and the measured span between them.
+            # Stereo geometry IS a separation you set, which is exactly what the
+            # two sliders under that submenu do.
+            #
+            # Three strokes, and the proportions are load-bearing -- only
+            # rendering at 20 px shows why. Stops at x=5/15 over a full
+            # 4.5..15.5 height (the obvious construction) draw a near-square
+            # figure that reads as a capital H, arrowheads or not: a 10 px gap
+            # cannot hold two heads AND still look like a gap. Pushing the stops
+            # to the edges and cutting them to 7 px makes the figure wide and
+            # flat, which no letterform is.
+            #
+            # Arrowheads were drawn, rendered and DROPPED: at 20 px they merge
+            # into the stops as blur rather than reading as heads, and detaching
+            # them into the span just leaves two floating blobs. They only work
+            # at 40 px, which is not the only size this ships at.
+            painter.drawLine(QPointF(2.6, 6.4), QPointF(2.6, 13.6))
+            painter.drawLine(QPointF(17.4, 6.4), QPointF(17.4, 13.6))
+            painter.drawLine(QPointF(2.6, 10.0), QPointF(17.4, 10.0))
+        elif kind == 'pulse':
+            # A waveform -- live measurement, running while you watch.
+            wave = QPainterPath()
+            wave.moveTo(1.6, 10.0)
+            wave.lineTo(5.2, 10.0)
+            wave.lineTo(7.1, 4.3)
+            wave.lineTo(9.7, 15.5)
+            wave.lineTo(12.0, 7.4)
+            wave.lineTo(13.6, 10.0)
+            wave.lineTo(18.4, 10.0)
+            painter.drawPath(wave)
+
+        painter.end()
+        return QIcon(pixmap)
+
+    def _prepare_export_menu(self, menu, minimum_width):
+        """Apply the same visual contract to every menu in the export tree."""
+        menu.setObjectName("sylcExportMenu")
+        menu.setStyleSheet(self._EXPORT_MENU_STYLE)
+        menu.setToolTipsVisible(True)
+        menu.setSeparatorsCollapsible(False)
+        menu.setMinimumWidth(minimum_width)
+
+    @staticmethod
+    def _add_export_menu_header(menu, title, subtitle, minimum_width):
+        """Add a non-command header so each level states its purpose at a glance."""
+        header_action = QWidgetAction(menu)
+        header = QWidget(menu)
+        header.setObjectName("sylcMenuHeader")
+        header.setMinimumWidth(max(240, minimum_width - 18))
+        header.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        layout = QVBoxLayout(header)
+        layout.setContentsMargins(12, 7, 12, 9)
+        layout.setSpacing(2)
+
+        eyebrow = QLabel(title, header)
+        eyebrow.setObjectName("sylcMenuEyebrow")
+        eyebrow.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        subtitle_label = QLabel(subtitle, header)
+        subtitle_label.setObjectName("sylcMenuSubtitle")
+        subtitle_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        layout.addWidget(eyebrow)
+        layout.addWidget(subtitle_label)
+
+        header_action.setDefaultWidget(header)
+        header_action.setEnabled(False)
+        menu.addAction(header_action)
+        return header_action
+
+    @staticmethod
+    def _add_export_menu_section(menu, title, minimum_width):
+        """A quiet, non-command section label, one step below the header.
+
+        Same construction as _add_export_menu_header so it reads as the same
+        family: the header names the panel, a section names the register the
+        rows beneath it belong to. It is STRUCTURE, not decoration -- add one
+        only where the register genuinely changes.
+        """
+        section_action = QWidgetAction(menu)
+        holder = QWidget(menu)
+        holder.setObjectName("sylcMenuHeader")
+        holder.setMinimumWidth(max(240, minimum_width - 18))
+        holder.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        layout = QVBoxLayout(holder)
+        layout.setContentsMargins(14, 5, 12, 1)
+        layout.setSpacing(0)
+
+        label = QLabel(title, holder)
+        label.setObjectName("sylcMenuSection")
+        label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        layout.addWidget(label)
+
+        section_action.setDefaultWidget(holder)
+        section_action.setEnabled(False)
+        menu.addAction(section_action)
+        return section_action
+
+    def _build_export_menu(self):
+        """EX-4: build the unified « Sauvegarde / Export » QMenu attached to the
+        (former ISO) archive_button.
+
+        Two families of entries:
+          * « Créer un ISO du disque » — emits archive_requested (the UNCHANGED
+            existing ISO archiving flow). Enabled only for a physical Blu-ray
+            disc/ISO source — the host refreshes it on aboutToShow.
+          * "Export to MV-HEVC (.mov)" submenu with a Quality / Fast choice,
+            plus a per-source eye-order override (Automatic / Left / Right),
+            each emitting export_mvhevc_requested('quality'|'fast'). Enabled only
+            for an exportable 3D source with the export tools present — the host
+            refreshes the submenu's enabled state, tooltip and title (it becomes
+            « … (copie sans réencodage) » for an MV-HEVC remux source).
+
+        Enablement/labels are owned by the host (SyLC_3D_Player) because they
+        depend on the current media session; the menu only exposes the action
+        objects (iso_action, export_mvhevc_menu, export_quality_action,
+        export_fast_action) and wires them to signals here.
+        """
+        menu = QMenu(self.archive_button)
+        self._prepare_export_menu(menu, 340)
+        self.export_menu_header = self._add_export_menu_header(
+            menu, "BACKUP & EXPORT", "Disc image  ·  Apple Spatial  ·  Quest", 340)
+
+        self.iso_action = QAction("Create a disc ISO image", menu)
+        self.iso_action.setIcon(self._export_menu_icon('disc'))
+        self.iso_action.triggered.connect(lambda: self.archive_requested.emit())
+        self.iso_action.setStatusTip("Create a lossless ISO backup of the inserted disc.")
+        menu.addAction(self.iso_action)
+
+        menu.addSeparator()
+
+        sub = QMenu("Export to MV-HEVC (.mov)", menu)
+        self._prepare_export_menu(sub, 370)
+        sub.setIcon(self._export_menu_icon('spatial'))
+        self.export_mvhevc_header = self._add_export_menu_header(
+            sub, "APPLE SPATIAL VIDEO",
+            "Two-view MV-HEVC  ·  Vision Pro ready", 370)
+        self.export_quality_action = QAction("Quality (slow, CRF 20)", sub)
+        self.export_quality_action.setIcon(self._export_menu_icon('quality'))
+        self.export_quality_action.triggered.connect(
+            lambda: self.export_mvhevc_requested.emit('quality'))
+        self.export_fast_action = QAction("Fast (medium, CRF 23)", sub)
+        self.export_fast_action.setIcon(
+            self._export_menu_icon('fast', PremiumColors.WARNING))
+        self.export_fast_action.triggered.connect(
+            lambda: self.export_mvhevc_requested.emit('fast'))
+        self.export_quality_action.setToolTip(
+            "Best visual quality. Uses the slow x265 preset at CRF 20.")
+        self.export_fast_action.setToolTip(
+            "Faster export. Uses the medium x265 preset at CRF 23.")
+        sub.addAction(self.export_quality_action)
+        sub.addAction(self.export_fast_action)
+        sub.setDefaultAction(self.export_quality_action)
+        sub.addSeparator()
+
+        # Absolute source order is less error-prone than a sticky "swap" toggle:
+        # it states what the first packed plane / MVC base view actually is.
+        self.export_eye_order_menu = QMenu("Source eye order", sub)
+        self._prepare_export_menu(self.export_eye_order_menu, 390)
+        self.export_eye_order_menu.setIcon(self._export_menu_icon('eye'))
+        self.export_eye_order_header = self._add_export_menu_header(
+            self.export_eye_order_menu, "SOURCE LAYOUT",
+            "Define which decoded view belongs to the left eye", 390)
+        self.export_eye_order_group = QActionGroup(self.export_eye_order_menu)
+        self.export_eye_order_group.setExclusive(True)
+        self.export_eye_auto_action = QAction("Automatic (metadata)", self.export_eye_order_menu)
+        self.export_eye_left_action = QAction("Left eye first / MVC base is left",
+                                              self.export_eye_order_menu)
+        self.export_eye_right_action = QAction("Right eye first / MVC base is right",
+                                               self.export_eye_order_menu)
+        self.export_eye_auto_action.setIcon(self._export_menu_icon('auto'))
+        self.export_eye_left_action.setIcon(self._export_menu_icon('left'))
+        self.export_eye_right_action.setIcon(self._export_menu_icon('right'))
+        for action in (self.export_eye_auto_action,
+                       self.export_eye_left_action,
+                       self.export_eye_right_action):
+            action.setCheckable(True)
+            self.export_eye_order_group.addAction(action)
+            self.export_eye_order_menu.addAction(action)
+        self.export_eye_auto_action.setChecked(True)
+        self.export_eye_auto_action.setToolTip(
+            "Use Stereo3D/Matroska/Blu-ray metadata; SyLC asks if metadata is absent.")
+        self.export_eye_left_action.setToolTip(
+            "Treat the left/top packed plane or MVC base view as the left eye.")
+        self.export_eye_right_action.setToolTip(
+            "Treat the first left/top packed plane or MVC base view as the right eye.")
+        sub.addMenu(self.export_eye_order_menu)
+        menu.addMenu(sub)
+
+        self.export_mvhevc_menu = sub
+
+        # « Diffuser vers Quest » — cast the LIVE 3D session to the headset over
+        # Wi-Fi or USB-C (SyLC Cast). Mirrors the MV-HEVC submenu idiom above. The
+        # host (SyLC_3D_Player) owns enablement/tooltip in _update_export_menu_state
+        # (active 3D session + renderer.cast_available()) and toggles start/stop via
+        # the _on_cast_requested handler wired to cast_requested.
+        menu.addSeparator()
+        cast_sub = QMenu("Stream to Quest", menu)
+        self._prepare_export_menu(cast_sub, 320)
+        cast_sub.setIcon(
+            self._export_menu_icon('quest', PremiumColors.SUCCESS))
+        self.cast_menu_header = self._add_export_menu_header(
+            cast_sub, "SYLC CAST", "Live stereoscopic playback  ·  Quest", 320)
+        self.cast_wifi_action = QAction("Wi-Fi", cast_sub)
+        self.cast_wifi_action.setIcon(self._export_menu_icon('wifi'))
+        self.cast_wifi_action.triggered.connect(
+            lambda: self.cast_requested.emit('wifi'))
+        self.cast_usb_action = QAction("USB-C", cast_sub)
+        self.cast_usb_action.setIcon(
+            self._export_menu_icon('usb', PremiumColors.INFO))
+        self.cast_usb_action.triggered.connect(
+            lambda: self.cast_requested.emit('usb'))
+        cast_sub.addAction(self.cast_wifi_action)
+        cast_sub.addAction(self.cast_usb_action)
+        menu.addMenu(cast_sub)
+
+        self.cast_menu = cast_sub
+        # Status lights (témoin) on the two transports: refreshed by the host
+        # via set_cast_transport_state() at cast start/stop and on status.
+        self._cast_light_state = (None, False)   # (active_kind, connected)
+        self.export_menu = menu
+        self.archive_button.setMenu(menu)
+
+    # Base titles of the two preset submenus. The row itself reports the
+    # current choice ("Depth preset — Balanced"), so these are the stem the
+    # selection is appended to rather than the final text.
+    _SYNTH3D_DEPTH_PRESET_TITLE = "Depth preset"
+    _SYNTH3D_GEOMETRY_TITLE = "Stereo geometry"
+
+    def _build_synth3d_menu(self):
+        """Build the "2D->3D (AI)" QMenu attached to synth3d_button.
+
+        Ordered by DEPENDENCY, not by implementation history -- the four
+        registers a user actually moves through:
+
+          provision  "Depth models" is the gateway: nothing below it works until
+                     a pack is on disk. It therefore comes first, alone above
+                     the rule, ahead of the very control it unlocks. Convention
+                     puts the primary action at the top; here that action is
+                     greyed out until this row has been used, and a dead control
+                     sitting above its own remedy explains nothing. The row also
+                     reports its own state (set_synth3d_models_summary).
+          act/tune   SYNTHESIS -- the enable toggle, the two preset submenus
+                     (which model computes the depth, and how it reaches your
+                     eyes) and the two precise sliders.
+          inspect    INSPECT -- depth view, live diagnostics, engine status.
+
+        Colour is semantic and comes only from the existing PremiumColors
+        tokens: ACCENT_PRIMARY = synthesis itself, SUCCESS/WARNING = the
+        gateway's own provisioning state, WARNING = inspection, muted grey =
+        structure and inert text. Every row carries an icon that means something
+        on its own; no glyph is reused with a different tint standing in for a
+        difference in kind.
+
+        Task 8 review -- atomic build: every local widget/action is fully
+        constructed first; only then are the four attributes the host's
+        _update_synth3d_menu_state touches (synth3d_enable_action,
+        synth3d_depth_view_action, synth3d_strength_slider,
+        synth3d_convergence_slider) assigned, as one block, and only after
+        that are their signals wired to the outside. That host method guards
+        on synth3d_enable_action alone then touches all four, so a
+        partially-built menu (e.g. an exception midway) must never be
+        observable -- either none of the four exist, or all of them do.
+
+        Enablement/tooltips/slider values are owned by the host, refreshed on
+        the menu's aboutToShow (same idiom as _update_export_menu_state); this
+        overlay stays media/state-blind.
+        """
+        menu = QMenu(self.synth3d_button)
+        self._prepare_export_menu(menu, 340)
+        header = self._add_export_menu_header(
+            menu, "2D->3D (AI)",
+            "Depth Anything V3 - real-time synthesis", 340)
+
+        # --- provision -------------------------------------------------------
+        # Always present, always enabled: this is how a user inspects what is
+        # installed and re-fetches a corrupted file, not only how they escape an
+        # empty models/ directory. The overlay stays player-blind -- it emits,
+        # the host opens the dialog and feeds the row's summary back.
+        download_models_action = QAction("Depth models…", menu)
+        download_models_action.setIcon(
+            self._export_menu_icon('models', PremiumColors.SUCCESS))
+        download_models_action.triggered.connect(
+            lambda _checked=False: self.synth3d_download_models_requested.emit())
+        menu.addAction(download_models_action)
+
+        # --- synthesis -------------------------------------------------------
+        menu.addSeparator()
+        self._add_export_menu_section(menu, "SYNTHESIS", 340)
+
+        # The header already says AI; saying it again here would be the only
+        # word in the panel that carries no information.
+        enable_action = QAction("Enable 2D->3D", menu)
+        enable_action.setCheckable(True)
+        enable_action.setIcon(self._export_menu_icon('depth'))
+        menu.addAction(enable_action)
+
+        # Depth preset = which model runs, and on which inference grid; the
+        # stereo-geometry presets below are the geometry axis
+        # (strength/convergence) and are independent of it. The labels ARE the
+        # names the host persists (see SYNTH3D_DEPTH_PRESET_LABELS): this
+        # overlay stays player-blind, so the host pins them equal to its own
+        # preset table.
+        depth_preset_menu = QMenu(self._SYNTH3D_DEPTH_PRESET_TITLE, menu)
+        self._prepare_export_menu(depth_preset_menu, 300)
+        depth_preset_menu.setIcon(self._export_menu_icon('grid'))
+        depth_preset_header = self._add_export_menu_header(
+            depth_preset_menu, "DEPTH PRESET",
+            "Which model runs, and on which grid", 300)
+        depth_preset_group = QActionGroup(depth_preset_menu)
+        depth_preset_group.setExclusive(True)
+        depth_preset_actions = {}
+        for key in SYNTH3D_DEPTH_PRESET_LABELS:
+            action = QAction(key, depth_preset_menu)
+            action.setCheckable(True)
+            action.setData(key)
+            depth_preset_group.addAction(action)
+            depth_preset_menu.addAction(action)
+            action.triggered.connect(
+                lambda checked=False, name=key:
+                    self.synth3d_depth_preset_selected.emit(name) if checked else None)
+            depth_preset_actions[key] = action
+        menu.addMenu(depth_preset_menu)
+
+        # "Stereo geometry", not "Comfort preset": a preset menu named after one
+        # of its own children reads as a mistake, and this is exactly what the
+        # two sliders below it set. It pairs with "Depth preset" -- what the AI
+        # computes, versus how it reaches your eyes. The KEYS are untouched:
+        # the host persists them.
+        preset_menu = QMenu(self._SYNTH3D_GEOMETRY_TITLE, menu)
+        self._prepare_export_menu(preset_menu, 300)
+        preset_menu.setIcon(self._export_menu_icon('parallax'))
+        preset_header = self._add_export_menu_header(
+            preset_menu, "STEREO GEOMETRY",
+            "How pronounced the effect is", 300)
+        preset_group = QActionGroup(preset_menu)
+        preset_group.setExclusive(True)
+        preset_actions = {}
+        for key, label in (
+                ("comfort", "Comfort"),
+                ("cinema", "Cinema"),
+                ("immersion", "Immersion"),
+                ("custom", "Custom")):
+            action = QAction(label, preset_menu)
+            action.setCheckable(True)
+            action.setData(key)
+            preset_group.addAction(action)
+            preset_menu.addAction(action)
+            action.triggered.connect(
+                lambda checked=False, name=key:
+                    self.synth3d_preset_selected.emit(name) if checked else None)
+            preset_actions[key] = action
+        preset_actions["custom"].setChecked(True)
+        menu.addMenu(preset_menu)
+
+        # The sliders are the fine end of the same register as the presets
+        # above them, so no rule divides them: the section label already
+        # carries that structure.
+        strength_slider = self._add_menu_slider(
+            menu, "Depth strength", 5, 30, 15,
+            self.synth3d_strength_preview, self.synth3d_strength_changed)
+        convergence_slider = self._add_menu_slider(
+            menu, "Convergence", 0, 100, 50,
+            self.synth3d_convergence_preview, self.synth3d_convergence_changed)
+
+        auto_convergence_action = QAction("Auto convergence", menu)
+        auto_convergence_action.setCheckable(True)
+        auto_convergence_action.setToolTip(
+            "Place the zero-parallax plane per shot from the scene's own "
+            "depth statistics (the Convergence slider is the manual fallback)")
+        menu.addAction(auto_convergence_action)
+
+        temporal_fill_action = QAction("Temporal fill (experimental)", menu)
+        temporal_fill_action.setCheckable(True)
+        temporal_fill_action.setToolTip(
+            "Fill disocclusions with background remembered from earlier "
+            "frames instead of stretching the edge")
+        menu.addAction(temporal_fill_action)
+
+        # --- inspect ---------------------------------------------------------
+        menu.addSeparator()
+        self._add_export_menu_section(menu, "INSPECT", 340)
+
+        depth_view_action = QAction("Depth view", menu)
+        depth_view_action.setCheckable(True)
+        depth_view_action.setIcon(
+            self._export_menu_icon('eye', PremiumColors.WARNING))
+        diagnostics_action = QAction("Live diagnostics", menu)
+        diagnostics_action.setCheckable(True)
+        diagnostics_action.setIcon(
+            self._export_menu_icon('pulse', PremiumColors.WARNING))
+        menu.addAction(depth_view_action)
+        menu.addAction(diagnostics_action)
+
+        status_action = QAction("Engine: off", menu)
+        status_action.setEnabled(False)
+        menu.addAction(status_action)
+
+        # Assign all four together (atomic build -- see docstring) before
+        # wiring anything outward.
+        self.synth3d_enable_action = enable_action
+        self.synth3d_depth_view_action = depth_view_action
+        self.synth3d_strength_slider = strength_slider
+        self.synth3d_convergence_slider = convergence_slider
+        self.synth3d_auto_convergence_action = auto_convergence_action
+        self.synth3d_temporal_fill_action = temporal_fill_action
+        self.synth3d_diagnostics_action = diagnostics_action
+        self.synth3d_preset_menu = preset_menu
+        self.synth3d_preset_group = preset_group
+        self.synth3d_preset_actions = preset_actions
+        self.synth3d_depth_preset_menu = depth_preset_menu
+        self.synth3d_depth_preset_group = depth_preset_group
+        self.synth3d_depth_preset_actions = depth_preset_actions
+        self.synth3d_download_models_action = download_models_action
+        self.synth3d_status_action = status_action
+        self.synth3d_depth_preset_header = depth_preset_header
+        self.synth3d_preset_header = preset_header
+
+        enable_action.toggled.connect(self.synth3d_toggled)
+        depth_view_action.toggled.connect(self.synth3d_depth_view_toggled)
+        diagnostics_action.toggled.connect(self.synth3d_diagnostics_toggled)
+        auto_convergence_action.toggled.connect(
+            self.synth3d_auto_convergence_toggled)
+        temporal_fill_action.toggled.connect(
+            self.synth3d_temporal_fill_toggled)
+
+        self.synth3d_menu_header = header
+        self.synth3d_menu = menu
+        self.synth3d_button.setMenu(menu)
+
+    def set_synth3d_status(self, text):
+        """Set the single compact diagnostics line at the foot of the AI menu."""
+        if hasattr(self, 'synth3d_status_action'):
+            self.synth3d_status_action.setText(str(text))
+
+    def set_synth3d_models_summary(self, text, ready=True):
+        """Make the gateway row report its own state: "Depth models — Small
+        installed".
+
+        `ready` decides the tint. SUCCESS once a pack is on disk, WARNING while
+        the panel has nothing to run: a green light over "none installed" would
+        be the one dishonest colour in the menu, and this row is the only one
+        whose colour is a claim about the world rather than about its kind.
+
+        Same contract as set_synth3d_status -- the host is the authority on
+        what is installed and simply tells the overlay.
+        """
+        action = getattr(self, 'synth3d_download_models_action', None)
+        if action is None:
+            return
+        summary = str(text).strip()
+        action.setText("Depth models — %s" % summary if summary
+                       else "Depth models…")
+        action.setIcon(self._export_menu_icon(
+            'models',
+            PremiumColors.SUCCESS if ready else PremiumColors.WARNING))
+
+    def set_synth3d_selection_summary(self, depth_preset=None,
+                                      geometry_preset=None):
+        """Name the current choice on each submenu ROW, so a user reads their
+        configuration without opening anything.
+
+        The host passes its own persisted keys; the overlay resolves them
+        against the actions it built itself and never has to know what a preset
+        means. Either argument may be None to leave that row alone.
+        """
+        for menu, stem, actions, key in (
+                (getattr(self, 'synth3d_depth_preset_menu', None),
+                 self._SYNTH3D_DEPTH_PRESET_TITLE,
+                 getattr(self, 'synth3d_depth_preset_actions', None),
+                 depth_preset),
+                (getattr(self, 'synth3d_preset_menu', None),
+                 self._SYNTH3D_GEOMETRY_TITLE,
+                 getattr(self, 'synth3d_preset_actions', None),
+                 geometry_preset)):
+            if menu is None or key is None:
+                continue
+            action = (actions or {}).get(str(key))
+            label = action.text() if action is not None else str(key)
+            menu.setTitle("%s — %s" % (stem, label) if label else stem)
+
+    def _add_menu_slider(self, menu, label, lo, hi, val, preview_signal, changed_signal):
+        """A labeled QSlider hosted in the menu via QWidgetAction. `preview_signal`
+        fires on every valueChanged (live, e.g. while dragging); `changed_signal`
+        fires only on sliderReleased, with the slider's settled value -- the
+        single point where the host persists the setting."""
+        holder = QWidget()
+        lay = QVBoxLayout(holder)
+        lay.setContentsMargins(14, 4, 14, 6)
+        lay.setSpacing(2)
+        lab = QLabel(label)
+        lab.setObjectName("sylcMenuSubtitle")
+        lay.addWidget(lab)
+        s = QSlider(Qt.Orientation.Horizontal)
+        s.setRange(lo, hi)
+        s.setValue(val)
+        s.valueChanged.connect(preview_signal)
+        s.sliderReleased.connect(lambda: changed_signal.emit(s.value()))
+        lay.addWidget(s)
+        act = QWidgetAction(menu)
+        act.setDefaultWidget(holder)
+        menu.addAction(act)
+        return s
+
+    @classmethod
+    def _export_menu_icon_with_status(cls, kind, color, state):
+        """The transport icon with a status light (témoin) composited at its
+        bottom-right corner: green = session on this transport with the Quest
+        connected, orange = session up, waiting for the headset, no dot =
+        inactive. Drawn over the same glyph _export_menu_icon renders, so the
+        icon itself is untouched."""
+        base = cls._export_menu_icon(kind, color)
+        if state is None:
+            return base
+        pixmap = base.pixmap(40, 40)          # the 20x20-logical DPR-2 canvas
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        dot = QColor(PremiumColors.SUCCESS if state == 'connected'
+                     else PremiumColors.WARNING)
+        # Physical pixels on the 40px canvas (= 6.5px logical dot, bottom-right).
+        cx, cy, r = 31.0, 31.0, 6.5
+        halo = QColor(dot)
+        halo.setAlpha(70)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(halo))
+        painter.drawEllipse(QPointF(cx, cy), r + 2.5, r + 2.5)
+        painter.setBrush(QBrush(dot))
+        painter.drawEllipse(QPointF(cx, cy), r, r)
+        painter.end()
+        pixmap.setDevicePixelRatio(2.0)
+        return QIcon(pixmap)
+
+    def set_cast_transport_state(self, active_kind, connected=False):
+        """Refresh the Stream-to-Quest status lights (témoins). active_kind:
+        'wifi', 'usb' or None (no session). connected: the Quest client is
+        attached (green) vs the session waiting for it (orange)."""
+        state = (active_kind, bool(connected))
+        if state == getattr(self, '_cast_light_state', None):
+            return
+        self._cast_light_state = state
+        for kind, action, base_color in (
+                ('wifi', getattr(self, 'cast_wifi_action', None), None),
+                ('usb', getattr(self, 'cast_usb_action', None), PremiumColors.INFO)):
+            if action is None:
+                continue
+            dot = None
+            if active_kind == kind:
+                dot = 'connected' if connected else 'waiting'
+            action.setIcon(self._export_menu_icon_with_status(kind, base_color, dot))
+
+    def _connect_signals(self):
+        """Connects internal signals."""
+        self.play_pause_button.clicked.connect(self.play_toggled)
+        self.stop_button.clicked.connect(self.stop_clicked)
+        self.fullscreen_button.clicked.connect(self.fullscreen_toggled)
+        self.open_file_button.clicked.connect(self.file_opened)
+        self.open_disc_button.clicked.connect(self.disc_opened)
+        # archive_button no longer emits archive_requested on click — it opens the
+        # « Sauvegarde / Export » QMenu (setMenu, wired in _build_export_menu); the
+        # ISO entry is what emits archive_requested now.
+        self.volume_slider.volume_changed.connect(self.volume_changed)
+        self.time_slider.sliderMoved.connect(lambda pos: self._on_slider_scrub(pos))
+        # ANTI-SPAM: Use scrub_finished (debounced) instead of sliderReleased
+        self.time_slider.scrub_finished.connect(self._emit_seek)
+        # Keep sliderReleased as a backup for simple clicks
+        self.time_slider.sliderReleased.connect(self._on_slider_released)
+        self.mode_3d_button.toggled.connect(self.mode_3d_toggled)
+        self.stereo_mode_combo.currentTextChanged.connect(self._on_stereo_mode_changed)
+        self.audio_track_combo.currentIndexChanged.connect(self._on_audio_track_changed)
+        self.subtitle_track_combo.currentIndexChanged.connect(self._on_subtitle_track_changed)
+
+    def stop_all_animations(self):
+        """Stop all button animations - call before destruction or MVC mode."""
+        buttons = [
+            self.open_file_button,
+            self.open_disc_button,
+            self.archive_button,
+            self.skip_back_button,
+            self.stop_button,
+            self.play_pause_button,
+            self.skip_forward_button,
+            self.mode_3d_button,
+            self.fullscreen_button
+        ]
+        for btn in buttons:
+            if hasattr(btn, 'stop_animations'):
+                btn.stop_animations()
+
+    def enable_all_animations(self):
+        """Re-enable button animations after MVC mode ends."""
+        buttons = [
+            self.open_file_button,
+            self.open_disc_button,
+            self.archive_button,
+            self.skip_back_button,
+            self.stop_button,
+            self.play_pause_button,
+            self.skip_forward_button,
+            self.mode_3d_button,
+            self.fullscreen_button
+        ]
+        for btn in buttons:
+            if hasattr(btn, 'enable_animations'):
+                btn.enable_animations()
+
+    # === PUBLIC API ===
+
+    def set_status_info(self, text, status_type="info", active=False):
+        """Updates the status badge. (NO-OP: Badge removed)"""
+        # self.status_badge.set_status(text, status_type, active)
+        pass
+
+    def set_format_badge(self, text, tooltip="Decoded by edge264"):
+        """Compatibility no-op: the format badge is intentionally not rendered."""
+        return
+
+    def clear_format_badge(self):
+        """Compatibility no-op: the format badge is intentionally not rendered."""
+        return
+
+    def set_tech_info(self, resolution="", fps="", codec=""):
+        """Updates the technical info."""
+        self.tech_info.set_info(resolution, fps, codec)
+
+    def set_mvc_active(self, active):
+        """Activates/deactivates visual MVC mode."""
+        self.time_slider.set_mvc_active(active)
+        if active:
+            # V7b+++ STUTTER FIX: Stop ALL button animations in MVC mode
+            # These constant repaints cause stuttering when window has focus
+            self.stop_all_animations()
+        else:
+            # V7b+++ Re-enable animations when leaving MVC mode
+            self.enable_all_animations()
+
+    def set_paused(self, is_paused):
+        """Changes play/pause icon."""
+        self.play_pause_button.icon_type = 'play' if is_paused else 'pause'
+        self.play_pause_button.setToolTip("Play" if is_paused else "Pause")
+        self.play_pause_button.update()
+
+    def set_playback_stopped(self):
+        """Force the transport to its canonical stopped appearance."""
+        self.play_pause_button.icon_type = 'play'
+        self.play_pause_button.setToolTip("Play")
+        self.play_pause_button.update()
+
+    def set_fullscreen_icon(self, is_fullscreen):
+        """Changes fullscreen icon."""
+        self.fullscreen_button.icon_type = 'exit_fullscreen' if is_fullscreen else 'fullscreen'
+        self.fullscreen_button.update()
+
+    def set_duration(self, seconds):
+        """Sets total duration."""
+        if seconds is None:
+            return
+        new_max = int(seconds * 1000)
+        if self.time_slider.maximum() != new_max:
+            self.time_slider.setRange(0, new_max)
+        self.time_slider.setEnabled(seconds > 0)
+        self.duration_label.setText(self._format_time(seconds))
+
+    def set_time(self, seconds):
+        """Updates the current position."""
+        if seconds is not None and not self.time_slider.isSliderDown():
+            self.time_slider.setValue(int(seconds * 1000))
+        self.time_label.setText(self._format_time(seconds))
+
+    def set_buffer_progress(self, progress):
+        """Updates the buffer indicator (0-1)."""
+        self.time_slider.set_buffer_progress(progress)
+
+    def update_audio_tracks(self, tracks):
+        """Updates the audio track list."""
+        self.audio_track_combo.blockSignals(True)
+        self.audio_track_combo.clear()
+        if not tracks:
+            self.audio_track_combo.addItem("No tracks")
+            self.audio_track_combo.setEnabled(False)
+        else:
+            self.audio_track_combo.addItem("Select...")
+            for track_id, title, lang in tracks:
+                # Compact but readable format
+                if lang:
+                    label = f"{title} [{lang.upper()}]"
+                else:
+                    label = title
+                self.audio_track_combo.addItem(label, track_id)
+            self.audio_track_combo.setEnabled(True)
+            self.audio_track_combo.setCurrentIndex(1)
+        self.audio_track_combo.blockSignals(False)
+
+    def update_subtitle_tracks(self, tracks):
+        """Updates the subtitle list."""
+        logger.info(f"[UI] update_subtitle_tracks called with {len(tracks) if tracks else 0} tracks")
+        self.subtitle_track_combo.blockSignals(True)
+        self.subtitle_track_combo.clear()
+        self.subtitle_track_combo.addItem("None", 0)
+        if tracks:
+            for track_id, title, lang in tracks:
+                # Compact but readable format
+                if lang:
+                    label = f"{title} [{lang.upper()}]"
+                else:
+                    label = title
+                logger.info(f"[UI]   Adding subtitle: track_id={track_id}")
+                self.subtitle_track_combo.addItem(label, track_id)
+        self.subtitle_track_combo.setEnabled(True)
+        self.subtitle_track_combo.blockSignals(False)
+        logger.info(f"[UI] subtitle_track_combo now has {self.subtitle_track_combo.count()} items")
+
+    def update_subtitle_tracks_streaming(self, tracks):
+        """Update subtitle list from streaming tracks (MVC demuxer format).
+
+        Args:
+            tracks: List of dicts with {trackNumber, codecId, language, name, isPGS}
+        """
+        logger.info(f"[UI] update_subtitle_tracks_streaming called with {len(tracks) if tracks else 0} tracks")
+        self.subtitle_track_combo.blockSignals(True)
+        self.subtitle_track_combo.clear()
+        self.subtitle_track_combo.addItem("None", 0)
+        if tracks:
+            # Convert streaming format to tuple format and add to combo
+            for i, track in enumerate(tracks):
+                track_number = track.get('trackNumber', i + 1)
+                name = (track.get('name') or '').strip()
+                language = (track.get('language') or '').strip()
+                is_pgs = track.get('isPGS', False)
+                codec = track.get('codecId', '')
+
+                # Format label with codec type indication
+                if is_pgs:
+                    codec_label = "PGS"
+                elif 'UTF8' in codec:
+                    codec_label = "SRT"
+                else:
+                    codec_label = (codec.split('/')[-1] if '/' in codec else codec) or ''
+
+                # Drop meaningless placeholder names (e.g. "TRACK_1"); build a
+                # readable label from language + codec instead.
+                low = name.lower()
+                is_placeholder = (not name) or (
+                    low.startswith('track') and low[5:].strip(' _0123456789') == ''
+                )
+                parts = []
+                if name and not is_placeholder:
+                    parts.append(name)               # already conveys the language (BD PGS)
+                elif language:
+                    parts.append(f"[{language.upper()}]")
+                if codec_label:
+                    parts.append(f"({codec_label})")
+                label = " ".join(parts) if parts else f"Subtitle {i + 1}"
+
+                # Use 1-based index for UI (matches track selection logic in GUI)
+                ui_index = i + 1
+                logger.info(f"[UI]   Adding streaming subtitle: ui_index={ui_index}, trackNumber={track_number}, isPGS={is_pgs}")
+                self.subtitle_track_combo.addItem(label, ui_index)
+
+        self.subtitle_track_combo.setEnabled(True)
+        self.subtitle_track_combo.blockSignals(False)
+        logger.info(f"[UI] subtitle_track_combo now has {self.subtitle_track_combo.count()} items (streaming mode)")
+
+    # === INTERNAL ===
+
+    def _format_time(self, seconds):
+        if seconds is None:
+            return "00:00"
+        s = int(seconds)
+        h, s = divmod(s, 3600)
+        m, s = divmod(s, 60)
+        if h > 0:
+            return f"{h}:{m:02}:{s:02}"
+        return f"{m:02}:{s:02}"
+
+    def _emit_seek(self, value=None):
+        """Emits seeked signal with value in seconds."""
+        # The value received from scrub_finished is already in seconds
+        if value is not None:
+            self.seeked.emit(float(value))
+        else:
+            # Fallback: use the slider value (in ms) converted to seconds
+            self.seeked.emit(self.time_slider.value() / 1000.0)
+
+    def _on_slider_released(self):
+        """
+        Called when slider is released (backup for simple clicks).
+        Debounced scrub_finished handles most cases, but this ensures
+        simple clicks are processed even if scrub_finished didn't trigger.
+        """
+        # Do nothing - scrub_finished handles the seek via mouseReleaseEvent
+        pass
+
+    def _on_slider_scrub(self, pos):
+        self.time_label.setText(self._format_time(pos / 1000.0))
+
+    def _on_stereo_mode_changed(self, text):
+        # "MultiView" is the display label for the internal 'mvc' key (unchanged everywhere
+        # internal). "MVC" kept as an alias for robustness against older callers.
+        mode_map = {"MultiView": "mvc", "MVC": "mvc",
+                    "Side-by-Side": "sbs", "Top-Bottom": "tab",
+                    "Dual Projector": "dual", "Glasses (F-SBS)": "glasses"}
+        self.stereo_mode_changed.emit(mode_map.get(text, "auto"))
+
+    def _on_audio_track_changed(self, index):
+        if index > 0:
+            track_id = self.audio_track_combo.itemData(index)
+            if track_id is not None:
+                self.audio_track_changed.emit(track_id)
+
+    def _on_subtitle_track_changed(self, index):
+        track_id = self.subtitle_track_combo.itemData(index)
+        logger.info(f"[UI] _on_subtitle_track_changed: index={index}, track_id={track_id}")
+        if track_id is not None:
+            logger.info(f"[UI] Emitting subtitle_track_changed({track_id})")
+            self.subtitle_track_changed.emit(track_id)
+        else:
+            logger.info(f"[UI] track_id is None, signal NOT emitted")
+
+    # === PAINT ===
+
+    def paintEvent(self, event):
+        """Draws glassmorphism background."""
+        try:
+            painter = QPainter(self)
+            if not painter.isActive():
+                return
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+            rect = QRectF(0, 0, self.width(), self.height())
+
+            # Background with glassmorphism effect
+            path = QPainterPath()
+            path.addRoundedRect(rect, 16, 16)
+
+            # Main background
+            gradient = QLinearGradient(0, 0, 0, self.height())
+            gradient.setColorAt(0, QColor(35, 38, 48, 245))
+            gradient.setColorAt(1, QColor(25, 28, 35, 250))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(gradient))
+            painter.drawPath(path)
+
+            # Top highlight (glass effect)
+            highlight_path = QPainterPath()
+            highlight_rect = QRectF(0, 0, self.width(), 40)
+            highlight_path.addRoundedRect(highlight_rect, 16, 16)
+            highlight_gradient = QLinearGradient(0, 0, 0, 40)
+            highlight_gradient.setColorAt(0, QColor(255, 255, 255, 15))
+            highlight_gradient.setColorAt(1, QColor(255, 255, 255, 0))
+            painter.setBrush(QBrush(highlight_gradient))
+            painter.drawPath(highlight_path)
+
+            # Border
+            painter.setPen(QPen(QColor(255, 255, 255, 25), 1))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(path)
+
+            # Subtle cyan glow at top
+            glow_gradient = QLinearGradient(0, 0, self.width(), 0)
+            glow_gradient.setColorAt(0, QColor(0, 200, 255, 0))
+            glow_gradient.setColorAt(0.5, QColor(0, 200, 255, 20))
+            glow_gradient.setColorAt(1, QColor(0, 200, 255, 0))
+            painter.setPen(QPen(QBrush(glow_gradient), 2))
+            painter.drawLine(QPointF(20, 1), QPointF(self.width() - 20, 1))
+        except Exception:
+            pass  # Ignore paint errors
+
+
+# =============================================================================
+# COMPATIBILITY WRAPPER
+# =============================================================================
+
+class ControlsOverlay(PremiumControlsOverlay):
+    """
+    Compatibility wrapper to replace old ControlsOverlay.
+    Inherits from PremiumControlsOverlay while maintaining existing API.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+    def show_animated(self):
+        self.show()
+
+    def hide_animated(self):
+        self.hide()
+
+
+# =============================================================================
+# TEST
+# =============================================================================
+
+if __name__ == "__main__":
+    import sys
+    from PySide6.QtWidgets import QApplication, QMainWindow
+
+    app = QApplication(sys.argv)
+
+    # Dark theme
+    app.setStyleSheet("""
+        QMainWindow { background-color: #1a1a1e; }
+    """)
+
+    window = QMainWindow()
+    window.setWindowTitle("Premium Controls Overlay - Test")
+    window.resize(1200, 200)
+
+    overlay = PremiumControlsOverlay()
+    overlay.setFixedHeight(120)
+    window.setCentralWidget(overlay)
+
+    # Test data
+    overlay.set_duration(7200)  # 2 hours
+    overlay.set_time(1234)
+    overlay.set_tech_info("1920*1080", "23.976 fps", "MVC")
+    overlay.set_mvc_active(True)
+    overlay.update_audio_tracks([
+        (1, "English", "eng"),
+        (2, "French", "fra"),
+        (3, "German", "deu"),
+    ])
+    overlay.update_subtitle_tracks([
+        (1, "English", "eng"),
+        (2, "French", "fra"),
+    ])
+
+    window.show()
+    sys.exit(app.exec())

@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Build outputs
+/build/
+build_py314/
+build_nuitka/
+build_onefile/
+build_release_v530/
+_build_release_v530/
+dist/
+*.manifest
+*.log
+
+# Large runtime binaries (~100 MB each) — must be present locally to run,
+# but are not committed (fetch/copy them into runtime/ yourself).
+runtime/mpv-2.dll
+runtime/avcodec-62.dll
+runtime/avfilter-11.dll
+
+# Runtime / sensitive / transient
+crash_log.txt
+exe.out
+exe.err
+
+# Pre-optimization binaries and benchmark baselines (local rollback only)
+.perf_backup/
+
+# Editor / OS / venv
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.venv/
+
+# Optional non-commercial MatAnyone 2 developer runtime. The integration and
+# notices are tracked; third-party source, weights and the 3+ GiB uv venv are not.
+models_dev_nc/matanyone2_runtime/
+models_dev_nc/matanyone2/*.pth
+tools_dev/_vendor/MatAnyone2/

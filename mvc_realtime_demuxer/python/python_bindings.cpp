@@ -20,6 +20,9 @@
 #include "depth_stabilizer.h"  // same gating as depth_engine.h above
 #include "cut_gate.h"          // header-only; same gating as depth_engine.h above
 #include "shared_depth_service.h"  // synth3d_flow::estimate_flow test surface
+#ifdef SYLC_NATIVE_RENDERER
+#include "stereo_lab.h"
+#endif
 
 namespace py = pybind11;
 using namespace mvc_demux;
@@ -931,6 +934,10 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
              "Attach the exact media PTS (milliseconds) to the planes uploaded "
              "for the next present. Negative/non-finite selects the fallback "
              "clock; inference cadence is never substituted for video time.")
+        .def("set_synth3d_output_eye", &sylc::NativeRenderer::set_synth3d_output_eye,
+             py::arg("eye"),
+             "Select the synthesized eye exposed by a stereo_mode=0 surface: "
+             "0=left, 1=right. Used by Dual Projector eye windows only.")
         .def("set_yuv_frame",
              [](sylc::NativeRenderer& r, py::object yl, py::object ul, py::object vl,
                 py::object yr, py::object ur, py::object vr) {
@@ -1102,7 +1109,8 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
                  bool depth_view, const std::wstring& model_path, const std::wstring& ort_dir,
                  bool diagnostics, int side, int grid_width, int grid_height,
                  float crop_top, float crop_bottom, bool auto_convergence,
-                 bool temporal_fill) {
+                 bool temporal_fill, bool stereo_lab, bool comfort_enabled,
+                 float comfort_soft_pct, float comfort_hard_pct) {
                   if (side <= 0)
                       throw std::runtime_error("side must be a positive inference grid");
                   if ((grid_width > 0) != (grid_height > 0))
@@ -1112,7 +1120,9 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
                   return r.set_synth3d(enabled, strength_pct, convergence, depth_view,
                                        model_path, ort_dir, diagnostics, side,
                                        grid_width, grid_height, crop_top, crop_bottom,
-                                       auto_convergence, temporal_fill);
+                                       auto_convergence, temporal_fill, stereo_lab,
+                                       comfort_enabled, comfort_soft_pct,
+                                       comfort_hard_pct);
              },
              py::arg("enabled"), py::arg("strength_pct") = 1.5f,
              py::arg("convergence") = 0.5f, py::arg("depth_view") = false,
@@ -1122,13 +1132,20 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
               py::arg("crop_top") = 0.0f, py::arg("crop_bottom") = 0.0f,
               py::arg("auto_convergence") = false,
               py::arg("temporal_fill") = false,
+              py::arg("stereo_lab") = true,
+              py::arg("comfort_enabled") = false,
+              py::arg("comfort_soft_pct") = 0.0f,
+              py::arg("comfort_hard_pct") = 0.0f,
              "Enable the real-time 2D->3D conversion. strength_pct = max disparity as a "
              "% of image width; convergence = normalized nearness at zero parallax (0..1); "
              "depth_view replaces the warp with a false-color depth visualization; "
              "diagnostics overlays depth and disocclusion confidence on the movie; "
               "side = the backward-compatible square grid; positive grid_width and "
               "grid_height override it for a fixed rectangular export; crop_top and "
-              "crop_bottom remove normalized encoded mattes before inference. "
+              "crop_bottom remove normalized encoded mattes before inference; "
+              "stereo_lab adds a reversible final coherence pass above the "
+              "immutable v5.2.1c raw pair; the calibrated comfort envelope "
+              "remains bypassed. "
              "Renderers share one asynchronous ORT service, so playback never waits "
              "for the model. False on error (see last_error()).")
         .def("synth3d_status", &sylc::NativeRenderer::synth3d_status,
@@ -1230,7 +1247,7 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
              "RG16 renderer map; all arrays must match its grid.")
         .def("synth3d_set_human_matte",
              [](sylc::NativeRenderer& r, py::object matte,
-                const std::string& mode) -> bool {
+                const std::string& mode, py::object reliability) -> bool {
                  int mode_id = 0;
                  if (mode == "guard") mode_id = 1;
                  else if (mode == "contour") mode_id = 2;
@@ -1250,10 +1267,23 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
                  const auto width = static_cast<uint32_t>(a.shape(1));
                  const size_t count = static_cast<size_t>(width) * height;
                  bool ok = false;
-                 {
+                 if (reliability.is_none()) {
                      py::gil_scoped_release nogil;
                      ok = r.synth3d_set_test_matte(
                          a.data(), width, height, count, mode_id);
+                 } else {
+                     auto local = reliability.cast<py::array_t<uint8_t,
+                         py::array::c_style | py::array::forcecast>>();
+                     if (local.ndim() != 2 ||
+                         local.shape(0) != a.shape(0) ||
+                         local.shape(1) != a.shape(1)) {
+                         throw std::runtime_error(
+                             "matte reliability must match the alpha shape");
+                     }
+                     py::gil_scoped_release nogil;
+                     ok = r.synth3d_set_test_matte(
+                         a.data(), width, height, count, mode_id,
+                         local.data(), count);
                  }
                  if (!ok)
                      throw std::runtime_error(
@@ -1261,6 +1291,7 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
                  return true;
               },
               py::arg("matte"), py::arg("mode") = "contour",
+              py::arg("reliability") = py::none(),
               "Attach an asynchronously generated uint8 human alpha matte. "
               "'guard' uses it only for layer ownership, hole-fill veto and local "
               "stereo safety; 'contour' also decontaminates fractional foreground "
@@ -1269,7 +1300,7 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
               "None disables all matte behavior and restores the historical path.")
         .def("synth3d_set_test_matte",
              [](sylc::NativeRenderer& r, py::object matte,
-                const std::string& mode) -> bool {
+                const std::string& mode, py::object reliability) -> bool {
                  int mode_id = 0;
                  if (mode == "guard") mode_id = 1;
                  else if (mode == "contour") mode_id = 2;
@@ -1289,10 +1320,23 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
                  const auto width = static_cast<uint32_t>(a.shape(1));
                  const size_t count = static_cast<size_t>(width) * height;
                  bool ok = false;
-                 {
+                 if (reliability.is_none()) {
                      py::gil_scoped_release nogil;
                      ok = r.synth3d_set_test_matte(
                          a.data(), width, height, count, mode_id);
+                 } else {
+                     auto local = reliability.cast<py::array_t<uint8_t,
+                         py::array::c_style | py::array::forcecast>>();
+                     if (local.ndim() != 2 ||
+                         local.shape(0) != a.shape(0) ||
+                         local.shape(1) != a.shape(1)) {
+                         throw std::runtime_error(
+                             "matte reliability must match the alpha shape");
+                     }
+                     py::gil_scoped_release nogil;
+                     ok = r.synth3d_set_test_matte(
+                         a.data(), width, height, count, mode_id,
+                         local.data(), count);
                  }
                  if (!ok)
                      throw std::runtime_error(
@@ -1300,6 +1344,7 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
                  return true;
              },
              py::arg("matte"), py::arg("mode") = "guard",
+             py::arg("reliability") = py::none(),
              "Compatibility alias retained for the offline A/B prototype.")
         .def("synth3d_side", &sylc::NativeRenderer::synth3d_side,
              py::call_guard<py::gil_scoped_release>(),
@@ -1319,12 +1364,57 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
              "Return the live synth3d inference grid as (width, height).")
         .def("synth3d_set_lookahead", &sylc::NativeRenderer::synth3d_set_lookahead,
              py::arg("cut_in_ms"), py::arg("storm_in_ms"),
+             py::arg("cut_pts_ms") = -1.0,
              "Two-filter look-ahead advisory: delays (ms) from the presented "
              "position to the next cut / motion-storm onset observed in the "
              "decoded future. Slightly NEGATIVE values (hold window, ~-120ms) "
              "mean the event just landed and its effect must persist; pass "
-             "-1e9 for none (NOT -1: that reads as 'cut one ms ago'). False "
+             "-1e9 for none (NOT -1: that reads as 'cut one ms ago'). "
+             "cut_pts_ms is the ABSOLUTE media PTS of the same reported cut "
+             "(shot identity for the cross-shot gate; -1.0 = none — an "
+             "absolute PTS is always >= 0, unlike the relative delays). False "
              "when synth3d is off. SYLC_LOOKAHEAD=0 disables the intake.")
+        .def("synth3d_set_motion_hints",
+             [](sylc::NativeRenderer& r, double pts_ms, double frame_ms,
+                int blocks_w, int blocks_h,
+                int source_width, int source_height,
+                py::array_t<int16_t,
+                    py::array::c_style | py::array::forcecast> mv_xy,
+                py::object valid_obj) {
+                 const size_t blocks =
+                     static_cast<size_t>(blocks_w) * blocks_h;
+                 if (mv_xy.ndim() != 1 ||
+                     static_cast<size_t>(mv_xy.shape(0)) != 2 * blocks)
+                     throw std::runtime_error(
+                         "mv_xy must be a flat int16 array of 2*blocks");
+                 std::vector<int16_t> mv(mv_xy.data(),
+                                         mv_xy.data() + 2 * blocks);
+                 std::vector<uint8_t> valid;
+                 if (!valid_obj.is_none()) {
+                     auto v = valid_obj.cast<py::array_t<uint8_t,
+                         py::array::c_style | py::array::forcecast>>();
+                     if (v.ndim() != 1 ||
+                         static_cast<size_t>(v.shape(0)) != blocks)
+                         throw std::runtime_error(
+                             "valid must be a flat uint8 array of blocks");
+                     valid.assign(v.data(), v.data() + blocks);
+                 }
+                 py::gil_scoped_release nogil;
+                 return r.synth3d_set_motion_hints(
+                     pts_ms, frame_ms, blocks_w, blocks_h,
+                     source_width, source_height,
+                     std::move(mv), std::move(valid));
+             },
+             py::arg("pts_ms"), py::arg("frame_ms"),
+             py::arg("blocks_w"), py::arg("blocks_h"),
+             py::arg("source_width"), py::arg("source_height"),
+             py::arg("mv_xy"), py::arg("valid") = py::none(),
+             "Phase 1 (04/08): decoder motion hints for ONE frame, keyed by "
+             "media pts. Quarter-pel per display frame, production flow "
+             "convention (cur(p) ~ prev(p - flow)); valid=0 marks intra/"
+             "absent blocks. Forwarded to the depth service ring; the worker "
+             "matches by pts and feeds fuse_bidirectional's third candidate. "
+             "SYLC_SYNTH3D_MV_HINTS=0 disables the intake.")
         .def("synth3d_read_plane",
              [](sylc::NativeRenderer& r, int slot) -> py::object {
                  std::vector<uint8_t> buf;
@@ -1461,6 +1551,54 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
           "Test the production encoded-horizontal-letterbox detector. Returns "
           "(top_rows, bottom_rows, valid).");
 
+    m.def("_synth3d_reduce_lab_metrics_test",
+          [](py::array_t<uint8_t,
+                         py::array::c_style | py::array::forcecast> guards) {
+              if (guards.ndim() != 3 || guards.shape(2) != 2)
+                  throw std::runtime_error(
+                      "guards must be a contiguous HxWx2 uint8 array");
+              const size_t count = static_cast<size_t>(guards.shape(0)) *
+                                   static_cast<size_t>(guards.shape(1));
+              const auto summary = StereoLab::reduce_metric_rg8(
+                  guards.data(), count);
+              py::dict out;
+              out["mean"] = summary.mean;
+              out["p95_active"] = summary.p95_active;
+              out["asym"] = summary.asym;
+              out["coverage"] = summary.coverage;
+              return out;
+          },
+          py::arg("guards"),
+          "Test the production Stereo Lab metric reducer on an HxWx2 RG8 "
+          "guard map. p95_active excludes inactive samples.");
+
+    m.def("_synth3d_reduce_lab_shadow_metrics_test",
+          [](py::array_t<uint8_t,
+                         py::array::c_style | py::array::forcecast> metrics,
+             float comfort_scale_px) {
+              if (metrics.ndim() != 3 || metrics.shape(2) != 4)
+                  throw std::runtime_error(
+                      "metrics must be a contiguous HxWx4 uint8 array");
+              const size_t count = static_cast<size_t>(metrics.shape(0)) *
+                                   static_cast<size_t>(metrics.shape(1));
+              const auto summary = StereoLab::reduce_metric_rgba8(
+                  metrics.data(), count, comfort_scale_px);
+              py::dict out;
+              out["mean"] = summary.mean;
+              out["p95_active"] = summary.p95_active;
+              out["asym"] = summary.asym;
+              out["coverage"] = summary.coverage;
+              out["comfort_mean_loss_px"] = summary.comfort_mean_loss_px;
+              out["comfort_p95_loss_px"] = summary.comfort_p95_loss_px;
+              out["comfort_coverage"] = summary.comfort_coverage;
+              out["edge_veto_p95"] = summary.edge_veto_p95;
+              out["edge_veto_coverage"] = summary.edge_veto_coverage;
+              return out;
+          },
+          py::arg("metrics"), py::arg("comfort_scale_px"),
+          "Test the production RGBA8 Lab/comfort shadow reducer. B is "
+          "normalized comfort loss and A is protected-edge strength.");
+
     m.def("_synth3d_registry_stats", [] {
               size_t services = 0, active = 0, idle = 0;
               SharedDepthService::debug_registry_stats(
@@ -1483,6 +1621,67 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
           "(production code path): the stored pump delay minus its "
           "steady-clock age; the NONE sentinel (-1e9) passes through "
           "undecayed.");
+
+    m.def("_synth3d_shot_gate_test",
+          [](double map_video_ms, double presented_video_ms,
+             double cut_pts_ms) {
+              return SharedDepthService::cross_shot_gate(
+                  map_video_ms, presented_video_ms, cut_pts_ms);
+          },
+          py::arg("map_video_ms"), py::arg("presented_video_ms"),
+          py::arg("cut_pts_ms"),
+          "Test surface for the cross-shot gate decision (production code "
+          "path, 04/08): true while the cut boundary separates the published "
+          "map's source observation from the presented frame (map < cut <= "
+          "presented, with the +-4 ms media-clock jitter tolerance). Any "
+          "negative/invalid clock never gates.");
+
+    m.def("_synth3d_boundary_signal_test",
+          [](float histogram_distance, float scene_cut_threshold) {
+              return SharedDepthService::boundary_scene_signal(
+                  histogram_distance, scene_cut_threshold);
+          },
+          py::arg("histogram_distance"), py::arg("scene_cut_threshold"),
+          "Test surface for the boundary-crossing scene-cut signal "
+          "(production code path, 04/08 round 2): the signal handed to "
+          "DepthStabilizer::step() when a worker observation crossed a "
+          "recorded cut boundary — raised to the stabilizer's scene-cut "
+          "threshold so the snap is guaranteed even when both content "
+          "detectors are blind (similar compositions); a higher measured "
+          "distance passes through untouched.");
+
+    m.def("_synth3d_realign_test",
+          [](py::array_t<uint16_t,
+                 py::array::c_style | py::array::forcecast> depth,
+             py::array_t<float,
+                 py::array::c_style | py::array::forcecast> luma,
+             int max_threads) {
+              if (depth.ndim() != 2 || luma.ndim() != 2 ||
+                  depth.shape(0) != luma.shape(0) ||
+                  depth.shape(1) != luma.shape(1))
+                  throw std::runtime_error(
+                      "depth/luma must be equal-shape 2D arrays");
+              const int height = static_cast<int>(depth.shape(0));
+              const int width = static_cast<int>(depth.shape(1));
+              const size_t n = static_cast<size_t>(width) * height;
+              std::vector<uint16_t> d(depth.data(), depth.data() + n);
+              std::vector<float> l(luma.data(), luma.data() + n);
+              std::vector<uint16_t> scratch;
+              {
+                  py::gil_scoped_release nogil;
+                  synth3d_surface::realign_contours(
+                      d, l, width, height, scratch, max_threads);
+              }
+              py::array_t<uint16_t> out({height, width});
+              std::copy(d.begin(), d.end(), out.mutable_data());
+              return out;
+          },
+          py::arg("depth_q16"), py::arg("luma"), py::arg("max_threads") = 1,
+          "Test surface for contour re-anchoring (production code path, "
+          "04/08): snaps the depth discontinuity onto the dominant unique "
+          "image edge — a near-halo painted over the background beside a "
+          "silhouette returns to its own side's depth; aligned edges, weak "
+          "or ambiguous image edges and filaments are untouched.");
 
     // --- synth3d (2D->3D): DepthStabilizer (temporal fit/EMA/cut) ----------------
     // Test-only-visible helper (the closed-form fit is also used internally by
@@ -1587,6 +1786,173 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
           "Round 7 test surface: bidirectional flow fusion (production code "
           "path). Returns (flow_x, flow_y, reliability, motion, motion_sum, "
           "mean_flow) — the fused prev->cur transport at cur coordinates.");
+
+    m.def("_synth3d_fuse_candidates_test",
+          [](py::array_t<float, py::array::c_style | py::array::forcecast> prev,
+             py::array_t<float, py::array::c_style | py::array::forcecast> cur,
+             py::array_t<float, py::array::c_style | py::array::forcecast> fwd_x,
+             py::array_t<float, py::array::c_style | py::array::forcecast> fwd_y,
+             py::array_t<float, py::array::c_style | py::array::forcecast> fwd_q,
+             py::array_t<float, py::array::c_style | py::array::forcecast> fut_x,
+             py::array_t<float, py::array::c_style | py::array::forcecast> fut_y,
+             py::array_t<float, py::array::c_style | py::array::forcecast> fut_q,
+             py::object hint_x_obj, py::object hint_y_obj,
+             py::object hint_q_obj,
+             int width, int height, float video_time_scale, int threads) {
+              const size_t expected =
+                  static_cast<size_t>(width) * static_cast<size_t>(height);
+              auto take = [&](py::array_t<
+                      float, py::array::c_style | py::array::forcecast>& a) {
+                  if (a.ndim() != 1 ||
+                      static_cast<size_t>(a.shape(0)) != expected)
+                      throw std::runtime_error(
+                          "all fields must be flat float32 width*height");
+                  return std::vector<float>(a.data(), a.data() + expected);
+              };
+              std::vector<float> p = take(prev), c = take(cur);
+              synth3d_flow::DenseFlow forward, future, hint;
+              forward.x = take(fwd_x); forward.y = take(fwd_y);
+              forward.quality = take(fwd_q);
+              future.x = take(fut_x); future.y = take(fut_y);
+              future.quality = take(fut_q);
+              synth3d_flow::DenseFlow* hint_ptr = nullptr;
+              if (!hint_x_obj.is_none()) {
+                  auto hx = hint_x_obj.cast<py::array_t<
+                      float, py::array::c_style | py::array::forcecast>>();
+                  auto hy = hint_y_obj.cast<py::array_t<
+                      float, py::array::c_style | py::array::forcecast>>();
+                  auto hq = hint_q_obj.cast<py::array_t<
+                      float, py::array::c_style | py::array::forcecast>>();
+                  hint.x = take(hx); hint.y = take(hy);
+                  hint.quality = take(hq);
+                  hint_ptr = &hint;
+              }
+              std::vector<float> ox, oy, orel, omotion;
+              double motion_sum = 0.0;
+              float mean_flow = 0.0f;
+              {
+                  py::gil_scoped_release nogil;
+                  synth3d_flow::fuse_bidirectional(
+                      p, c, forward, future, width, height,
+                      video_time_scale, ox, oy, orel, omotion,
+                      motion_sum, mean_flow, threads, hint_ptr);
+              }
+              const py::ssize_t n = static_cast<py::ssize_t>(expected);
+              py::array_t<float> fx(n), fy(n), frel(n), fm(n);
+              std::memcpy(fx.mutable_data(), ox.data(), expected * sizeof(float));
+              std::memcpy(fy.mutable_data(), oy.data(), expected * sizeof(float));
+              std::memcpy(frel.mutable_data(), orel.data(),
+                          expected * sizeof(float));
+              std::memcpy(fm.mutable_data(), omotion.data(),
+                          expected * sizeof(float));
+              return py::make_tuple(fx, fy, frel, fm);
+          },
+          py::arg("prev"), py::arg("cur"),
+          py::arg("fwd_x"), py::arg("fwd_y"), py::arg("fwd_q"),
+          py::arg("fut_x"), py::arg("fut_y"), py::arg("fut_q"),
+          py::arg("hint_x") = py::none(), py::arg("hint_y") = py::none(),
+          py::arg("hint_q") = py::none(),
+          py::arg("width"), py::arg("height"),
+          py::arg("video_time_scale") = 1.0f, py::arg("threads") = 1,
+          "Phase-1 test surface: triple fusion with EXPLICIT candidate "
+          "fields (production code path). The optional hint triple is the "
+          "decoder motion-vector candidate; quality 0 = no candidate.");
+
+    m.def("_synth3d_rasterize_hints_test",
+          [](py::array_t<int16_t,
+                 py::array::c_style | py::array::forcecast> mv_xy,
+             py::array_t<uint8_t,
+                 py::array::c_style | py::array::forcecast> valid,
+             int blocks_w, int blocks_h,
+             int source_width, int source_height,
+             int grid_width, int grid_height, float time_scale) {
+              const size_t blocks =
+                  static_cast<size_t>(blocks_w) * blocks_h;
+              if (mv_xy.ndim() != 1 ||
+                  static_cast<size_t>(mv_xy.shape(0)) != 2 * blocks ||
+                  valid.ndim() != 1 ||
+                  static_cast<size_t>(valid.shape(0)) != blocks)
+                  throw std::runtime_error(
+                      "mv_xy must be flat 2*blocks int16, valid flat blocks");
+              std::vector<float> ox, oy, oq;
+              synth3d_flow::rasterize_motion_hints(
+                  mv_xy.data(), valid.data(), blocks_w, blocks_h,
+                  source_width, source_height, grid_width, grid_height,
+                  time_scale, ox, oy, oq);
+              const py::ssize_t n =
+                  static_cast<py::ssize_t>(grid_width) * grid_height;
+              py::array_t<float> fx(n), fy(n), fq(n);
+              std::memcpy(fx.mutable_data(), ox.data(), ox.size() * sizeof(float));
+              std::memcpy(fy.mutable_data(), oy.data(), oy.size() * sizeof(float));
+              std::memcpy(fq.mutable_data(), oq.data(), oq.size() * sizeof(float));
+              return py::make_tuple(fx, fy, fq);
+          },
+          py::arg("mv_xy"), py::arg("valid"),
+          py::arg("blocks_w"), py::arg("blocks_h"),
+          py::arg("source_width"), py::arg("source_height"),
+          py::arg("grid_width"), py::arg("grid_height"),
+          py::arg("time_scale") = 1.0f,
+          "Phase-1 test surface: decoder block motion field -> inference "
+          "grid (production code path). Quarter-pel per display frame, "
+          "anisotropic scaling, invalid blocks -> quality 0.");
+
+    m.def("_synth3d_mean_divergence_test",
+          [](py::array_t<float, py::array::c_style | py::array::forcecast> fx,
+             py::array_t<float, py::array::c_style | py::array::forcecast> fy,
+             int width, int height) {
+              const size_t expected =
+                  static_cast<size_t>(width) * static_cast<size_t>(height);
+              if (fx.ndim() != 1 || fy.ndim() != 1 ||
+                  static_cast<size_t>(fx.shape(0)) != expected ||
+                  static_cast<size_t>(fy.shape(0)) != expected)
+                  throw std::runtime_error(
+                      "fx/fy must be flat float32 width*height");
+              std::vector<float> vx(fx.data(), fx.data() + expected);
+              std::vector<float> vy(fy.data(), fy.data() + expected);
+              return synth3d_flow::mean_divergence(vx, vy, width, height);
+          },
+          py::arg("flow_x"), py::arg("flow_y"),
+          py::arg("width"), py::arg("height"),
+          "Phase-2 test surface: mean divergence of a flow field "
+          "(production code path); positive = expansion/looming.");
+
+    m.def("_synth3d_expand_motion_test",
+          [](py::array_t<float, py::array::c_style | py::array::forcecast> motion,
+             py::array_t<float, py::array::c_style | py::array::forcecast> boundary,
+             py::array_t<float, py::array::c_style | py::array::forcecast> fx,
+             py::array_t<float, py::array::c_style | py::array::forcecast> fy,
+             int width, int height, bool directional, int threads) {
+              const size_t expected =
+                  static_cast<size_t>(width) * static_cast<size_t>(height);
+              for (auto* a : {&motion, &boundary, &fx, &fy})
+                  if (a->ndim() != 1 ||
+                      static_cast<size_t>(a->shape(0)) != expected)
+                      throw std::runtime_error(
+                          "all fields must be flat float32 width*height");
+              std::vector<float> m_(motion.data(), motion.data() + expected);
+              std::vector<float> b(boundary.data(),
+                                   boundary.data() + expected);
+              std::vector<float> vx(fx.data(), fx.data() + expected);
+              std::vector<float> vy(fy.data(), fy.data() + expected);
+              std::vector<float> scratch;
+              {
+                  py::gil_scoped_release nogil;
+                  synth3d_flow::expand_boundary_motion(
+                      m_, b, vx, vy, width, height, scratch, threads,
+                      directional);
+              }
+              py::array_t<float> out(static_cast<py::ssize_t>(expected));
+              std::memcpy(out.mutable_data(), m_.data(),
+                          expected * sizeof(float));
+              return out;
+          },
+          py::arg("motion"), py::arg("boundary"),
+          py::arg("flow_x"), py::arg("flow_y"),
+          py::arg("width"), py::arg("height"),
+          py::arg("directional") = true, py::arg("threads") = 1,
+          "Phase-2 test surface: silhouette motion expansion (production "
+          "code path). directional=false reproduces the historical 3x3 "
+          "guard-band max exactly; true adds the upstream anti-trail reach.");
 
     m.def("_synth3d_refine_depth_test",
           [](py::array_t<float, py::array::c_style | py::array::forcecast> depth,
@@ -1840,6 +2206,12 @@ PYBIND11_MODULE(mvc_demuxer_cpp, m) {
         .def_property_readonly("last_confidence",
                                &DepthStabilizer::last_confidence)
         .def_property_readonly("last_cut", &DepthStabilizer::last_cut)
+        .def_property_readonly("last_depth_cut",
+                               &DepthStabilizer::last_depth_cut)
+        .def_property_readonly("last_scene_cut",
+                               &DepthStabilizer::last_scene_cut)
+        .def_property_readonly("last_depth_residual",
+                               &DepthStabilizer::last_depth_residual)
         .def_property_readonly("last_stability",
                                &DepthStabilizer::last_stability)
         .def_property_readonly("last_history_support",

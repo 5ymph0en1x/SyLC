@@ -1,0 +1,79 @@
+x265.exe — provenance (SyLC MV-HEVC export, Task EX-1)
+=======================================================
+
+WHAT
+  Standalone x265 HEVC encoder CLI, 8-bit, built WITH MV-HEVC multiview
+  support (-DENABLE_MULTIVIEW=ON). No reputable pre-built Windows binary
+  ships multiview: the x265 CMake option ENABLE_MULTIVIEW defaults to OFF
+  (source: source/CMakeLists.txt line 701; confirmed by Mike Swanson's
+  reference guide and MulticoreWare's "MV-HEVC Extension Support in x265").
+  Therefore built from the OFFICIAL 4.1 source tarball on this machine.
+
+VERSION (verbatim from `x265.exe --version`)
+  x265 [info]: HEVC encoder version 4.1+1-1d117be
+  x265 [info]: build info [Windows][GCC 15.2.0][64 bit] 8bit
+  x265 [info]: using cpu capabilities: MMX2 SSE2Fast LZCNT SSSE3 SSE4.2 AVX FMA3 BMI2 AVX2
+
+MULTIVIEW ACCEPTED (verbatim from `x265.exe --fullhelp`)
+  --num-views                   Number of Views for Multiview Encoding. Default 1
+  --multiview-config            Configuration file for Multiview Encoding
+
+SOURCE
+  URL (official MulticoreWare release tarball, via VideoLAN-mirrored bitbucket):
+    https://bitbucket.org/multicoreware/x265_git/downloads/x265_4.1.tar.gz
+  sha256 (downloaded tarball):
+    a31699c6a89806b74b0151e5e6a7df65de4b49050482fe5ebf8a4379d7af8f29
+  This sha256 is the published/official x265 4.1 source hash (independently
+  cross-referenced against Homebrew / OpenEmbedded / Yocto / Ravenports
+  package manifests for x265_4.1.tar.gz).
+  Internal version string reported by the build: X265 RELEASE VERSION 4.1+1-1d117be
+  X265_BUILD (public API level): 215
+
+BUILD TOOLCHAIN (this machine, Ryzen 5950X, Windows 11)
+  Compiler : MSYS2 mingw-w64 GCC 15.2.0  (C:\msys64\mingw64\bin\gcc.exe / g++.exe)
+  Generator: Ninja 1.12.1  (github.com/ninja-build/ninja v1.12.1 ninja-win.zip,
+             sha256 f550fec705b6d6ff58f2db3c374c2277a37691678d6aba463adcbb129108467a)
+  Assembler: NASM 2.16.03  (nasm.us releasebuilds 2.16.03 win64,
+             sha256 3ee4782247bcb874378d02f7eab4e294a84d3d15f3f6ee2de2f47a46aa7226e6)
+             -> assembly primitives ENABLED (AVX2/FMA3/BMI2 active at runtime)
+  CMake    : 4.2.1  (C:\Program Files\CMake\bin\cmake.exe)
+
+BUILD-COMPATIBILITY PATCH (source/CMakeLists.txt — NO functional/encoder change)
+  CMake 4.x removed support for cmake_policy(SET ... OLD). The x265 4.1
+  CMakeLists set CMP0025 and CMP0054 to OLD and required cmake >= 2.8.8,
+  which CMake 4.2.1 refuses. Patched exactly (same fix used by Yocto/OE
+  "x265: fix build with cmake 4"):
+    - CMP0025 OLD -> NEW
+    - CMP0054 OLD -> NEW
+    - cmake_minimum_required 2.8.8 -> 3.5
+  Also passed -DCMAKE_POLICY_VERSION_MINIMUM=3.5. These affect only the CMake
+  configure step, not the compiled encoder.
+
+CONFIGURE COMMAND (verbatim)
+  cmake -S x265_4.1/source -B build -G Ninja -Wno-dev \
+    -DCMAKE_C_COMPILER=/c/msys64/mingw64/bin/gcc.exe \
+    -DCMAKE_CXX_COMPILER=/c/msys64/mingw64/bin/g++.exe \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+    -DENABLE_MULTIVIEW=ON \
+    -DENABLE_CLI=ON \
+    -DENABLE_SHARED=OFF \
+    -DCMAKE_EXE_LINKER_FLAGS="-static -static-libgcc -static-libstdc++"
+  (nasm + ninja on PATH so find_package(Nasm) succeeds -> assembly enabled)
+  Build: `ninja -C build`  (89 targets, ~60 s)
+
+PORTABILITY
+  Statically linked. objdump -p reports only Windows system DLLs:
+    KERNEL32.dll, msvcrt.dll, SHELL32.dll
+  -> runs with NO MSYS2/mingw runtime on PATH. Self-contained.
+
+INSTALLED BINARY
+  tools\x265\x265.exe
+  sha256: 8e645929aa9b128aec5e587a32f95179bf4841a0cd00c354b1ddcec6efbf19b7
+  size  : 10906173 bytes
+
+LICENSE
+  x265 is licensed GNU GPL v2 (or later); a commercial license is available
+  from MulticoreWare. See LICENSE (verbatim COPYING from the 4.1 source).
+
+ACQUIRED: 2026-07-22 (Task EX-1)
