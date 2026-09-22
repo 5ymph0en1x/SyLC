@@ -29,47 +29,65 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, Q
                                QLineEdit, QPushButton, QCheckBox, QFileDialog, QWidget,
                                QFrame, QMessageBox, QSizePolicy)
 
+import sys
+
 SECTOR = 2048                      # optical logical sector size
 CHUNK = 2048 * 2048                # 4 MiB bulk read (multiple of SECTOR)
 SECTOR_RETRIES = 4                 # per-sector retries before declaring it bad
 
 # ---------------------------------------------------------------------------
-# Win32 raw volume access (ctypes)
+# Win32 raw volume access (ctypes) - Windows only
 # ---------------------------------------------------------------------------
-_k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+if sys.platform == 'win32':
+    _k32 = ctypes.WinDLL('kernel32', use_last_error=True)
 
-GENERIC_READ = 0x80000000
-FILE_SHARE_READ = 0x1
-FILE_SHARE_WRITE = 0x2
-OPEN_EXISTING = 3
-FILE_FLAG_NO_BUFFERING = 0x20000000
-FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000
-INVALID_HANDLE = ctypes.c_void_p(-1).value
-FILE_BEGIN = 0
-DRIVE_CDROM = 5
-IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
+    GENERIC_READ = 0x80000000
+    FILE_SHARE_READ = 0x1
+    FILE_SHARE_WRITE = 0x2
+    OPEN_EXISTING = 3
+    FILE_FLAG_NO_BUFFERING = 0x20000000
+    FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000
+    INVALID_HANDLE = ctypes.c_void_p(-1).value
+    FILE_BEGIN = 0
+    DRIVE_CDROM = 5
+    IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
 
-ERR_NOT_READY = 21
-ERR_ACCESS_DENIED = 5
-ERR_INVALID_PARAMETER = 87
+    ERR_NOT_READY = 21
+    ERR_ACCESS_DENIED = 5
+    ERR_INVALID_PARAMETER = 87
 
-_k32.CreateFileW.restype = wintypes.HANDLE
-_k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                             ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
-_k32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
-                          ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
-_k32.SetFilePointerEx.argtypes = [wintypes.HANDLE, ctypes.c_longlong,
-                                  ctypes.POINTER(ctypes.c_longlong), wintypes.DWORD]
-_k32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
-                                 ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
-_k32.CloseHandle.argtypes = [wintypes.HANDLE]
-_k32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
-_k32.GetDriveTypeW.restype = wintypes.UINT
-_k32.GetVolumeInformationW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD,
-                                       ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-                                       wintypes.LPWSTR, wintypes.DWORD]
-_k32.GetDiskFreeSpaceExW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_ulonglong),
-                                     ctypes.POINTER(ctypes.c_ulonglong), ctypes.POINTER(ctypes.c_ulonglong)]
+    _k32.CreateFileW.restype = wintypes.HANDLE
+    _k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                 ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    _k32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                              ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    _k32.SetFilePointerEx.argtypes = [wintypes.HANDLE, ctypes.c_longlong,
+                                      ctypes.POINTER(ctypes.c_longlong), wintypes.DWORD]
+    _k32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                     ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    _k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _k32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
+    _k32.GetDriveTypeW.restype = wintypes.UINT
+    _k32.GetVolumeInformationW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD,
+                                           ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                                           wintypes.LPWSTR, wintypes.DWORD]
+    _k32.GetDiskFreeSpaceExW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_ulonglong),
+                                         ctypes.POINTER(ctypes.c_ulonglong), ctypes.POINTER(ctypes.c_ulonglong)]
+else:
+    _k32 = None
+    GENERIC_READ = 0
+    FILE_SHARE_READ = 0
+    FILE_SHARE_WRITE = 0
+    OPEN_EXISTING = 0
+    FILE_FLAG_NO_BUFFERING = 0
+    FILE_FLAG_SEQUENTIAL_SCAN = 0
+    INVALID_HANDLE = None
+    FILE_BEGIN = 0
+    DRIVE_CDROM = 5
+    IOCTL_DISK_GET_LENGTH_INFO = 0
+    ERR_NOT_READY = 21
+    ERR_ACCESS_DENIED = 5
+    ERR_INVALID_PARAMETER = 87
 
 
 def error_text(code):
@@ -91,6 +109,8 @@ def error_text(code):
 def list_optical_drives():
     """Return the drive letters (e.g. ['J']) whose type is CD/DVD/BD-ROM.
     Note: a Windows-mounted ISO also reports as CDROM."""
+    if _k32 is None:
+        return []
     out = []
     import string
     for c in string.ascii_uppercase:
@@ -103,6 +123,8 @@ def list_optical_drives():
 
 
 def _volume_label(letter):
+    if _k32 is None:
+        return ""
     try:
         name = ctypes.create_unicode_buffer(261)
         ok = _k32.GetVolumeInformationW(f"{letter}:\\", name, 260, None, None, None, None, 0)

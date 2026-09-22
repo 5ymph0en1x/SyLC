@@ -423,7 +423,28 @@ def _find_asset(name):
             p = os.path.join(folder, name)
             if os.path.exists(p):
                 return p
-    return None
+# macOS: ensure ctypes find_library finds Homebrew or runtime libmpv quickly
+if sys.platform == 'darwin':
+    import ctypes.util
+    _orig_find_library = ctypes.util.find_library
+    def _mac_find_library(name):
+        search_prefixes = [
+            os.environ.get('SYLC_RUNTIME_DIR', ''),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'runtime'),
+            os.path.join(os.getcwd(), 'runtime'),
+            '/opt/homebrew/lib',
+            '/usr/local/lib',
+        ]
+        for prefix in search_prefixes:
+            if not prefix or not os.path.isdir(prefix):
+                continue
+            for ext in ('.dylib', '.2.dylib', '.1.dylib', '.so'):
+                cand = os.path.join(prefix, f"lib{name}{ext}")
+                if os.path.isfile(cand):
+                    return cand
+        return _orig_find_library(name)
+    ctypes.util.find_library = _mac_find_library
+
 import mpv
 import numpy as np
 from sylc.premium_controls_overlay import PremiumControlsOverlay as ControlsOverlay
@@ -838,10 +859,15 @@ class PlayerWindow(
         self.video_stack = QStackedLayout(self.video_stack_container)
         self.video_stack.setContentsMargins(0, 0, 0, 0)
 
-        self.video_widget = QWidget()
-        self.video_widget.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors)
-        self.video_widget.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
+        if sys.platform == 'darwin':
+            from sylc.macos_mpv_render import MacOSMpvVideoWidget
+            self.video_widget = MacOSMpvVideoWidget()
+        else:
+            self.video_widget = QWidget()
+            self.video_widget.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors)
+            self.video_widget.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
         self.video_widget.setStyleSheet("background-color: black;")
+        self.video_widget.setMouseTracking(True)
 
         self.video_stack.addWidget(self.video_widget)  # Index 0: MPV
         self.video_layout.addWidget(self.video_stack_container, 1)
@@ -1210,6 +1236,9 @@ class PlayerWindow(
         QTimer.singleShot(0, self._update_metrics_overlay_geometry)
         # Fix: Position floating overlays on startup
         QTimer.singleShot(0, self._update_overlays_geometry)
+        # Installing this during layout construction sends Qt events before
+        # controls_overlay and has_media exist. Wait until initialization ends.
+        self.video_widget.installEventFilter(self)
 
         # First launch on an empty models/ directory: name the action once,
         # without a modal. Someone who opened the player to watch a Blu-ray
@@ -1519,8 +1548,11 @@ class PlayerWindow(
         seen = set()
         windows = (getattr(self, 'framepacking_window', None),
                    *(getattr(self, 'eye_windows', None) or ()))
-        for widget in (getattr(self, 'mvc_embedded_widget', None),
-                       *(getattr(w, 'display_widget', None) for w in windows)):
+        candidates = [getattr(self, 'mvc_embedded_widget', None),
+                      *(getattr(w, 'display_widget', None) for w in windows)]
+        if sys.platform == 'darwin':
+            candidates.insert(0, getattr(self, 'video_widget', None))
+        for widget in candidates:
             if widget is None or id(widget) in seen:
                 continue
             seen.add(id(widget))
@@ -2171,6 +2203,8 @@ class PlayerWindow(
         self.player = None
         if _closing_player is not None:
             try:
+                if sys.platform == 'darwin':
+                    self.video_widget.detach_player()
                 try:
                     _closing_player.command('stop')
                     time.sleep(0.150)

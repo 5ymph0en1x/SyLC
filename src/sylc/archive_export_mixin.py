@@ -724,10 +724,13 @@ class ArchiveExportMixin:
             p = desc.get(key)
             if not p:
                 continue
-            try:
-                drv = os.path.splitdrive(os.path.abspath(p))[0].rstrip(':').upper()[:1]
-            except Exception:
-                drv = ''
+            if len(p) >= 2 and p[1] == ':' and p[0].isalpha():
+                drv = p[0].upper()
+            else:
+                try:
+                    drv = os.path.splitdrive(os.path.abspath(p))[0].rstrip(':').upper()[:1]
+                except Exception:
+                    drv = ''
             if drv:
                 drives.add(drv)
         return drives

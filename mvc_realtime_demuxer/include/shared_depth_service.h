@@ -26,6 +26,24 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>   // _dupenv_s/free: SYLC_LOOKAHEAD_DECAY probe (header-inline)
+#ifndef _MSC_VER
+#include <cstring>
+static inline int _dupenv_s(char** pbuffer, size_t* psizeInBytes, const char* varname) {
+    if (!pbuffer || !varname) return -1;
+    const char* val = std::getenv(varname);
+    if (!val) {
+        *pbuffer = nullptr;
+        if (psizeInBytes) *psizeInBytes = 0;
+        return 0;
+    }
+    size_t len = std::strlen(val) + 1;
+    *pbuffer = static_cast<char*>(std::malloc(len));
+    if (!*pbuffer) return -1;
+    std::memcpy(*pbuffer, val, len);
+    if (psizeInBytes) *psizeInBytes = len;
+    return 0;
+}
+#endif
 #include <memory>
 #include <mutex>
 #include <string>

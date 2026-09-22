@@ -1277,6 +1277,8 @@ class Synth3DAdapter(_BaseAdapter):
             raise RuntimeError(
                 '2D->3D depth model not installed — enable the AI once in the '
                 'player (which downloads it) before exporting.')
+        if sys.platform != 'win32':
+            raise RuntimeError('Offscreen D3D11 NativeRenderer export is currently Windows-only. Use standard FFmpeg/VideoToolbox export on macOS.')
         import ctypes
         import mvc_demuxer_cpp
         m = self.metadata()
@@ -1399,8 +1401,9 @@ class Synth3DAdapter(_BaseAdapter):
             self._renderer = None
         if self._hwnd:
             try:
-                import ctypes
-                ctypes.windll.user32.DestroyWindow(self._hwnd)
+                if sys.platform == 'win32':
+                    import ctypes
+                    ctypes.windll.user32.DestroyWindow(self._hwnd)
             except Exception:
                 pass
             self._hwnd = None

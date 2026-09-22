@@ -345,6 +345,22 @@ class ModelDownloadDialog(QDialog):
         writes INTO that directory and the row has to follow it without a second
         mechanism.
         """
+        import sys
+        if sys.platform == 'darwin':
+            try:
+                import onnxruntime as ort
+                providers = ort.get_available_providers()
+                prov = "CoreML / Neural Engine" if "CoreMLExecutionProvider" in providers else "CPU"
+                self._trt_label.setText(f"AI Depth Engine — Apple Silicon ({prov} Active)")
+                self._trt_label.setEnabled(True)
+            except Exception:
+                self._trt_label.setText(
+                    "AI Depth Engine — onnxruntime missing (run: pip install onnxruntime --break-system-packages)")
+                self._trt_label.setEnabled(False)
+            self._trt_button.setVisible(False)
+            self._discard_button.setVisible(False)
+            return
+
         status = trt_runtime.runtime_status(self._ort_dir)
         self._trt_label.setText(f"TensorRT — {status.message}")
         # Greyed only for the two verdicts the user can do nothing about. The

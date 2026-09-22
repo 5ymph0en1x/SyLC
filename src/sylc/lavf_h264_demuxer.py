@@ -84,19 +84,48 @@ _AVUTIL = None
 
 
 def _load():
-    """Load + sign the bundled ffmpeg DLLs once. Raises on failure."""
+    """Load + sign the bundled ffmpeg DLLs/dylibs once. Raises on failure."""
     global _AVFORMAT, _AVCODEC, _AVUTIL
     if _AVFORMAT is not None:
         return
+    import sys
     d = RUNTIME_DIR
-    try:
-        os.add_dll_directory(d)
-    except (OSError, AttributeError):
-        pass
-    avutil = ctypes.CDLL(os.path.join(d, 'avutil-60.dll'))
-    ctypes.CDLL(os.path.join(d, 'swresample-6.dll'))   # avcodec dependency
-    avcodec = ctypes.CDLL(os.path.join(d, 'avcodec-62.dll'))
-    avformat = ctypes.CDLL(os.path.join(d, 'avformat-62.dll'))
+    if sys.platform == 'win32':
+        try:
+            os.add_dll_directory(d)
+        except (OSError, AttributeError):
+            pass
+        avutil = ctypes.CDLL(os.path.join(d, 'avutil-60.dll'))
+        ctypes.CDLL(os.path.join(d, 'swresample-6.dll'))   # avcodec dependency
+        avcodec = ctypes.CDLL(os.path.join(d, 'avcodec-62.dll'))
+        avformat = ctypes.CDLL(os.path.join(d, 'avformat-62.dll'))
+    elif sys.platform == 'darwin':
+        # On macOS, load Homebrew / runtime ffmpeg dylibs
+        import ctypes.util
+        def _load_mac_lib(name):
+            for prefix in (d, '/opt/homebrew/lib', '/usr/local/lib'):
+                for ext in ('.dylib', ''):
+                    p = os.path.join(prefix, f"lib{name}{ext}")
+                    if os.path.isfile(p):
+                        try:
+                            return ctypes.CDLL(p)
+                        except Exception:
+                            pass
+            found = ctypes.util.find_library(name)
+            if found:
+                return ctypes.CDLL(found)
+            raise OSError(f"Could not find lib{name}.dylib on macOS")
+
+        avutil = _load_mac_lib('avutil')
+        _load_mac_lib('swresample')
+        avcodec = _load_mac_lib('avcodec')
+        avformat = _load_mac_lib('avformat')
+    else:
+        # Linux
+        avutil = ctypes.CDLL('libavutil.so.60')
+        ctypes.CDLL('libswresample.so.6')
+        avcodec = ctypes.CDLL('libavcodec.so.62')
+        avformat = ctypes.CDLL('libavformat.so.62')
 
     avformat.avformat_open_input.argtypes = [ctypes.POINTER(ctypes.c_void_p),
                                              ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p]

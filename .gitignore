@@ -1,10 +1,13 @@
 # Python
+.venv-release-macos/
 __pycache__/
 *.pyc
 *.pyo
 
 # Build outputs
 /build/
+build_*/
+build_macos/
 build_py314/
 build_nuitka/
 build_onefile/
@@ -13,12 +16,19 @@ _build_release_v530/
 dist/
 *.manifest
 *.log
+*.so
+*.dylib
+*.pyd
 
-# Large runtime binaries (~100 MB each) — must be present locally to run,
-# but are not committed (fetch/copy them into runtime/ yourself).
+# Large runtime binaries (~100 MB each) and locally compiled binaries
 runtime/mpv-2.dll
 runtime/avcodec-62.dll
 runtime/avfilter-11.dll
+runtime/libedge264.*
+runtime/mvc_demuxer_cpp*
+edge264/libedge264.*
+mvc_demuxer_cpp*.so
+mvc_demuxer_cpp*.pyd
 
 # Runtime / sensitive / transient
 sylc_license.json
@@ -41,3 +51,9 @@ Thumbs.db
 models_dev_nc/matanyone2_runtime/
 models_dev_nc/matanyone2/*.pth
 tools_dev/_vendor/MatAnyone2/
+
+# Depth model weights & engine caches
+models/*.onnx
+models/*.engine
+models/*.bin
+ort_tensorrt/

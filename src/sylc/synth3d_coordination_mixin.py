@@ -241,18 +241,38 @@ class Synth3DCoordinationMixin:
         downloading 3.67 GB of weights. Resolved in the same order the support
         check applies them so the two can never disagree.
         """
-        if not NATIVE_RENDER_AVAILABLE:
-            return 'renderer'
-        model, _side = self._synth3d_model_path()
-        if not os.path.exists(model):
-            return 'models'
-        if not os.path.exists(os.path.join(self._synth3d_ort_dir(model),
-                                           'onnxruntime.dll')):
-            return 'runtime'
-        return None
+        if NATIVE_RENDER_AVAILABLE:
+            model, _side = self._synth3d_model_path()
+            if not os.path.exists(model):
+                return 'models'
+            if not os.path.exists(os.path.join(self._synth3d_ort_dir(model),
+                                               'onnxruntime.dll')):
+                return 'runtime'
+            return None
+
+        if sys.platform == 'darwin':
+            from sylc.macos_mpv_render import MacOSMpvVideoWidget
+            vw = getattr(self, 'video_widget', None)
+            if vw is None or not isinstance(vw, MacOSMpvVideoWidget):
+                return 'renderer'
+            model, _side = self._synth3d_model_path()
+            if not os.path.exists(model):
+                return 'models'
+            try:
+                import onnxruntime  # noqa: F401
+            except Exception:
+                return 'runtime'
+            return None
+
+        return 'renderer'
 
     def _synth3d_depth_preset(self):
         """Name of the active depth preset (persisted; default Quality)."""
+        # CoreML compiling Base/756 repeatedly caused severe system pressure on
+        # Apple Silicon. Keep the macOS preview on the bounded Small/518 graph
+        # until the GPU path has a persistent session/cache and memory budget.
+        if sys.platform == 'darwin':
+            return 'Performance'
         return synth3d_depth_preset_stored()
 
     def _synth3d_set_depth_preset(self, name):
@@ -338,6 +358,16 @@ class Synth3DCoordinationMixin:
         that one node -- 342 ms per map versus 55 ms for the fixed-shape
         re-export, measured.
         """
+        if sys.platform == 'darwin':
+            entry = synth3d_depth_preset_entry('Performance')
+            found = synth3d_find_model(entry[1]) if entry else None
+            if found:
+                return found, entry[2]
+            # Return the expected Small/518 path so the support gate reports
+            # models missing instead of falling through to the unsafe Base graph.
+            return os.path.join(_synth3d_models_dirs()[0],
+                                'da3_small_518.onnx'), 518
+
         entry = synth3d_depth_preset_entry(self._synth3d_depth_preset())
         if entry is not None:
             found = synth3d_find_model(entry[1])
@@ -445,9 +475,13 @@ class Synth3DCoordinationMixin:
         return os.path.join(roots[0], 'ort_tensorrt')
 
     def _synth3d_eligible(self):
-        return ((getattr(self, 'mvc_mode_active', False)
-                 or getattr(self, '_hevc_mode_active', False))
-                and not self._content_is_3d() and bool(self.has_media))
+        if getattr(self, 'mvc_mode_active', False) or getattr(self, '_hevc_mode_active', False):
+            return not self._content_is_3d() and bool(self.has_media)
+        if sys.platform == 'darwin':
+            return (bool(getattr(self, 'has_media', False))
+                    and not self._content_is_3d()
+                    and getattr(self, 'video_widget', None) is not None)
+        return False
 
     def toggle_synth3d(self, enabled, remember=True):
         if enabled and not (self._synth3d_supported() and self._synth3d_eligible()):
@@ -495,6 +529,11 @@ class Synth3DCoordinationMixin:
         self.is_3d_enabled = bool(enabled)
         self._push_synth3d_to_widgets()
         if enabled:
+            if sys.platform == 'darwin':
+                vw = getattr(self, 'video_widget', None)
+                if vw is not None and hasattr(vw, 'start_synth3d'):
+                    model_path, side = self._synth3d_model_path()
+                    vw.start_synth3d(model_path, side)
             self._synth3d_restore_mono_source()
             start_matting = getattr(self, '_synth3d_start_human_matting', None)
             if start_matting is not None:
@@ -506,7 +545,7 @@ class Synth3DCoordinationMixin:
             # visually means MultiView (combo index 0); persisting a previous
             # SBS/TAB/Dual/Glasses choice is also legitimate and should be honoured.
             presentation = getattr(self, 'current_stereo_mode', 'auto')
-            if presentation not in ('mvc', 'sbs', 'tab', 'dual', 'glasses'):
+            if presentation not in ('mvc', 'sbs', 'tab', 'dual', 'glasses', 'anaglyph'):
                 presentation = 'mvc'
                 self.current_stereo_mode = presentation
             self.configure_3d_output(True, presentation)
@@ -514,6 +553,10 @@ class Synth3DCoordinationMixin:
             # single early log said nothing about a failure hours into playback.
             self._synth3d_start_poll()
         else:
+            if sys.platform == 'darwin':
+                vw = getattr(self, 'video_widget', None)
+                if vw is not None and hasattr(vw, 'stop_synth3d'):
+                    vw.stop_synth3d()
             # Attribute propagation alone reaches NativeRenderer only with the
             # next decoded frame. A paused/stopped source may never deliver it,
             # so detach every live surface synchronously (the native registry
@@ -880,6 +923,19 @@ class Synth3DCoordinationMixin:
             w.synth3d_crop_top = crop_top
             w.synth3d_crop_bottom = crop_bottom
 
+        if sys.platform == 'darwin':
+            vw = getattr(self, 'video_widget', None)
+            if vw is not None:
+                vw.synth3d_enabled = self._synth3d_active
+                vw.synth3d_strength = self._synth3d_strength
+                vw.synth3d_convergence = self._synth3d_convergence
+                vw.synth3d_depth_view = self._synth3d_depth_view
+                vw.synth3d_model_path = model_path
+                vw.synth3d_side = side
+                vw.stereo_mode = getattr(self, 'current_stereo_mode', 'mvc')
+                if hasattr(vw, 'update'):
+                    vw.update()
+
     def _synth3d_disable_renderers_now(self):
         """Detach live native surfaces without waiting for another video frame."""
         for w in self._display_widgets():
@@ -1085,11 +1141,14 @@ class Synth3DCoordinationMixin:
         the active 3D presentation may be the framepack or an eye-window widget."""
         statuses = []
         for w in self._display_widgets():
-            r = getattr(w, '_r', None)
-            if r is None:
+            target = getattr(w, '_r', None) or w
+            status_fn = getattr(target, 'synth3d_status', None)
+            if status_fn is None:
                 continue
             try:
-                statuses.append(r.synth3d_status())
+                st = status_fn()
+                if st:
+                    statuses.append(st)
             except (AttributeError, TypeError, RuntimeError):
                 continue
         if not statuses:
@@ -1374,18 +1433,29 @@ class Synth3DCoordinationMixin:
             # install, not of the packs.
             reason = self._synth3d_unsupported_reason()
             if reason == 'runtime':
-                act.setToolTip(
-                    "onnxruntime.dll is missing from this install — "
-                    "downloading depth models will not enable this")
+                if sys.platform == 'darwin':
+                    act.setToolTip(
+                        "onnxruntime is not installed — run: pip install onnxruntime --break-system-packages")
+                else:
+                    act.setToolTip(
+                        "onnxruntime.dll is missing from this install — "
+                        "downloading depth models will not enable this")
             elif reason == 'renderer':
-                act.setToolTip(
-                    "The native renderer is not available in this build")
+                if sys.platform == 'darwin':
+                    act.setToolTip(
+                        "OpenGL render widget is unavailable")
+                else:
+                    act.setToolTip(
+                        "The native renderer is not available in this build")
             else:
                 act.setToolTip(
                     "Depth models are not installed — use “Depth models” at "
                     "the top of this menu to download them")
         elif not eligible and not self._synth3d_active:
-            act.setToolTip("Available on 2D video decoded by the native pipeline")
+            if self._content_is_3d():
+                act.setToolTip("This video is already in 3D format — 2D->3D synthesis only applies to 2D videos")
+            else:
+                act.setToolTip("Available on 2D video decoded by the native pipeline")
         else:
             act.setToolTip("Synthesize stereo 3D from this 2D video")
         act.blockSignals(False)
@@ -1429,12 +1499,16 @@ class Synth3DCoordinationMixin:
         active_depth = self._synth3d_depth_preset()
         for name, action in ov.synth3d_depth_preset_actions.items():
             available = synth3d_depth_preset_available(name)
+            if sys.platform == 'darwin' and name != 'Performance':
+                available = False
             action.blockSignals(True)
             action.setChecked(name == active_depth)
             action.setEnabled(available)
             action.setToolTip(
-                self._synth3d_depth_preset_tooltip(name) if available
-                else "model file not installed")
+                ("Disabled on macOS while CoreML memory use is being stabilized"
+                 if sys.platform == 'darwin' and name != 'Performance'
+                 else self._synth3d_depth_preset_tooltip(name) if available
+                 else "model file not installed"))
             action.blockSignals(False)
         # The two submenu rows and the gateway row state the current
         # configuration on their own faces, so it reads without opening
@@ -1447,16 +1521,24 @@ class Synth3DCoordinationMixin:
                 " + ".join(packs) + " installed" if packs else "none installed",
                 bool(packs))
         st = None
-        for w in self._display_widgets():
-            r = getattr(w, '_r', None)
-            if r is None:
-                continue
-            try:
-                st = r.synth3d_status()
-            except (AttributeError, TypeError, RuntimeError):
-                st = None
-            if st is not None:
-                break
+        if sys.platform == 'darwin':
+            vw = getattr(self, 'video_widget', None)
+            if vw is not None and hasattr(vw, 'synth3d_status'):
+                try:
+                    st = vw.synth3d_status()
+                except Exception:
+                    st = None
+        if st is None:
+            for w in self._display_widgets():
+                r = getattr(w, '_r', None)
+                if r is None:
+                    continue
+                try:
+                    st = r.synth3d_status()
+                except (AttributeError, TypeError, RuntimeError):
+                    st = None
+                if st is not None:
+                    break
         self._update_synth3d_status_label(st)
 
     @staticmethod

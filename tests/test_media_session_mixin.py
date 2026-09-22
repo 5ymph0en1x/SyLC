@@ -188,3 +188,47 @@ def test_release_mpv_core_detaches_before_deferred_termination():
     assert player._mpv_dying is core
     assert scheduled[0][0] == session_module._MPV_RELEASE_SETTLE_MS
 
+
+def test_mpv_platform_config_darwin_vs_win32():
+    from unittest.mock import patch, MagicMock
+
+    captured_configs = []
+
+    def mock_mpv_init(**kwargs):
+        captured_configs.append(kwargs)
+        mock_obj = MagicMock()
+        mock_obj.__getitem__.return_value = 'info'
+        return mock_obj
+
+    mock_mpv_module = MagicMock()
+    mock_mpv_module.MPV = mock_mpv_init
+
+    player = _Harness()
+    player.player = None
+    player.video_widget = MagicMock()
+    player.video_widget.winId.return_value = 99999
+    player._vu_timer = MagicMock()
+    player._drain_dying_core = MagicMock()
+
+    with patch.object(session_module, 'MPV_MODULE', mock_mpv_module):
+        with patch.object(session_module.sys, 'platform', 'darwin'):
+            player._setup_mpv_player()
+            assert len(captured_configs) == 1
+            cfg_darwin = captured_configs[0]
+            assert cfg_darwin['hwdec'] == 'videotoolbox'
+            assert cfg_darwin['video-sync'] == 'audio'
+            assert cfg_darwin['interpolation'] == 'no'
+            assert cfg_darwin['scale'] == 'spline36'
+
+        player.player = None
+        captured_configs.clear()
+        with patch.object(session_module.sys, 'platform', 'win32'):
+            player._setup_mpv_player()
+            assert len(captured_configs) == 1
+            cfg_win = captured_configs[0]
+            assert cfg_win['hwdec'] == 'auto-copy'
+            assert cfg_win['video-sync'] == 'display-resample'
+            assert cfg_win['interpolation'] == 'yes'
+            assert cfg_win['scale'] == 'ewa_lanczossharp'
+
+

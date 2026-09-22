@@ -214,11 +214,18 @@ class LoadingOverlay(QWidget):
         self.show()
         self.raise_()
 
-    def hide_loading(self):
-        """Hide loading overlay with fade-out animation."""
+    def hide_loading(self, immediate: bool = False):
+        """Hide loading overlay with fade-out animation (or immediately)."""
+        self._progress_mode = False
+        if immediate:
+            self._fade_opacity = 0.0
+            self._fade_timer.stop()
+            self._anim_timer.stop()
+            self._is_showing = False
+            self.hide()
+            return
         self._fade_direction = -1
         self._fade_timer.start(16)
-        self._progress_mode = False
 
     def set_status(self, text: str):
         """Update the status text."""

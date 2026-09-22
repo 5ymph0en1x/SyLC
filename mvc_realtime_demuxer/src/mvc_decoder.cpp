@@ -15,6 +15,8 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <dlfcn.h>
 #endif
 
 namespace mvc_demux {
@@ -24,6 +26,8 @@ namespace {
 struct Edge264Api {
 #ifdef _WIN32
     HMODULE module = nullptr;
+#else
+    void* module = nullptr;
 #endif
     decltype(&edge264_alloc) alloc = nullptr;
     decltype(&edge264_flush) flush = nullptr;
@@ -95,6 +99,18 @@ bool loadProc(HMODULE module, const char* name, T& destination,
     destination = reinterpret_cast<T>(GetProcAddress(module, name));
     if (!destination) {
         diagnostic = std::string("edge264.dll: export manquant: ") + name;
+        return false;
+    }
+    return true;
+}
+#else
+template <typename T>
+bool loadProc(void* module, const char* name, T& destination,
+              std::string& diagnostic) {
+    destination = reinterpret_cast<T>(dlsym(module, name));
+    if (!destination) {
+        const char* err = dlerror();
+        diagnostic = std::string("libedge264: export missing: ") + name + (err ? (" (" + std::string(err) + ")") : "");
         return false;
     }
     return true;
@@ -198,10 +214,91 @@ bool loadEdge264(std::string* diagnostic) {
     if (diagnostic) *diagnostic = g_edge264.diagnostic;
     return true;
 #else
-    g_edge264.diagnostic =
-        "Le chargement dynamique edge264 n'est implemente que sous Windows.";
+    std::vector<std::string> candidates;
+
+    const char* env_path = std::getenv("SYLC_EDGE264_DLL");
+    if (env_path && *env_path) {
+        candidates.emplace_back(env_path);
+    }
+    const char* env_dylib = std::getenv("SYLC_EDGE264_DYLIB");
+    if (env_dylib && *env_dylib) {
+        candidates.emplace_back(env_dylib);
+    }
+
+    // Try relative to module
+    Dl_info info;
+    if (dladdr(reinterpret_cast<void*>(&g_edge264_module_anchor), &info) && info.dli_fname) {
+        std::string mod_path = info.dli_fname;
+        size_t pos = mod_path.find_last_of('/');
+        if (pos != std::string::npos) {
+            std::string dir = mod_path.substr(0, pos);
+            candidates.push_back(dir + "/libedge264.dylib");
+            candidates.push_back(dir + "/edge264.dylib");
+            candidates.push_back(dir + "/../runtime/libedge264.dylib");
+            candidates.push_back(dir + "/../edge264/libedge264.dylib");
+        }
+    }
+
+    candidates.emplace_back("libedge264.dylib");
+    candidates.emplace_back("runtime/libedge264.dylib");
+    candidates.emplace_back("./libedge264.dylib");
+    candidates.emplace_back("./runtime/libedge264.dylib");
+    candidates.emplace_back("/opt/homebrew/lib/libedge264.dylib");
+    candidates.emplace_back("/usr/local/lib/libedge264.dylib");
+
+    std::string last_error;
+    std::string loaded_path;
+    for (const auto& candidate : candidates) {
+        void* handle = dlopen(candidate.c_str(), RTLD_NOW | RTLD_GLOBAL);
+        if (handle) {
+            g_edge264.module = handle;
+            loaded_path = candidate;
+            break;
+        }
+        const char* err = dlerror();
+        if (err) last_error = err;
+    }
+
+    if (!g_edge264.module) {
+        g_edge264.diagnostic =
+            "Impossible de charger libedge264.dylib (" + last_error +
+            "). Placez libedge264.dylib a cote de "
+            "mvc_demuxer_cpp.so ou dans runtime/, ou definissez SYLC_EDGE264_DYLIB.";
+        if (diagnostic) *diagnostic = g_edge264.diagnostic;
+        return false;
+    }
+
+    bool ok =
+        loadProc(g_edge264.module, "edge264_alloc", g_edge264.alloc,
+                 g_edge264.diagnostic) &&
+        loadProc(g_edge264.module, "edge264_flush", g_edge264.flush,
+                 g_edge264.diagnostic) &&
+        loadProc(g_edge264.module, "edge264_free", g_edge264.free_decoder,
+                 g_edge264.diagnostic) &&
+        loadProc(g_edge264.module, "edge264_decode_NAL", g_edge264.decode_nal,
+                 g_edge264.diagnostic) &&
+        loadProc(g_edge264.module, "edge264_get_frame", g_edge264.get_frame,
+                 g_edge264.diagnostic) &&
+        loadProc(g_edge264.module, "edge264_return_frame",
+                 g_edge264.return_frame, g_edge264.diagnostic) &&
+        loadProc(g_edge264.module, "edge264_bump_frames",
+                 g_edge264.bump_frames, g_edge264.diagnostic) &&
+        loadProc(g_edge264.module, "edge264_get_busy_tasks",
+                 g_edge264.get_busy_tasks, g_edge264.diagnostic);
+    if (!ok) {
+        const std::string missing_export = g_edge264.diagnostic;
+        dlclose(g_edge264.module);
+        g_edge264 = {};
+        g_edge264.diagnostic = missing_export;
+        if (diagnostic) *diagnostic = missing_export;
+        return false;
+    }
+
+    std::ostringstream status;
+    status << "edge264 charge dynamiquement depuis " << loaded_path;
+    g_edge264.diagnostic = status.str();
     if (diagnostic) *diagnostic = g_edge264.diagnostic;
-    return false;
+    return true;
 #endif
 }
 

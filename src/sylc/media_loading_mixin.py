@@ -2,6 +2,7 @@
 
 import logging
 import os
+import sys
 import time
 import traceback
 
@@ -38,12 +39,12 @@ class MediaLoadingMixin:
         text = str(path or '').strip()
         if not text:
             return ''
-        normalized = os.path.normpath(text)
+        normalized = os.path.normpath(text.replace('\\', '/'))
         leaf = os.path.basename(normalized)
         if leaf.lower() == 'bdmv':
             leaf = os.path.basename(os.path.dirname(normalized))
         if not leaf:
-            drive = os.path.splitdrive(normalized)[0]
+            drive = os.path.splitdrive(text)[0]
             leaf = f"Blu-ray Disc ({drive})" if drive else normalized
         stem, extension = os.path.splitext(leaf)
         return stem if extension and stem else leaf
@@ -899,7 +900,7 @@ class MediaLoadingMixin:
             self.has_media = False
             self._abort_media_load(owner, f"Playback initialization failed: {exc}")
             try:
-                self.loading_overlay.hide_loading()
+                self.loading_overlay.hide_loading(immediate=True)
             except Exception:
                 pass
         finally:
@@ -1001,7 +1002,7 @@ class MediaLoadingMixin:
             if stereo_mode == 'mvc':
                 # V7b CRITICAL FIX: Force decoder to start at 0s, not at current MPV time
                 # This prevents the "21.955s drift" bug where decoder starts at wrong timestamp
-                if MVC_SUPPORT_AVAILABLE:
+                if MVC_SUPPORT_AVAILABLE and NATIVE_RENDER_AVAILABLE:
                     try:
                         self._start_mvc_decoder(start_time=0.0)
                     except Exception as e:
@@ -1010,11 +1011,10 @@ class MediaLoadingMixin:
                         self._fallback_from_edge264(reason=f"MVC decoder init failed: {e}")
                         return
                 else:
-                    logger.warning("[MVC] MVC content detected but decoder support is unavailable; using mpv fallback.")
+                    logger.warning("[MVC] MVC content detected but native decoder support is unavailable; using mpv fallback.")
                     self._fallback_to_mpv_mvc()
-                # V7b CRITICAL FIX: Framepacking window should ALWAYS use framepack mode
-                # It's specifically designed for 1920x2205 framepack output!
-                if self.framepacking_window:
+                # Framepacking window should ALWAYS use framepack mode on native platforms (Windows)
+                if self.framepacking_window and NATIVE_RENDER_AVAILABLE and sys.platform == 'win32':
                     self.framepacking_window.display_widget.set_stereo_mode('framepack')
                 # Reassure the user: edge264 recognised & adapted to this 3D stream.
                 self.controls_overlay.set_format_badge(self._format_badge_label())

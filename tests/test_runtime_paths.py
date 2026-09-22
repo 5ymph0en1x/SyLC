@@ -16,6 +16,9 @@ def test_source_checkout_resolves_project_runtime_and_assets():
 
 
 def test_required_runtime_markers_are_grouped_outside_repository_root():
+    if sys.platform != 'win32':
+        import pytest
+        pytest.skip("Windows-specific DLL layout test")
     runtime = Path(runtime_paths.RUNTIME_DIR)
     required = {
         'mpv-2.dll', 'edge264.dll', 'ffprobe.exe',

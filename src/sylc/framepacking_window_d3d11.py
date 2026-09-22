@@ -11,8 +11,7 @@ Key differences from OpenGL version:
 - Same API as the OpenGL version for drop-in replacement
 """
 
-import ctypes
-from ctypes import wintypes, byref
+import sys
 import logging
 
 from PySide6.QtWidgets import QMainWindow
@@ -32,8 +31,15 @@ def apply_borderless_dwm(hwnd, enable):
 
     Returns the border-colour call's HRESULT (0 = S_OK). Harmless on Windows 10
     / pre-22000 (unsupported attribute → non-zero HRESULT, ignored)."""
+    if sys.platform != 'win32':
+        return 0
     try:
-        dwmapi = ctypes.windll.dwmapi
+        import ctypes
+        from ctypes import wintypes, byref
+        dwmapi = getattr(ctypes, 'windll', None)
+        if not dwmapi or not hasattr(dwmapi, 'dwmapi'):
+            return 0
+        dwmapi = dwmapi.dwmapi
         dwmapi.DwmSetWindowAttribute.argtypes = [
             wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
         dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long  # HRESULT
@@ -107,11 +113,20 @@ class _BorderlessOutputWindow(QMainWindow):
             self.enter_fake_fullscreen()
 
     def enter_fake_fullscreen(self):
-        """Enter fullscreen using Win32 API (preserves HDR with D3D11)."""
+        """Enter fullscreen using Win32 API (preserves HDR with D3D11) or native Qt on non-Windows."""
         if self._is_fake_fullscreen:
             return
 
+        if sys.platform != 'win32':
+            self.showFullScreen()
+            self._is_fake_fullscreen = True
+            self.is_fullscreen = True
+            self.visibilityChanged.emit(True)
+            return
+
         try:
+            import ctypes
+            from ctypes import wintypes, byref
             user32 = ctypes.windll.user32
             dwmapi = ctypes.windll.dwmapi
 
@@ -194,7 +209,15 @@ class _BorderlessOutputWindow(QMainWindow):
         if not self._is_fake_fullscreen:
             return
 
+        if sys.platform != 'win32':
+            self.showNormal()
+            self._is_fake_fullscreen = False
+            self.is_fullscreen = False
+            self.visibilityChanged.emit(False)
+            return
+
         try:
+            import ctypes
             user32 = ctypes.windll.user32
             dwmapi = ctypes.windll.dwmapi
             GWL_STYLE = -16

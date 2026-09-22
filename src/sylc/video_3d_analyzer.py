@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import re
 from functools import lru_cache
 
 from sylc.stereo_eye_order import (
@@ -48,6 +49,13 @@ def _resolve_external_tool(executable_name):
         resolved = shutil.which(candidate)
         if resolved:
             return resolved
+
+    # PRIORITY 3: Common platform search paths (e.g. Homebrew on macOS)
+    if sys.platform == 'darwin':
+        for prefix in ('/opt/homebrew/bin', '/usr/local/bin'):
+            p = os.path.join(prefix, executable_name)
+            if os.path.isfile(p):
+                return p
 
     return None
 
@@ -216,10 +224,11 @@ def _apply_filename_3d_hint(result, file_path):
     never win for the very filenames it was meant to recognize.
     """
     filename = os.path.basename(str(file_path)).lower()
-    if 'tab' in filename or 'htab' in filename:
+    # Use word/token boundaries so words like 'tablet' do not match 'tab'
+    if re.search(r'(?i)[._\-\s](h-?tab|tab)[._\-\s]', filename) or re.search(r'(?i)\b(h-?tab|tab)\b', filename):
         result['is_3d'] = True
         result['stereo_mode'] = 'tab'
-    elif 'sbs' in filename or 'hsbs' in filename or '3d' in filename:
+    elif re.search(r'(?i)[._\-\s](h-?sbs|sbs)[._\-\s]', filename) or re.search(r'(?i)\b(h-?sbs|sbs)\b', filename) or '3d' in filename:
         result['is_3d'] = True
         result['stereo_mode'] = 'sbs'
     return result

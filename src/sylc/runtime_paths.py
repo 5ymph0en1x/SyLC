@@ -22,7 +22,7 @@ def _unique_existing(paths):
 
 
 def _application_roots():
-    candidates = [os.environ.get('SYLC_PROJECT_ROOT')]
+    candidates = [os.environ.get('SYLC_PROJECT_ROOT'), getattr(sys, '_MEIPASS', None)]
     try:
         import __compiled__
         candidates.append(getattr(__compiled__, 'containing_dir', None))
@@ -45,9 +45,13 @@ PROJECT_ROOT = next(iter(_application_roots()), os.getcwd())
 def _contains_runtime_marker(directory):
     return any((
         os.path.isfile(os.path.join(directory, 'edge264.dll')),
+        os.path.isfile(os.path.join(directory, 'libedge264.dylib')),
+        os.path.isfile(os.path.join(directory, 'libedge264.so')),
         os.path.isfile(os.path.join(directory, 'mpv-2.dll')),
+        os.path.isfile(os.path.join(directory, 'libmpv.dylib')),
         os.path.isfile(os.path.join(directory, 'ffprobe.exe')),
-        bool(glob.glob(os.path.join(directory, 'mvc_demuxer_cpp*.pyd'))),
+        os.path.isfile(os.path.join(directory, 'ffprobe')),
+        bool(glob.glob(os.path.join(directory, 'mvc_demuxer_cpp*.*'))),
     ))
 
 
@@ -100,6 +104,13 @@ def configure_runtime_environment():
             _DLL_HANDLES.append(os.add_dll_directory(RUNTIME_DIR))
         except OSError:
             pass
+    elif sys.platform == 'darwin':
+        # Add Homebrew and runtime library dirs to DYLD_FALLBACK_LIBRARY_PATH if needed
+        extra_mac_lib_paths = [RUNTIME_DIR, '/opt/homebrew/lib', '/usr/local/lib']
+        current_dyld = os.environ.get('DYLD_FALLBACK_LIBRARY_PATH', '')
+        merged_dyld = os.pathsep.join(p for p in extra_mac_lib_paths + [current_dyld] if p and os.path.isdir(p))
+        if merged_dyld:
+            os.environ['DYLD_FALLBACK_LIBRARY_PATH'] = merged_dyld
     return RUNTIME_DIR
 
 

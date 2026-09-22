@@ -108,6 +108,8 @@ def query_sdr_white_level():
     """Windows SDR white level as an scRGB multiplier (1.0 = SDR display, ~2.0-3.5
     for HDR). Extracted from the Qt widget so the native renderer path is
     self-sufficient for HDR brightness (no dependency on the Qt widget)."""
+    if sys.platform != 'win32':
+        return 1.0
     import ctypes
     from ctypes import Structure, c_uint32, c_int32, byref, sizeof
     try:

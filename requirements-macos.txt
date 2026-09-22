@@ -1,0 +1,20 @@
+# SyLC 3D Player - Requirements for macOS (Apple Silicon arm64 & x86_64)
+
+# Core UI Framework
+PySide6>=6.6.0
+
+# Video playback backend (requires: brew install mpv)
+python-mpv>=1.0.0
+
+# Numerical computing (YUV processing)
+numpy>=1.24.0
+
+# Image processing
+opencv-python>=4.8.0
+
+# 2D->3D AI Depth Synthesis (Apple Silicon CoreML & CPU)
+# Install via: pip install onnxruntime --break-system-packages
+onnxruntime>=1.20.0
+
+# C++ bindings for mvc_demuxer_cpp
+pybind11>=2.11.0

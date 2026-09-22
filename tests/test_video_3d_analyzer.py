@@ -51,6 +51,19 @@ def test_fractional_frame_rate_parser_is_bounded_and_exact():
     assert analyzer._parse_ffprobe_fps('not-a-rate') is None
 
 
+def test_filename_hint_tablet_not_matched_as_tab():
+    res = {}
+    analyzer._apply_filename_3d_hint(res, 'Interstellar_3D_1080p_SDR_HSBS_tablet.mkv')
+    assert res['is_3d'] is True
+    assert res['stereo_mode'] == 'sbs'
+
+    res_tab = {}
+    analyzer._apply_filename_3d_hint(res_tab, 'Avatar.3D.HTAB.1080p.mkv')
+    assert res_tab['is_3d'] is True
+    assert res_tab['stereo_mode'] == 'tab'
+
+
+
 if __name__ == '__main__':
     tests = [
         value for name, value in sorted(globals().items())

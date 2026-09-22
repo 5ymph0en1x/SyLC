@@ -29,7 +29,7 @@ for _candidate in reversed((_ROOT / "build_py314" / "python" / "Release",
 _DLL_HANDLES = [
     os.add_dll_directory(str(path))
     for path in (_ROOT / "runtime", _ROOT / "ort_tensorrt")
-    if path.is_dir()
+    if path.is_dir() and hasattr(os, "add_dll_directory")
 ]
 
 native = pytest.importorskip("mvc_demuxer_cpp")

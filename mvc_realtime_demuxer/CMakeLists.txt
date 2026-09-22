@@ -18,6 +18,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_definitions(-D_FILE_OFFSET_BITS=64)
 add_definitions(-D_LARGEFILE_SOURCE)
 
+if(APPLE)
+    list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew" "/usr/local")
+endif()
+
 # Compiler options with aggressive optimizations for maximum performance
 if(MSVC)
     add_compile_options(/W4)
@@ -48,7 +52,7 @@ if(DEFINED PYTHON_EXECUTABLE AND NOT DEFINED Python_EXECUTABLE)
 endif()
 find_package(Python COMPONENTS Interpreter Development REQUIRED)
 
-# First try CONFIG mode (vcpkg provides this)
+# First try CONFIG mode (vcpkg or Homebrew provides this)
 find_package(pybind11 CONFIG QUIET)
 
 if(NOT pybind11_FOUND)
@@ -72,22 +76,21 @@ if(NOT pybind11_FOUND)
             message(FATAL_ERROR
                 "pybind11 not found!\n"
                 "Please install pybind11 using one of these methods:\n"
-                "  1. vcpkg (recommended for Windows):\n"
-                "     vcpkg install pybind11:x64-windows\n"
-                "  2. Python pip:\n"
-                "     python -m pip install pybind11\n"
-                "  3. Set pybind11_DIR to the pybind11 cmake directory"
+                "  1. macOS (Homebrew): brew install pybind11\n"
+                "  2. Windows (vcpkg): vcpkg install pybind11:x64-windows\n"
+                "  3. Python pip: python -m pip install pybind11\n"
+                "  4. Set pybind11_DIR to the pybind11 cmake directory"
             )
         endif()
     else()
         message(FATAL_ERROR
             "pybind11 not found and Python not available!\n"
             "Please install pybind11 using one of these methods:\n"
-            "  1. vcpkg (recommended for Windows):\n"
-            "     vcpkg install pybind11:x64-windows\n"
-            "  2. Install Python and then:\n"
+            "  1. macOS (Homebrew): brew install pybind11\n"
+            "  2. Windows (vcpkg): vcpkg install pybind11:x64-windows\n"
+            "  3. Install Python and then:\n"
             "     python -m pip install pybind11\n"
-            "  3. Set pybind11_DIR to the pybind11 cmake directory"
+            "  4. Set pybind11_DIR to the pybind11 cmake directory"
         )
     endif()
 endif()
@@ -142,7 +145,6 @@ if(VCPKG_DETECTED)
         string(REGEX REPLACE "\\\\scripts\\\\buildsystems\\\\vcpkg.cmake$" "" VCPKG_ROOT "${CMAKE_TOOLCHAIN_FILE}")
         string(REPLACE "\\" "/" VCPKG_ROOT "${VCPKG_ROOT}")
         message(STATUS "VCPKG_ROOT extracted from CMAKE_TOOLCHAIN_FILE: ${VCPKG_ROOT}")
-
     endif()
 
     # Determine the triplet
@@ -323,17 +325,16 @@ if(NOT HAVE_LIBMATROSKA)
             set(HAVE_LIBMATROSKA ON)
         else()
             message(STATUS "find_package found Matroska but no usable libraries/includes, trying manual detection...")
-            # V7b+++++++ FIX: Fall through to manual detection even when find_package "found" packages
             set(Matroska_FOUND FALSE)
         endif()
     endif()
 
-    # V7b+++++++ FIX: Try manual detection if still not configured
     if(NOT HAVE_LIBMATROSKA)
         # Try manual detection
         find_path(MATROSKA_INCLUDE_DIR
             NAMES matroska/KaxSegment.h
             PATHS
+                /opt/homebrew/include
                 /usr/include
                 /usr/local/include
                 C:/Program Files/Matroska/include
@@ -344,6 +345,7 @@ if(NOT HAVE_LIBMATROSKA)
         find_path(EBML_INCLUDE_DIR
             NAMES ebml/EbmlHead.h
             PATHS
+                /opt/homebrew/include
                 /usr/include
                 /usr/local/include
                 C:/Program Files/EBML/include
@@ -354,6 +356,7 @@ if(NOT HAVE_LIBMATROSKA)
         find_library(MATROSKA_LIBRARY
             NAMES matroska libmatroska
             PATHS
+                /opt/homebrew/lib
                 /usr/lib
                 /usr/local/lib
                 C:/Program Files/Matroska/lib
@@ -364,6 +367,7 @@ if(NOT HAVE_LIBMATROSKA)
         find_library(EBML_LIBRARY
             NAMES ebml libebml
             PATHS
+                /opt/homebrew/lib
                 /usr/lib
                 /usr/local/lib
                 C:/Program Files/EBML/lib
@@ -379,6 +383,7 @@ if(NOT HAVE_LIBMATROSKA)
         else()
             message(WARNING "libmatroska not found: Building with limited MVC support")
             message(WARNING "  To enable full MVC support, install libmatroska and libebml:")
+            message(WARNING "    macOS (Homebrew): brew install libmatroska libebml")
             message(WARNING "    Ubuntu/Debian: sudo apt-get install libmatroska-dev libebml-dev")
             message(WARNING "    Windows (vcpkg): vcpkg install ebml:x64-windows matroska:x64-windows")
             message(WARNING "    Or build from source and set CMAKE_PREFIX_PATH")
@@ -398,14 +403,12 @@ if(HAVE_LIBMATROSKA)
     endif()
 endif()
 
-# edge264 decoder headers. The decoder DLL is built independently with
-# ../edge264/build_sylc_edge264.bat and resolved at runtime by mvc_decoder.cpp.
-# Never link a MinGW import/static archive into the MSVC extension.
+# edge264 decoder headers.
 set(EDGE264_DIR "${CMAKE_SOURCE_DIR}/../edge264")
 set(EDGE264_INCLUDE_DIR "${EDGE264_DIR}")
 
-# edge264.dll is loaded with LoadLibrary/GetProcAddress by mvc_decoder.cpp.
-if(WIN32)
+# edge264 dynamic loading is supported on Windows and Apple/POSIX
+if(WIN32 OR APPLE OR UNIX)
     set(HAVE_EDGE264 ON)
     set(EDGE264_DYNAMIC_LOAD ON)
     message(STATUS "edge264 MVC decoder: dynamic runtime loading ENABLED")
@@ -466,7 +469,7 @@ pybind11_add_module(mvc_demuxer_cpp
 if(HAVE_EDGE264)
     target_compile_definitions(mvc_demuxer_cpp PRIVATE
         EDGE264_AVAILABLE EDGE264_DYNAMIC_LOAD)
-    message(STATUS "MVCDecoder exposed; edge264.dll will be resolved at runtime")
+    message(STATUS "MVCDecoder exposed; edge264 will be resolved at runtime")
 else()
     message(STATUS "edge264 library not found - MVCDecoder will NOT be available (demuxer still works)")
 endif()
@@ -549,35 +552,32 @@ if(BUILD_NATIVE_RENDERER)
             OUTPUT "${_output}"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${SYLC_SHADER_BINARY_DIR}"
             COMMAND "${SYLC_FXC_EXECUTABLE}"
-                /nologo /Ges /O3 /Qstrip_debug /Qstrip_reflect
-                /E "${entry}" /T "${profile}"
+                /nologo /O3 /T ${profile} /E ${entry}
                 /Fo "${_output}" "${source}"
             DEPENDS "${source}"
-            COMMENT "FXC ${output_name} (${entry}/${profile})"
+            COMMENT "Compiling HLSL ${entry} (${profile}) -> ${_output}"
             VERBATIM)
         set(${output_var} "${_output}" PARENT_SCOPE)
     endfunction()
 
-    set(_native_vert "${CMAKE_CURRENT_SOURCE_DIR}/../src/sylc/native_renderer/shaders/yuv_framepack.vert.hlsl")
-    set(_native_frag "${CMAKE_CURRENT_SOURCE_DIR}/../src/sylc/native_renderer/shaders/yuv_framepack.frag.hlsl")
-    set(_sbs_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/shaders/yuv_to_nv12_sbs.hlsl")
+    set(_native_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/shaders/native_renderer.hlsl")
+    set(_sbs_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/shaders/sbs_nv12_packer.hlsl")
     set(_synth_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/shaders/synth3d.hlsl")
-    set(_synth_owner_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/shaders/synth3d_ownership.hlsl")
+    set(_synth_owner_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/shaders/synth3d_cs_owner.hlsl")
     set(_stereo_lab_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/shaders/stereo_lab.hlsl")
-
-    sylc_compile_hlsl(SYLC_NATIVE_VS_CSO native_vs "${_native_vert}" main vs_5_0)
-    sylc_compile_hlsl(SYLC_NATIVE_PS_CSO native_ps "${_native_frag}" main ps_5_0)
-    sylc_compile_hlsl(SYLC_SBS_VS_CSO sbs_vs "${_sbs_hlsl}" VS vs_5_0)
-    sylc_compile_hlsl(SYLC_SBS_PS_LUMA_CSO sbs_ps_luma "${_sbs_hlsl}" PS_Luma ps_5_0)
-    sylc_compile_hlsl(SYLC_SBS_PS_CHROMA_CSO sbs_ps_chroma "${_sbs_hlsl}" PS_Chroma ps_5_0)
-    sylc_compile_hlsl(SYLC_SYNTH3D_VS_FULL_CSO synth3d_vs_full "${_synth_hlsl}" VS_Full vs_5_0)
+    sylc_compile_hlsl(SYLC_NATIVE_VS_CSO native_vs "${_native_hlsl}" VS_Main vs_5_0)
+    sylc_compile_hlsl(SYLC_NATIVE_PS_CSO native_ps "${_native_hlsl}" PS_Main ps_5_0)
+    sylc_compile_hlsl(SYLC_SBS_VS_CSO sbs_vs "${_sbs_hlsl}" VS_Sbs vs_5_0)
+    sylc_compile_hlsl(SYLC_SBS_PS_LUMA_CSO sbs_ps_luma "${_sbs_hlsl}" PS_SbsLuma ps_5_0)
+    sylc_compile_hlsl(SYLC_SBS_PS_CHROMA_CSO sbs_ps_chroma "${_sbs_hlsl}" PS_SbsChroma ps_5_0)
+    sylc_compile_hlsl(SYLC_SYNTH3D_VS_FULL_CSO synth3d_vs_full "${_synth_hlsl}" VS_FullscreenQuad vs_5_0)
     sylc_compile_hlsl(SYLC_SYNTH3D_PS_DEPTH_PREP_CSO synth3d_ps_depth_prep "${_synth_hlsl}" PS_DepthPrep ps_5_0)
-    sylc_compile_hlsl(SYLC_SYNTH3D_PS_WARP_LUMA_CSO synth3d_ps_warp_luma "${_synth_hlsl}" PS_WarpLuma ps_5_0)
-    sylc_compile_hlsl(SYLC_SYNTH3D_PS_WARP_CHROMA_CSO synth3d_ps_warp_chroma "${_synth_hlsl}" PS_WarpChroma ps_5_0)
+    sylc_compile_hlsl(SYLC_SYNTH3D_PS_WARP_LUMA_CSO synth3d_ps_warp_luma "${_synth_hlsl}" PS_Synth3DWarpLuma ps_5_0)
+    sylc_compile_hlsl(SYLC_SYNTH3D_PS_WARP_CHROMA_CSO synth3d_ps_warp_chroma "${_synth_hlsl}" PS_Synth3DWarpChroma ps_5_0)
     sylc_compile_hlsl(SYLC_SYNTH3D_PS_DEPTH_VIEW_LUMA_CSO synth3d_ps_depth_view_luma "${_synth_hlsl}" PS_DepthViewLuma ps_5_0)
     sylc_compile_hlsl(SYLC_SYNTH3D_PS_DEPTH_VIEW_CHROMA_CSO synth3d_ps_depth_view_chroma "${_synth_hlsl}" PS_DepthViewChroma ps_5_0)
-    sylc_compile_hlsl(SYLC_SYNTH3D_PS_PLATE_ACCUM_CSO synth3d_ps_plate_accum "${_synth_hlsl}" PS_PlateAccum ps_5_0)
-    sylc_compile_hlsl(SYLC_SYNTH3D_PS_PROVENANCE_CSO synth3d_ps_provenance "${_synth_hlsl}" PS_WarpProvenance ps_5_0)
+    sylc_compile_hlsl(SYLC_SYNTH3D_PS_PLATE_ACCUM_CSO synth3d_ps_plate_accum "${_synth_hlsl}" PS_Synth3DPlateAccum ps_5_0)
+    sylc_compile_hlsl(SYLC_SYNTH3D_PS_PROVENANCE_CSO synth3d_ps_provenance "${_synth_hlsl}" PS_Synth3DProvenance ps_5_0)
     sylc_compile_hlsl(SYLC_SYNTH3D_CS_OWNER_UNCERTAINTY_CSO synth3d_cs_owner_uncertainty "${_synth_owner_hlsl}" CS_OwnerUncertainty cs_5_0)
     sylc_compile_hlsl(SYLC_SYNTH3D_CS_OWNER_DILATE_CSO synth3d_cs_owner_dilate "${_synth_owner_hlsl}" CS_OwnerDilate cs_5_0)
     sylc_compile_hlsl(SYLC_SYNTH3D_CS_OWNER_LOCAL_CSO synth3d_cs_owner_local "${_synth_owner_hlsl}" CS_OwnerLocal cs_5_0)

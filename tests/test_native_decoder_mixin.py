@@ -222,7 +222,45 @@ def test_native_capabilities_are_injected_without_importing_main_module():
         native_module.configure_native_decoder_support(*original)
 
 
+def test_macos_framepack_window_never_shown():
+    from unittest.mock import patch, MagicMock
+    player = _Harness()
+    fp = MagicMock()
+    player.framepacking_window = fp
+
+    # On macOS or when NATIVE_RENDER_AVAILABLE is False, showNormal should never be called
+    with patch.object(native_module.sys, 'platform', 'darwin'):
+        with patch.object(native_module, 'NATIVE_RENDER_AVAILABLE', False):
+            player._show_framepacking_output()
+            fp.showNormal.assert_not_called()
+
+    # On Windows with NATIVE_RENDER_AVAILABLE, showNormal is called
+    with patch.object(native_module.sys, 'platform', 'win32'):
+        with patch.object(native_module, 'NATIVE_RENDER_AVAILABLE', True):
+            player._show_framepacking_output()
+            fp.showNormal.assert_called_once()
+
+
+def test_macos_fallback_to_mpv_mvc_options():
+    from unittest.mock import patch, MagicMock
+    player = _Harness()
+    player.player = {'init': True}
+    player.video_widget = MagicMock()
+    player.video_widget.winId.return_value = 12345
+    player.video_stack = MagicMock()
+    player.show_3d_notification = MagicMock()
+
+    with patch.object(native_module.sys, 'platform', 'darwin'):
+        player._fallback_to_mpv_mvc()
+        assert player.player['hwdec'] == 'videotoolbox'
+        assert player.player['video-sync'] == 'audio'
+        assert player.player['interpolation'] == 'no'
+        assert 'override-display-fps' not in player.player
+        assert player.player.get('wid') == '12345'
+
+
 if __name__ == '__main__':
     import unittest
 
     unittest.main()
+

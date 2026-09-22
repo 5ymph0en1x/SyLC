@@ -1596,7 +1596,7 @@ class PremiumControlsOverlay(QWidget):
     # not a source format: it emits Full Side-by-Side 3840x1080 whatever the
     # input was. Named for what the user plugs in, not for the pixel layout.
     STEREO_COMBO_ITEMS = ("MultiView", "Side-by-Side", "Top-Bottom",
-                          "Dual Projector", "Glasses (F-SBS)")
+                          "Dual Projector", "Glasses (F-SBS)", "Anaglyph (Red-Cyan)")
     METER_STANDARD_LAYOUT_WIDTH = 1180
 
     def __init__(self, parent=None):
@@ -2978,7 +2978,8 @@ class PremiumControlsOverlay(QWidget):
         # internal). "MVC" kept as an alias for robustness against older callers.
         mode_map = {"MultiView": "mvc", "MVC": "mvc",
                     "Side-by-Side": "sbs", "Top-Bottom": "tab",
-                    "Dual Projector": "dual", "Glasses (F-SBS)": "glasses"}
+                    "Dual Projector": "dual", "Glasses (F-SBS)": "glasses",
+                    "Anaglyph (Red-Cyan)": "anaglyph"}
         self.stereo_mode_changed.emit(mode_map.get(text, "auto"))
 
     def _on_audio_track_changed(self, index):

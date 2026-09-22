@@ -2,6 +2,7 @@
 """Window presentation, navigation visibility and Qt input coordination."""
 
 import logging
+import sys
 import time
 
 from PySide6.QtCore import QEvent, QPoint, Qt, QTimer
@@ -73,15 +74,9 @@ class WindowPresentationMixin:
                 return False
 
         try:
-            # Le hover Qt n'est fiable que SANS HUD stéréo : en mode HUD (mono
-            # comme pilote/FramePack), la barre capturée/remappée garde un
-            # WA_UnderMouse périmé à True, et chaque tick occupé rafraîchit
-            # l'échéance — les deux barres par œil ne disparaissaient JAMAIS.
-            # Un survol réel continue d'épingler la barre : ses événements
-            # Enter/MouseMove passent par l'eventFilter → _mark_activity().
-            if not hud_active and self.controls_overlay.underMouse():
-                return True
-                
+            # Hover alone is not interaction. A stationary pointer over the
+            # controls must still let the idle deadline expire; real movement
+            # refreshes it through the event filter and the global poller.
             for combo in (self.controls_overlay.audio_track_combo,
                           self.controls_overlay.subtitle_track_combo,
                           self.controls_overlay.stereo_mode_combo):
@@ -122,6 +117,8 @@ class WindowPresentationMixin:
         other app — 'the player keeps putting itself on top every few seconds'.
         WindowFromPoint sees the real stacking; GetCursorPos gives physical
         pixels so no DPI conversion of QCursor.pos() is needed."""
+        if sys.platform != 'win32':
+            return True
         try:
             import ctypes
             from ctypes import wintypes
@@ -236,6 +233,7 @@ class WindowPresentationMixin:
             self.controls_overlay.setWindowOpacity(1.0)
             
         self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.video_widget.setCursor(Qt.CursorShape.ArrowCursor)
 
         # V14b RENDER HEARTBEAT: Stop heartbeat when controls are visible (UI activity is sufficient)
         if self._render_heartbeat_timer.isActive():
@@ -261,15 +259,10 @@ class WindowPresentationMixin:
             hud.set_desired_visible(False)
             
         if hud is None or not hud.active:
-            if self._nav_is_fullscreen():
-                from PySide6.QtWidgets import QGraphicsOpacityEffect
-                opacity_effect = self.controls_overlay.graphicsEffect()
-                if not opacity_effect:
-                    opacity_effect = QGraphicsOpacityEffect(self.controls_overlay)
-                    self.controls_overlay.setGraphicsEffect(opacity_effect)
-                opacity_effect.setOpacity(0.0)
-            else:
-                self.controls_overlay.setWindowOpacity(0.0)
+            # A child QWidget's windowOpacity is not a dependable way to hide
+            # it on macOS, especially above a QOpenGLWidget. Actual visibility
+            # also prevents invisible controls from keeping a hover cursor.
+            self.controls_overlay.hide()
         else:
             # HUD actif : On efface la texture 3D du projecteur (et des autres écrans)
             for w in self._display_widgets():
@@ -285,6 +278,7 @@ class WindowPresentationMixin:
 
         # La souris disparaît de l'écran principal
         self.setCursor(Qt.CursorShape.BlankCursor)
+        self.video_widget.setCursor(Qt.CursorShape.BlankCursor)
 
         if (self._nav_is_fullscreen() and not self._render_heartbeat_timer.isActive()
                 and not self.mvc_mode_active and not getattr(self, '_hevc_mode_active', False)):
@@ -301,6 +295,10 @@ class WindowPresentationMixin:
         When UI elements are hidden, Windows DWM may reduce compositor activity.
         Force window-level operations to keep the compositor active.
         """
+        # Windows DWM only: on macOS/Linux Cocoa/Wayland, calling repaint() 120Hz starves rendering.
+        if sys.platform != 'win32':
+            return
+
         # V7b++ STUTTER FIX: Skip in MVC mode - D3D11 widget handles its own rendering
         # The heartbeat was designed for MPV rendering, not for MVC/D3D11 mode.
         # GUI-HOG FIX (2026-07): the HEVC path also drives the native D3D11 renderer and
@@ -319,12 +317,22 @@ class WindowPresentationMixin:
             QCoreApplication.processEvents()
 
     def toggle_fullscreen(self):
-        """Toggle fullscreen using Win32 API to preserve HDR and MPV connection.
+        """Toggle fullscreen using Win32 API to preserve HDR and MPV connection on Windows,
+        or native Qt fullscreen on non-Windows platforms."""
+        if sys.platform != 'win32':
+            if self.isFullScreen() or getattr(self, '_is_fake_fullscreen', False):
+                self.showNormal()
+                self._is_fake_fullscreen = False
+            else:
+                self.showFullScreen()
+                self._is_fake_fullscreen = True
+            self.controls_overlay.set_fullscreen_icon(self._is_fake_fullscreen)
+            self._update_overlays_geometry()
+            if self.has_media:
+                self.show_controls()
+            QTimer.singleShot(50, self._refresh_nav_after_window_transition)
+            return
 
-        CRITICAL: Qt's showFullScreen() triggers SDR mode on HDR displays.
-        CRITICAL: Qt's setWindowFlags() recreates window and breaks MPV.
-        Solution: Use Win32 API to modify window style without recreating it.
-        """
         import ctypes
         from ctypes import wintypes, byref, c_void_p, c_int, c_uint
 
@@ -376,7 +384,7 @@ class WindowPresentationMixin:
             self.controls_overlay.set_fullscreen_icon(False)
             
             # Optimize for windowed: disable flip model to reduce compositor stuttering
-            if self.player:
+            if self.player and sys.platform == 'win32':
                 try:
                     self.player['d3d11-flip'] = 'no'
                     logger.info("[HDR] Windowed: d3d11-flip=no for smooth playback")
@@ -451,7 +459,7 @@ class WindowPresentationMixin:
             self.controls_overlay.set_fullscreen_icon(True)
             
             # Optimize for fullscreen: flip model for best performance
-            if self.player:
+            if self.player and sys.platform == 'win32':
                 try:
                     self.player['d3d11-flip'] = 'yes'
                     logger.info("[HDR] Fullscreen: d3d11-flip=yes for optimal performance")
@@ -530,6 +538,8 @@ class WindowPresentationMixin:
 
     def _refresh_windows_hdr_brightness(self):
         """Force Windows to re-apply HDR SDR brightness setting via DisplayConfig API."""
+        if sys.platform != 'win32':
+            return
         try:
             import ctypes
             from ctypes import wintypes, Structure, byref, sizeof
@@ -620,7 +630,10 @@ class WindowPresentationMixin:
             logger.warning(f"[WINDOWED] Could not apply settings: {e}")
         
         # Refresh Windows HDR brightness after exiting fullscreen
-        QTimer.singleShot(200, self._refresh_windows_hdr_brightness)
+        if sys.platform == 'win32' or (hasattr(self, '_refresh_windows_hdr_brightness') and callable(getattr(self, '_refresh_windows_hdr_brightness', None))):
+            QTimer.singleShot(200, self._refresh_windows_hdr_brightness)
+        elif hasattr(self, '_refresh_windows_hdr_brightness'):
+            QTimer.singleShot(200, self._refresh_windows_hdr_brightness)
 
     def _enter_borderless_fullscreen_win32(self):
         """Enter borderless fullscreen using Win32 API directly.
@@ -629,6 +642,11 @@ class WindowPresentationMixin:
         breaking the MPV player connection. Instead, we modify the window style
         directly via Windows API.
         """
+        if sys.platform != 'win32':
+            self.showFullScreen()
+            self._is_fake_fullscreen = True
+            return
+
         import ctypes
         from ctypes import wintypes
         
@@ -697,6 +715,11 @@ class WindowPresentationMixin:
 
     def _exit_borderless_fullscreen_win32(self):
         """Exit borderless fullscreen using Win32 API directly."""
+        if sys.platform != 'win32':
+            self.showNormal()
+            self._is_fake_fullscreen = False
+            return
+
         import ctypes
         
         SWP_FRAMECHANGED = 0x0020
@@ -881,6 +904,12 @@ class WindowPresentationMixin:
             event.accept()
             return
 
+        # 'F' -> Toggle Fullscreen
+        if key == Qt.Key.Key_F:
+            self.toggle_fullscreen()
+            event.accept()
+            return
+
         # Escape -> Exit Fullscreen
         if key == Qt.Key.Key_Escape:
             if self._is_fake_fullscreen:
@@ -913,7 +942,25 @@ class WindowPresentationMixin:
 
         super().keyPressEvent(event)
 
+    def mouseDoubleClickEvent(self, event):
+        """Double clicking on the window or video toggles fullscreen."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.toggle_fullscreen()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def eventFilter(self, watched, event):
+        # Handle video_widget double-clicks and mouse movement
+        if watched is getattr(self, 'video_widget', None):
+            if event.type() == QEvent.Type.MouseButtonDblClick:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self.toggle_fullscreen()
+                    return True
+            elif event.type() in (QEvent.Type.MouseMove, QEvent.Type.MouseButtonPress):
+                if self.has_media:
+                    self._mark_activity()
+
         # V15: Handle combo popup visibility changes
         if watched.property("is_combo_popup") and event.type() == QEvent.Type.Hide:
             self._on_combo_popup_closed()

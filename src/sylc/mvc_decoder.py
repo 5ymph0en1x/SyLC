@@ -346,14 +346,23 @@ except Exception:
 try:
     import mvc_demuxer_cpp  # Optional fast path
 except ImportError as e:
-    # Try to find the .pyd file manually
-    pyd_name = 'mvc_demuxer_cpp.cp314-win_amd64.pyd'
+    # Try to find the extension file (.pyd on Windows, .so on macOS/Linux)
+    import glob
+    mvc_demuxer_cpp = None
     for p in sys.path:
-        pyd_path = os.path.join(p, pyd_name)
-        if os.path.exists(pyd_path):
-            break
-    else:
-        mvc_demuxer_cpp = None
+        matches = glob.glob(os.path.join(p, 'mvc_demuxer_cpp*.*'))
+        valid = [m for m in matches if m.endswith(('.pyd', '.so', '.dylib'))]
+        if valid:
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("mvc_demuxer_cpp", valid[0])
+                if spec and spec.loader:
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    mvc_demuxer_cpp = mod
+                    break
+            except Exception:
+                pass
 except Exception:
     mvc_demuxer_cpp = None
 
@@ -365,6 +374,8 @@ logger = logging.getLogger(__name__)
 
 if sys.platform == 'win32':
     lib_name = 'edge264.dll'
+elif sys.platform == 'darwin':
+    lib_name = 'libedge264.dylib'
 else:
     lib_name = 'libedge264.so'
 
@@ -400,13 +411,26 @@ def _find_dll(dll_name):
     except Exception:
         pass
 
-    # Priority 4: Current working directory
+    # Priority 4: Current working directory and runtime/ subdirectories
     try:
         cwd = os.getcwd()
         if cwd and cwd not in search_dirs:
             search_dirs.append(cwd)
+        runtime_subdir = os.path.join(cwd, 'runtime')
+        if os.path.isdir(runtime_subdir) and runtime_subdir not in search_dirs:
+            search_dirs.append(runtime_subdir)
     except Exception:
         pass
+
+    # Priority 5: macOS / Linux system paths
+    if sys.platform == 'darwin':
+        for mac_path in ('/opt/homebrew/lib', '/usr/local/lib'):
+            if os.path.isdir(mac_path) and mac_path not in search_dirs:
+                search_dirs.append(mac_path)
+    elif sys.platform.startswith('linux'):
+        for linux_path in ('/usr/lib', '/usr/local/lib'):
+            if os.path.isdir(linux_path) and linux_path not in search_dirs:
+                search_dirs.append(linux_path)
 
     # Search in all directories
     for search_dir in search_dirs:

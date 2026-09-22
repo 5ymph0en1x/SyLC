@@ -20,43 +20,51 @@ def _physical_core_count():
     APU the sibling count overstates the usable budget by 2x -- which is why
     the worker policy below budgets in physical cores.
     """
-    if sys.platform != 'win32':
-        return None
-    try:
-        import ctypes
-        from ctypes import wintypes
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            from ctypes import wintypes
 
-        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-        kernel32.GetLogicalProcessorInformationEx.argtypes = [
-            ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
-        kernel32.GetLogicalProcessorInformationEx.restype = wintypes.BOOL
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel32.GetLogicalProcessorInformationEx.argtypes = [
+                ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+            kernel32.GetLogicalProcessorInformationEx.restype = wintypes.BOOL
 
-        relation_processor_core = 0
-        length = wintypes.DWORD(0)
-        # First call fails with ERROR_INSUFFICIENT_BUFFER and reports the size.
-        kernel32.GetLogicalProcessorInformationEx(
-            relation_processor_core, None, ctypes.byref(length))
-        if not length.value:
+            relation_processor_core = 0
+            length = wintypes.DWORD(0)
+            # First call fails with ERROR_INSUFFICIENT_BUFFER and reports the size.
+            kernel32.GetLogicalProcessorInformationEx(
+                relation_processor_core, None, ctypes.byref(length))
+            if not length.value:
+                return None
+            buffer = (ctypes.c_ubyte * length.value)()
+            if not kernel32.GetLogicalProcessorInformationEx(
+                    relation_processor_core, buffer, ctypes.byref(length)):
+                return None
+
+            # A sequence of variable-length records; one record per physical core.
+            # Only the Size field (second DWORD) is needed to walk it.
+            cores = 0
+            offset = 0
+            while offset + 8 <= length.value:
+                size = int.from_bytes(bytes(buffer[offset + 4:offset + 8]), 'little')
+                if size <= 0:
+                    break
+                cores += 1
+                offset += size
+            return cores or None
+        except Exception as exc:
+            logger.debug("[CPU] Physical core probe failed: %s", exc)
             return None
-        buffer = (ctypes.c_ubyte * length.value)()
-        if not kernel32.GetLogicalProcessorInformationEx(
-                relation_processor_core, buffer, ctypes.byref(length)):
+    elif sys.platform == 'darwin':
+        try:
+            import subprocess
+            out = subprocess.check_output(['sysctl', '-n', 'hw.physicalcpu'], text=True).strip()
+            return int(out)
+        except Exception as exc:
+            logger.debug("[CPU] macOS physical core probe failed: %s", exc)
             return None
-
-        # A sequence of variable-length records; one record per physical core.
-        # Only the Size field (second DWORD) is needed to walk it.
-        cores = 0
-        offset = 0
-        while offset + 8 <= length.value:
-            size = int.from_bytes(bytes(buffer[offset + 4:offset + 8]), 'little')
-            if size <= 0:
-                break
-            cores += 1
-            offset += size
-        return cores or None
-    except Exception as exc:
-        logger.debug("[CPU] Physical core probe failed: %s", exc)
-        return None
+    return None
 
 def _recommended_edge264_threads():
     """Choose the automatic edge264 worker count for this machine.

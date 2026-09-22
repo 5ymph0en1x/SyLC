@@ -84,8 +84,12 @@ def _decide_thumbs_mode(file_path, mounted_iso_letters, optical_letters, codec_n
         is_h264 = True
     else:
         is_h264 = ext in EDGE_EXTS
-    d = os.path.splitdrive(os.path.abspath(file_path))[0]
-    letter = d[0].upper() if d else None
+    path_str = str(file_path)
+    if len(path_str) >= 2 and path_str[1] == ':' and path_str[0].isalpha():
+        letter = path_str[0].upper()
+    else:
+        d = os.path.splitdrive(os.path.abspath(file_path))[0]
+        letter = d[0].upper() if d else None
     if letter and letter in optical_letters:
         if letter in (mounted_iso_letters or set()):
             # Player-mounted ISO: a virtual volume has no optical head to
